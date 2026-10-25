@@ -197,7 +197,7 @@ window.__ModuleLoader__.load({
 			// 同级的配对条 / 提示语挤掉；挤不下的部分交给外层 `column` 去滚。
 			columnList:
 				'display:flex;flex-direction:column;gap:2px;' +
-				'flex:1 1 auto;flex-shrink:0;min-height:96px;' +
+				'flex:1 1 auto;min-height:96px;' +
 				'padding-right:8px;overflow-y:auto;overscroll-behavior:contain;' +
 				'-webkit-overflow-scrolling:touch;',
 			row:
