@@ -288,18 +288,39 @@ window.__ModuleLoader__.load({
 			 *
 			 * 现在拆成两步：这里慢慢下、可以重试，下好了再让用户填码。
 			 */
+			/*
+			 * **下载渠道**（需求 4，2026-10-28）。
+			 *
+			 * 用户要求：「改成多个渠道嘛，让用户自行选择……走官方的渠道，
+			 * 而且我建议默认就是走官方的。」
+			 *
+			 * `''` = 自动（先官方再中转），其余值是**强制只用那一个**。
+			 */
+			var channelState = react.useState('');
+			var channel = channelState[0];
+			var setChannel = channelState[1];
+
 			var prepareEnv = react.useCallback(function () {
 				setBusy('environment');
 				setMessage(null);
-				callPair('/environment', {}).then(function (payload) {
+				/*
+				 * 只有用户明确选了某个渠道才传 `channel`。
+				 * 选"自动"时传空对象，让 host 按默认顺序（官方 → 中转）依次尝试。
+				 */
+				callPair('/environment', channel === '' ? {} : { channel: channel }).then(function (payload) {
 					setBusy('');
+					/*
+					 * ⚠️ 全渠道失败时 `message` 里已经带了**可直接复制的手动安装
+					 * 提示词**（见 host 半边 `MANUAL_INSTALL_PROMPT`）。这里原样显示，
+					 * 不要截断或改写 —— 用户就是要复制它。
+					 */
 					setMessage({
 						kind: payload && payload.ok === true ? 'ok' : 'error',
 						text: (payload && payload.message) || '未知结果',
 					});
 					return reload();
 				});
-			}, [reload]);
+			}, [reload, channel]);
 
 			/** 生成配对码 + 二维码。 */
 			var makeCode = react.useCallback(function () {
@@ -450,6 +471,51 @@ window.__ModuleLoader__.load({
 									'隧道组件已就绪：' + status.cloudflared,
 								)
 							: null,
+						/*
+						 * **下载渠道选择**（需求 4）。
+						 *
+						 * 用户原话：「改成多个渠道嘛，让用户自行选择，比如用户他可能
+						 * 自己有网络环境，他在 GitHub 上面拉……而且我建议默认就是走官方的。」
+						 *
+						 * 默认选「官方（GitHub）」—— 不消耗作者服务器带宽，
+						 * 也是用户明确要求的默认行为。
+						 */
+						h(
+							'div',
+							{ style: { marginTop: '4px', marginBottom: '8px' } },
+							h('div', { style: CSS.hint }, '下载渠道'),
+							h(
+								'div',
+								{ style: { display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '6px' } },
+								[
+									{ id: '', label: '自动（官方优先）' },
+									{ id: 'github', label: 'Cloudflare 官方' },
+									{ id: 'mirror', label: '中转服务器' },
+								].map(function (opt) {
+									var active = channel === opt.id;
+									return h(
+										'button',
+										{
+											key: 'ch-' + (opt.id === '' ? 'auto' : opt.id),
+											type: 'button',
+											onClick: function () { setChannel(opt.id); },
+											disabled: busy !== '',
+											style: {
+												padding: '5px 11px',
+												borderRadius: '999px',
+												fontSize: '12px',
+												cursor: busy !== '' ? 'default' : 'pointer',
+												border: active ? '1px solid rgba(80,160,255,0.9)' : '1px solid rgba(127,127,127,0.35)',
+												background: active ? 'rgba(80,160,255,0.16)' : 'transparent',
+												color: 'inherit',
+												opacity: busy !== '' && !active ? 0.5 : 1,
+											},
+										},
+										opt.label,
+									);
+								}),
+							),
+						),
 						h(
 							'div',
 							{ style: CSS.row },

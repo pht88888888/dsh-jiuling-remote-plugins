@@ -46,6 +46,8 @@
 import { chmodSync, closeSync, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { hostname as osHostname } from 'node:os';
+import { lookup as dnsLookup } from 'node:dns/promises';
+import { request as httpsRequest } from 'node:https';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -66,7 +68,7 @@ import { qrDataUri } from './qr.js';
 export const PAIR_ENDPOINT =
 	typeof process.env.DSH_REMOTE_PAIR_ENDPOINT === 'string' && process.env.DSH_REMOTE_PAIR_ENDPOINT !== ''
 		? process.env.DSH_REMOTE_PAIR_ENDPOINT.replace(/\/+$/, '')
-		: 'https://pair.example.com';
+		: 'https://pair.jiulingssh.xyz';
 
 /**
  * 平台 → cloudflared 文件名。
@@ -116,6 +118,56 @@ const PLATFORM_FILES = {
  * 服务器上换了分发包 ⇒ 这里四个值必须同步换，否则所有客户机都下不动。
  * 取值命令：`sha256sum /workspace/dsh-pair/cloudflared/*`
  */
+/**
+ * **cloudflared 的下载渠道表**（需求 4，2026-10-28）。
+ *
+ * ## 用户诉求原文
+ *
+ * 「这个依赖目前是需要从我的服务器来进行拉取的，对我的资源开销很大，
+ *   并且有的用户他可能会连不上我的服务器，所以我希望这一点你可以改一下，
+ *   改成多个渠道嘛，让用户自行选择，比如用户他可能自己有网络环境，
+ *   他在 GitHub 上面拉或者在什么其他的渠道拉，这个 Cloudflare 的组件
+ *   是比较方便的，走官方的渠道，而且我建议默认就是走官方的，
+ *   然后如果都拉取失败的话，也给对应的文本提示，让提示用户借助他电脑的
+ *   DSH 来进行手动安装，并给出对应的提示词。」
+ *
+ * ## 顺序设计
+ *
+ * ① `github` —— Cloudflare 官方 release，**默认首选**。理由：
+ *    · 不消耗作者的服务器带宽（用户明确抱怨的点）；
+ *    · 官方源，长期可用；
+ *    · 有国内网络环境的用户会明显更快。
+ *
+ * ② `mirror` —— 作者的配对服务器中转。作为 GitHub 不通时的兜底
+ *   （国内直连 GitHub 常被墙，这是既有注释里记录过的事实）。
+ *
+ * ## ⚠️ 每个渠道都必须过同一个 SHA256 校验
+ *
+ * 渠道不同、文件相同 —— `CLOUDFLARED_SHA256` 里的哈希是**文件内容**哈希，
+ * 与来源无关。所以换渠道**不降低**安全门槛：任何渠道拿到的字节只要
+ * 哈希对得上就能用，对不上就丢弃换下一个。
+ */
+const CLOUDFLARED_CHANNEL_IDS = ['github', 'mirror'];
+
+/**
+ * 手动安装的提示词（所有自动渠道都失败时给用户）。
+ *
+ * 为什么给"提示词"而不是一堆命令：用户电脑上有 DSH，可以**直接让 DSH
+ * 自己装**。用户原话就是「让提示用户借助他电脑的 DSH 来进行手动安装，
+ * 并给出对应的提示词」。所以这里给一段可以直接粘进 DSH 的自然语言。
+ */
+const MANUAL_INSTALL_PROMPT = [
+	'请帮我在这台电脑上安装 cloudflared（Cloudflare Tunnel 客户端），要求：',
+	'',
+	'1. 从 Cloudflare 官方发布页下载对应我系统架构的版本：',
+	'   https://github.com/cloudflare/cloudflared/releases',
+	'2. 把可执行文件放到系统 PATH 能找到的位置，并确保有可执行权限。',
+	'3. 装完运行 `cloudflared --version` 确认能正常输出版本号。',
+	'4. 如果直连 GitHub 下载失败，请换用镜像或代理，不要跳过校验。',
+	'',
+	'装好后回到 DSH 的「设置 → 手机远程」，重新点「准备环境」即可。',
+].join('\n');
+
 const CLOUDFLARED_SHA256 = {
 	'cloudflared-windows-amd64.exe': '4d2490e74082c5d48dbfedaf92576fa5bd1702379ab88eb7faa0cfbe8dc891b6',
 	'cloudflared-linux-amd64': '3bfc539f45d2620c71debb7a86be0efa737ed5ccbad9eb85c787116900e5c586',
@@ -156,39 +208,160 @@ function sha256OfFile(path) {
  * @param timeoutMs - 超时毫秒数。
  * @returns `{ ok, status, payload }`。
  */
-async function pairRequest(path, body, timeoutMs = 30000) {
-	const controller = new AbortController();
-	const timer = setTimeout(() => controller.abort(), timeoutMs);
+/**
+ * 钉死在一个具体 IP 上发一次请求。
+ *
+ * ⚠️ 为什么要自己实现而不用 `fetch`：`fetch`（undici）**没有**办法指定
+ * 「这次连接只用 1.2.3.4」，它内部自己做 DNS 并自行决定连哪个地址。而本函数
+ * 的全部意义就是「逐个地址试一遍」，所以必须能控制连接目标。
+ * `node:https` 的 `lookup` 选项正好提供这个能力（回调里直接给出 IP）。
+ */
+function requestOnce(url, { address, family, method, headers, body, timeoutMs }) {
+	const u = new URL(url);
+	return new Promise((resolve, reject) => {
+		const req = httpsRequest(
+			{
+				host: u.hostname,
+				port: u.port || 443,
+				path: u.pathname + u.search,
+				method,
+				headers,
+				// 关键：把本次握手钉死在这一个地址上，绕开 undici/系统的选择逻辑。
+				//
+				// ⚠️ 回调有**两种**签名，必须都处理：`node:https` 在普通情况下
+				// 期望 `cb(err, address, family)`，但它内部也可能带 `all:true`
+				// 来拿全部地址（那时要 `cb(err, [{address, family}])`）。
+				// 只实现前者会得到 `ERR_INVALID_IP_ADDRESS`——实测踩过。
+				lookup: (_hostname, options, cb) => {
+					if (options && options.all) return cb(null, [{ address, family }]);
+					return cb(null, address, family);
+				},
+				timeout: timeoutMs,
+			},
+			(res) => {
+				const chunks = [];
+				res.on('data', (c) => chunks.push(c));
+				res.on('end', () =>
+					resolve({
+						status: res.statusCode,
+						text: Buffer.concat(chunks).toString('utf8'),
+					}),
+				);
+				res.on('error', reject);
+			},
+		);
+		req.on('timeout', () => req.destroy(new Error('timeout')));
+		req.on('error', reject);
+		if (body !== undefined) req.write(body);
+		req.end();
+	});
+}
+
+function safeJsonParse(text) {
 	try {
-		const response = await fetch(PAIR_ENDPOINT + path, {
-			method: body === undefined ? 'GET' : 'POST',
-			headers: body === undefined ? {} : { 'content-type': 'application/json' },
-			body: body === undefined ? undefined : JSON.stringify(body),
-			signal: controller.signal,
-		});
-		const text = await response.text();
-		let payload;
-		try {
-			payload = JSON.parse(text);
-		} catch {
-			payload = { error: 'bad-json', message: text.slice(0, 200) };
-		}
-		return { ok: response.ok, status: response.status, payload };
+		return JSON.parse(text);
+	} catch {
+		return { error: 'bad-json', message: String(text).slice(0, 200) };
+	}
+}
+
+/**
+ * 带超时的配对服务请求 —— **逐个地址尝试，任一成功即返回**。
+ *
+ * ## 为什么必须这么做（2026-10-27 真机取证）
+ *
+ * `pair.jiulingssh.xyz` 有两条 A 记录：`104.21.93.161`（通）与
+ * `172.67.212.18`（国内**IP 级**不可达，换 SNI 也是 `ECONNRESET`）。
+ * 而 Cloudflare **每次查询随机排序**这两条记录。
+ *
+ * 原来的实现是裸 `fetch()`：它只连「本次解析到的第一个地址」，失败就放弃。
+ * 于是用户看到的是「连不上配对服务器：fetch failed」——偶发失败，重试几次
+ * 有时能过。这被误当成「激活码无效 / 配对码过期」，实际纯粹是网络问题。
+ *
+ * 现在的行为：
+ *   ① 先用 `dns.lookup(host, { all: true })` 拿到**全部**地址；
+ *   ② IPv4 优先（与既有行为一致），但**每个都要试**；
+ *   ③ 任一成功立即返回，全部失败才报错，且错误里带上**每个地址的失败原因**。
+ *
+ * ## 错误码必须透出
+ *
+ * `fetch` 的 `error.message` 恒为无信息量的 `fetch failed`，真正的
+ * `ECONNRESET / ENOTFOUND / ECONNREFUSED` 在 `error.cause` 里。这一点在本
+ * 项目的排查中直接决定方向，所以这里把 `code` 一并写进 message。
+ *
+ * @param path - 相对 `/pair/` 的路径，如 `/pair/register`。
+ * @param body - 请求体；`undefined` 表示发 GET。
+ * @param timeoutMs - **每个地址**的超时毫秒数。
+ * @returns `{ ok, status, payload, via? }`。
+ */
+async function pairRequest(path, body, timeoutMs = 30000) {
+	const url = PAIR_ENDPOINT + path;
+	const { hostname: pairHost } = new URL(url);
+
+	let addresses = [];
+	try {
+		addresses = await dnsLookup(pairHost, { all: true });
 	} catch (error) {
-		const aborted = error?.name === 'AbortError';
+		// 解析都失败了 —— 这本身就是要告诉用户的结论，别再往下猜。
 		return {
 			ok: false,
 			status: 0,
 			payload: {
-				error: aborted ? 'timeout' : 'network',
-				message: aborted
-					? `连接配对服务器超时（${Math.round(timeoutMs / 1000)} 秒）`
-					: `连不上配对服务器：${String(error?.message ?? error)}`,
+				error: 'dns',
+				message: `无法解析配对服务器 ${pairHost}：${error?.code ?? error?.message ?? error}`,
 			},
 		};
-	} finally {
-		clearTimeout(timer);
 	}
+	if (!Array.isArray(addresses) || addresses.length === 0) {
+		return {
+			ok: false,
+			status: 0,
+			payload: { error: 'dns', message: `配对服务器 ${pairHost} 没有可用地址` },
+		};
+	}
+	// IPv4 优先：国内 IPv6 链路质量参差，先试 v4 命中率更高。
+	addresses.sort((a, b) => a.family - b.family);
+
+	const method = body === undefined ? 'GET' : 'POST';
+	const headers = body === undefined
+		? {}
+		: { 'content-type': 'application/json' };
+	const bodyText = body === undefined ? undefined : JSON.stringify(body);
+
+	const failures = [];
+	for (const { address, family } of addresses) {
+		try {
+			const r = await requestOnce(url, {
+				address,
+				family,
+				method,
+				headers,
+				body: bodyText,
+				timeoutMs,
+			});
+			return {
+				ok: r.status >= 200 && r.status < 300,
+				status: r.status,
+				payload: safeJsonParse(r.text),
+				via: address,
+			};
+		} catch (error) {
+			const code = error?.code ?? error?.message ?? String(error);
+			failures.push(`${address}: ${code}`);
+			// 换下一个地址继续 —— 这正是「一条记录被墙」的解药。
+		}
+	}
+
+	return {
+		ok: false,
+		status: 0,
+		payload: {
+			error: 'network',
+			message:
+				`连不上配对服务器（已尝试 ${failures.length} 个地址）\n` +
+				failures.join('\n'),
+		},
+	};
 }
 
 /** 规范化激活码：去空白、去横杠、转大写（用户从微信里复制粘贴常带这些）。 */
@@ -224,7 +397,14 @@ export function createPairing({ stateDir, logger }) {
 	const BIN_DIR = join(stateDir, 'bin');
 
 	/** cloudflared 自动下载的进度（给 UI 显示；没在下载时 `active` 为 false）。 */
-	const download = { active: false, received: 0, total: 0, error: '' };
+	/*
+	 * 下载进度。
+	 *
+	 * `channel` 记录**当前正在试哪个渠道**（需求 4）。前端据此显示
+	 * 「正在从 Cloudflare 官方下载…」/「正在从中转服务器下载…」，
+	 * 用户就知道卡在哪、要不要换网络。
+	 */
+	const download = { active: false, received: 0, total: 0, error: '', channel: '' };
 
 	/** 读配对状态；没配对过或文件坏了都返回 `undefined`。 */
 	function read() {
@@ -355,11 +535,28 @@ export function createPairing({ stateDir, logger }) {
 		// 「日志里的激活码 = 静默接管」—— 凡能读引擎日志 / GUI 日志面板 / `/export`
 		// 导出包 / 诊断包的人都能拿到它。只打一个单向短指纹，够对账、不够还原。
 		logger?.info?.(`[dsh-remote][pair] 正在注册（激活码指纹 ${codeFingerprint(code)}）…`);
-		const { ok, payload } = await pairRequest('/pair/register', {
+		// ⚠️ **可以安全重试**：`/pair/register` 服务端是幂等的 —— 同一个
+		// `clientSecret` 再注册一次只会「复用」已有隧道，不会重复建资源
+		//（`pair_server.py` 里有 `reused` 分支）。而国内网络下 Cloudflare 的
+		// 边缘节点偶发 `ECONNRESET`，不重试就得让用户重新填一遍激活码。
+		//
+		// 只在**网络层**失败时重试：`status===0` 说明请求根本没送到服务端；
+		// 服务端返回的业务错误（激活码无效等）重试没有意义，只会拖慢提示。
+		let reg = await pairRequest('/pair/register', {
 			code,
 			device: osHostname(),
 			clientSecret: previous?.clientSecret,
 		});
+		for (let attempt = 1; attempt <= 2 && !reg.ok && reg.status === 0; attempt += 1) {
+			logger?.warn?.(`[dsh-remote][pair] 注册网络失败，第 ${attempt} 次重试…`);
+			await new Promise((r) => setTimeout(r, 800 * attempt));
+			reg = await pairRequest('/pair/register', {
+				code,
+				device: osHostname(),
+				clientSecret: previous?.clientSecret,
+			});
+		}
+		const { ok, payload } = reg;
 		if (!ok || typeof payload?.hostname !== 'string') {
 			logger?.warn?.(`[dsh-remote][pair] 注册失败: ${JSON.stringify(payload)}`);
 			return { ok: false, message: payload?.message ?? `注册失败（HTTP ${payload?.error ?? '?'}）` };
@@ -407,10 +604,21 @@ export function createPairing({ stateDir, logger }) {
 
 		// ⚠️ 必须带设备凭据：服务端靠它挡「拿泄露的激活码生成配对码 → claim 取得令牌」
 		// 这条链（外部审计 S1）。
-		const { ok, payload } = await pairRequest('/pair/handshake', {
+		// 与注册同理：`/pair/handshake` 只是生成一个新的 6 位码，重复调用
+		// 不会弄坏已有状态（旧码由服务端按过期处理），所以网络失败可重试。
+		let hs = await pairRequest('/pair/handshake', {
 			code: record.activationCode,
 			clientSecret: record.clientSecret,
 		});
+		for (let attempt = 1; attempt <= 2 && !hs.ok && hs.status === 0; attempt += 1) {
+			logger?.warn?.(`[dsh-remote][pair] 生成配对码网络失败，第 ${attempt} 次重试…`);
+			await new Promise((r) => setTimeout(r, 800 * attempt));
+			hs = await pairRequest('/pair/handshake', {
+				code: record.activationCode,
+				clientSecret: record.clientSecret,
+			});
+		}
+		const { ok, payload } = hs;
 		if (!ok || typeof payload?.pairCode !== 'string') {
 			return { ok: false, message: payload?.message ?? '生成配对码失败，请重试' };
 		}
@@ -441,7 +649,12 @@ export function createPairing({ stateDir, logger }) {
 	 *
 	 * @returns `{ ok, path?, message, cached? }`。
 	 */
-	async function ensureCloudflared() {
+	/**
+	 * @param options - 可选。`{ channel }` 指定只走某个渠道
+	 *   （`'github'` / `'mirror'`，见 `CLOUDFLARED_CHANNEL_IDS`）。
+	 *   不传就按默认顺序自动尝试。
+	 */
+	async function ensureCloudflared(options) {
 		const cached = findCloudflared();
 		if (cached !== undefined) return { ok: true, path: cached, cached: true, message: '已找到 cloudflared' };
 
@@ -462,61 +675,135 @@ export function createPairing({ stateDir, logger }) {
 		}
 
 		const target = join(BIN_DIR, process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared');
-		const tmp = `${target}.part`;
 		mkdirSync(BIN_DIR, { recursive: true });
-		logger?.info?.(`[dsh-remote][pair] 正在下载 cloudflared（${fileName}）…`);
+
+		/*
+		 * ---- 多渠道下载（需求 4，见 `CLOUDFLARED_CHANNEL_IDS` 的注释） ----
+		 *
+		 * `preferred` 允许前端指定只走某个渠道（用户自己在设置里选）；
+		 * 不指定就按默认顺序：先官方 GitHub，再作者的服务器。
+		 *
+		 * ⚠️ 一旦用户明确指定了某个渠道，就**只试那一个**，不要偷偷回退 ——
+		 * 用户可能就是因为不想用作者的服务器（流量/隐私）才选的 GitHub，
+		 * 悄悄回退到 mirror 会违背他的意图。
+		 */
+		const preferred = typeof options?.channel === 'string' ? options.channel : '';
+		const channelIds = preferred !== '' && CLOUDFLARED_CHANNEL_IDS.includes(preferred)
+			? [preferred]
+			: CLOUDFLARED_CHANNEL_IDS.slice();
+
+		const urlOf = (channel) => (channel === 'github'
+			? `https://github.com/cloudflare/cloudflared/releases/latest/download/${fileName}`
+			: `${PAIR_ENDPOINT}/pair/cloudflared/${fileName}`);
+
+		/** 每个渠道的失败原因，最后一起交给用户（便于他自己判断该换什么网络）。 */
+		const failures = [];
 
 		download.active = true;
 		download.received = 0;
 		download.total = 0;
 		download.error = '';
 
-		const controller = new AbortController();
-		const timer = setTimeout(() => controller.abort(), 300000);
 		try {
-			const response = await fetch(`${PAIR_ENDPOINT}/pair/cloudflared/${fileName}`, {
-				signal: controller.signal,
-			});
-			if (!response.ok || response.body === null) {
-				throw new Error(`HTTP ${response.status}`);
-			}
-			download.total = Number(response.headers.get('content-length') ?? 0);
+			for (const channel of channelIds) {
+				const url = urlOf(channel);
+				const label = channel === 'github' ? 'Cloudflare 官方（GitHub）' : '作者的中转服务器';
+				const tmp = `${target}.part.${channel}`;
+				logger?.info?.(`[dsh-remote][pair] 尝试渠道 ${channel}: ${url}`);
+				download.received = 0;
+				download.total = 0;
+				download.channel = channel;
 
-			// 逐块写盘并记账：55 MB 全读进内存没必要，且 UI 要显示进度。
-			const source = Readable.fromWeb(response.body);
-			source.on('data', (chunk) => {
-				download.received += chunk.length;
-			});
-			await pipeline(source, createWriteStream(tmp));
-			clearTimeout(timer);
+				/*
+				 * 每个渠道**独立超时**：一个渠道卡住不该耗光全部预算。
+				 * 120 秒对 55 MB 的文件是宽松但有限的（GitHub 在国内可能很慢）。
+				 */
+				const controller = new AbortController();
+				const timer = setTimeout(() => controller.abort(), 120000);
+				try {
+					const response = await fetch(url, {
+						signal: controller.signal,
+						// GitHub 会 302 到 objects.githubusercontent.com，必须跟随。
+						redirect: 'follow',
+						headers: {
+							// GitHub API 要求 User-Agent，缺了会 403。
+							'user-agent': 'dsh-remote-plugin',
+							accept: 'application/octet-stream',
+						},
+					});
+					if (!response.ok || response.body === null) {
+						throw new Error(`HTTP ${response.status}`);
+					}
+					download.total = Number(response.headers.get('content-length') ?? 0);
 
-			const size = statSync(tmp).size;
-			if (size < 1024 * 1024) throw new Error(`文件太小（${size} 字节），可能不是可执行文件`);
-			// ⚠️ 校验必须在 `renameSync` **之前**：先校验再落位，绝不留下未校验的
-			// 可执行文件（哪怕是短暂的窗口 —— 别的进程可能正好扫到这个路径）。
-			const actualSha = sha256OfFile(tmp);
-			if (actualSha !== expectedSha) {
-				throw new Error(
-					`校验值不符（期望 ${expectedSha.slice(0, 16)}…，实际 ${actualSha.slice(0, 16)}…），已拒绝使用该文件`,
-				);
-			}
-			renameSync(tmp, target);
-			if (process.platform !== 'win32') chmodSync(target, 0o755);
+					// 逐块写盘并记账：55 MB 全读进内存没必要，且 UI 要显示进度。
+					const source = Readable.fromWeb(response.body);
+					source.on('data', (chunk) => {
+						download.received += chunk.length;
+					});
+					await pipeline(source, createWriteStream(tmp));
+					clearTimeout(timer);
 
-			logger?.info?.(`[dsh-remote][pair] cloudflared 已就绪: ${target}（${size} 字节，校验通过）`);
-			return { ok: true, path: target, cached: false, message: 'cloudflared 已下载完成' };
-		} catch (error) {
-			const aborted = error?.name === 'AbortError';
-			download.error = aborted ? '下载超时' : String(error?.message ?? error);
-			logger?.warn?.(`[dsh-remote][pair] 下载 cloudflared 失败: ${download.error}`);
-			try {
-				unlinkSync(tmp);
-			} catch {
-				/* 没落盘 */
+					const size = statSync(tmp).size;
+					if (size < 1024 * 1024) throw new Error(`文件太小（${size} 字节），可能不是可执行文件`);
+					/*
+					 * ⚠️ 校验必须在 `renameSync` **之前**：先校验再落位，绝不留下
+					 * 未校验的可执行文件（哪怕短暂窗口 —— 别的进程可能正好扫到）。
+					 *
+					 * 渠道不同但哈希相同（哈希认的是文件内容，不是来源）。
+					 */
+					const actualSha = sha256OfFile(tmp);
+					if (actualSha !== expectedSha) {
+						throw new Error(
+							`校验值不符（期望 ${expectedSha.slice(0, 16)}…，实际 ${actualSha.slice(0, 16)}…）`,
+						);
+					}
+					renameSync(tmp, target);
+					if (process.platform !== 'win32') chmodSync(target, 0o755);
+
+					logger?.info?.(
+						`[dsh-remote][pair] cloudflared 已就绪: ${target}（${size} 字节，渠道 ${channel}，校验通过）`,
+					);
+					return {
+						ok: true,
+						path: target,
+						cached: false,
+						channel,
+						message: `cloudflared 已下载完成（来源：${label}）`,
+					};
+				} catch (error) {
+					clearTimeout(timer);
+					const aborted = error?.name === 'AbortError';
+					const reason = aborted ? '下载超时（120 秒）' : String(error?.message ?? error);
+					failures.push(`${label}：${reason}`);
+					logger?.warn?.(`[dsh-remote][pair] 渠道 ${channel} 失败: ${reason}`);
+					try {
+						unlinkSync(tmp);
+					} catch {
+						/* 没落盘 */
+					}
+					// 继续下一个渠道。
+				}
 			}
-			return { ok: false, message: `下载 cloudflared 失败：${download.error}` };
+
+			/*
+			 * 全部渠道都失败 ⇒ 给出**可直接复制的手动安装提示词**。
+			 *
+			 * 用户原话：「如果都拉取失败的话，也给对应的文本提示，让提示用户
+			 * 借助他电脑的 DSH 来进行手动安装，并给出对应的提示词。」
+			 */
+			download.error = failures.join('；');
+			logger?.warn?.(`[dsh-remote][pair] 所有渠道都失败: ${download.error}`);
+			return {
+				ok: false,
+				channel: 'manual',
+				failures,
+				manualPrompt: MANUAL_INSTALL_PROMPT,
+				message: `自动下载失败（${failures.join('；')}）。\n\n`
+					+ '请手动安装：把下面这段提示词复制给电脑上的 DSH，它会帮你装好。\n\n'
+					+ MANUAL_INSTALL_PROMPT,
+			};
 		} finally {
-			clearTimeout(timer);
 			download.active = false;
 		}
 	}

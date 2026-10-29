@@ -6,6 +6,53 @@
 
 ## 手机端 `dsh-jiuling-remote-mobile`
 
+### 1.2.97
+
+- **修复：后来进入 App 时，弹窗能看见但点了电脑端收不到**
+  手机不在线的那一刻，电脑端原来会「立刻把 fallback 交回 GUI」并把请求放进
+  `ghostAsks`（幽灵记录）。实测证明那个假设不成立：GUI 并没有「接管并结束」，
+  而是一直在等；而 `answerAsk` 只查 `pendingAsks`，于是手机上点它只能拿到
+  `expired` —— 表现为「点了没反应」。现在无论手机是否在线都登记进
+  `pendingAsks` 并等待，`ghostAsks` 整个概念删除。
+- **修复：`ask_user_question` 报 `value is not lossless JSON`**
+  回传答案的字段名是 `questionId`，而官方 `answerResult()` 读的是 `answer.id`，
+  于是 `id` 变成 `undefined` 并被带进工具输出。改用官方的
+  `id` / `selected` / `custom`，电脑端另加一层严格校验挡住坏数据。
+- **修复：不在那个对话时也弹悬浮窗**
+  收到 ask 时比较 `sessionId` 与当前打开的会话，不一致就不弹（请求不丢，
+  切过去时会补出来）。避免不相关的浮层一直挡在别的对话上。
+
+### 1.2.96
+
+- **修复：自绘弹窗点击无反应、无输入框、与系统弹窗重复**
+  ① 答案形状不匹配被电脑端判成「没答」；② 问题没有选项时卡片上一个可点元素
+  都没有，既答不了也关不掉（补 textarea + 提交 + 跳过）；③ 自绘与官方两条渲染
+  路径同时触发导致两张卡片叠加，现统一只走自绘。
+
+### 1.2.95 / 1.2.94
+
+- **修复：App 退后台再回来收不到任何东西**
+  WebView 冻结后 EventSource 不会自愈。改成 3 秒一条**短连接**轮询补洞
+  （长连接死掉也照样能同步），并按「本地 seq 是否真的前进」决定是继续
+  立刻补还是等下一个周期，避免 0 延迟空转。
+- 顺带修掉轮询自己的死锁：`pollCatchUp` 顶部原来的
+  `if (watchers.size === 0) return;` 恰恰在最需要它的场景下把整条轮询关掉了。
+
+### 1.2.93
+
+- 修复前台唤醒（`wake`）后不立即补洞、要等下一个周期才同步的问题。
+
+### 1.2.92
+
+- **修复：ask 卡片渲染成功但用户完全看不到**
+  卡片原本贴底定位，被约 300px 高的输入框整块盖住（实测可见高度 0/219）。
+  改为贴顶 `calc(env(safe-area-inset-top) + 64px)`，并加 `max-height` 与滚动。
+
+### 1.2.19 – 1.2.91
+
+- 配对多地址回退、分页、启动连接风暴、文件选择器滚动、模型与预设列表刷新、
+  监听器泄漏等一批修复，详见 git 历史。
+
 ### 1.2.18
 
 - **修复：目录选择弹窗在横屏/矮屏下列表高度为 0**
@@ -52,6 +99,25 @@
 ---
 
 ## 电脑端 `dsh-jiuling-remote-desktop`
+
+### 1.0.52
+
+- **修复：手机离线时把 ask 判成「已交给 GUI」，导致手机后来作答无效**
+  原来手机不在线就立刻 `return fallback`（`NO_TAKEOVER`）并把请求塞进
+  `ghostAsks`。实测证明 GUI 并没有因此结束这一轮，而是一直在等 ——
+  于是手机上作答拿到 `expired`，表现为「点了没反应」。现在无论手机在不在线
+  都登记进 `pendingAsks` 并等待，`ghostAsks` 已删除。
+- **新增：手机答案的形状校验**
+  逐条校验 `id` 是非空字符串、`selected` 是数组，不合格就当没答退回 GUI，
+  避免把 `undefined` 带进工具输出触发
+  `tool "ask_user_question" returned invalid output: value is not lossless JSON`。
+- **修复：`sessionCursors` 恒返回空对象**
+  原来读 `item.projections.asOfSeq`，而官方 `listFields()` 并不提供该字段。
+  改用 `session.seq - 1`（会话存活）或 `sessionQuery.observeSession().cursor`（冷会话）。
+
+### 1.0.51
+
+- 补齐 `sessionCursors` / `readEventRange` 等 RPC，供手机端 3 秒轮询补洞使用。
 
 ### 1.0.42
 

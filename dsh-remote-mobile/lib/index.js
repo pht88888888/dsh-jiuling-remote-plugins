@@ -48,7 +48,7 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { homedir } from 'node:os';
@@ -80,6 +80,16 @@ export const inject = {
 
 /** 浏览器访问桥的路由。 */
 const ROUTE_RPC = '/api/dsh-remote/rpc';
+
+/**
+ * 「App 回到前台」通知端点。
+ *
+ * 客户端在 `onStart()` 里 `POST` 一次，插件据此**立刻重连所有退避中的 SSE**。
+ * 为什么需要它见 `sleepWakable` 的注释 —— 简单说：切到后台后系统冻结 JS
+ * 定时器，重连等待永远不会到期，用户切回来要干等最多 15 秒才收到回复，
+ * 表现就是「悬浮窗发了没反应，必须点开前台」。
+ */
+const ROUTE_WAKE = '/api/dsh-remote/wake';
 const ROUTE_STREAM = '/api/dsh-remote/stream';
 
 /** 状态目录（手机端）。 */
@@ -222,6 +232,24 @@ function loadDesktopCache() {
 			// 必然复发，无论内存里预取得多勤快。
 			dirs: restoreDirs(parsed.dirs),
 			at: typeof parsed.at === 'number' ? parsed.at : 0,
+			/*
+			 * ⚠️ **向后兼容老格式**（1.2.44）。
+			 *
+			 * 1.2.43 及更早的文件里只有 `at`，没有 `catalogAt` / `presetsAt`。
+			 * 直接读成 0 的话，升级上来的用户每次启动都会把模型和预设**都重拉一遍**
+			 *（多两次隧道往返，开机后菜单多转一会儿圈）。
+			 *
+			 * 所以老格式退回用 `at` —— 那时它确实是两者共用的那个时间戳，
+			 * 语义上等价于"两个都在那个时候拉过"。
+			 *
+			 * 新格式则各用各的，绝不互相代表。
+			 */
+			catalogAt: typeof parsed.catalogAt === 'number'
+				? parsed.catalogAt
+				: (typeof parsed.at === 'number' ? parsed.at : 0),
+			presetsAt: typeof parsed.presetsAt === 'number'
+				? parsed.presetsAt
+				: (typeof parsed.at === 'number' ? parsed.at : 0),
 		};
 	} catch (error) {
 		return null;
@@ -245,7 +273,41 @@ function saveDesktopCache(cache) {
 			// 都要重新 `stringify` 一遍整棵，越用越慢。用户真正会回到的是最近看过
 			// 的那几层，按插入顺序取尾部即是最新的。
 			dirs: tailDirs(cache.dirs),
-			at: cache.at ?? Date.now(),
+			/*
+			 * ⚠️ 落盘用的字段必须**原样保存数值**（1.2.41 修）
+			 *
+			 * 原来是 `cache.at ?? Date.now()`。`??` 只在 `null` / `undefined`
+			 * 时兜底，所以 `at === 0`（= 已作废）能正确保存为 `0` —— 这点没问题。
+			 *
+			 * 但 `undefined` / `null` 会被写成 `Date.now()`，等于把
+			 * 「**从未拉过**」记成「**刚刚拉过**」。而 `at` 是所有 TTL 判据的
+			 * 唯一依据：这一写，下次启动就会把一份空缓存当成新鲜的，
+			 * 于是**不重拉**，菜单空着直到用户手动再触发一次。
+			 *
+			 * 现在：非数字一律记 `0`（= 陈旧），让下次启动必定重拉。
+			 * 「没有时间戳」与「时间戳是 0」在语义上完全等价，都表示数据不可信。
+			 */
+			at: typeof cache.at === 'number' && Number.isFinite(cache.at) ? cache.at : 0,
+			/*
+			 * ⚠️ **两个独立时间戳也必须落盘**（1.2.44）。
+			 *
+			 * 只存 `at` 的话，重启后 `catalogAt` / `presetsAt` 会丢掉，
+			 * 于是启动时两者都被当成"从未拉过" ⇒ 无论数据多新都重拉一遍
+			 * （多两次隧道往返，用户开机后菜单转圈）。
+			 *
+			 * 反过来若存错（把 `at` 当成两者），就回到了"一个代表另一个"
+			 * 的老 bug。所以这两个字段必须各自独立保存。
+			 *
+			 * 判据与 `at` 相同：非有限数字一律记 0（= 陈旧）。
+			 */
+			catalogAt:
+				typeof cache.catalogAt === 'number' && Number.isFinite(cache.catalogAt)
+					? cache.catalogAt
+					: 0,
+			presetsAt:
+				typeof cache.presetsAt === 'number' && Number.isFinite(cache.presetsAt)
+					? cache.presetsAt
+					: 0,
 		};
 		const tmp = `${DESKTOP_CACHE_PATH}.${process.pid}.tmp`;
 		writeFileSync(tmp, JSON.stringify(record), { mode: 0o600 });
@@ -255,8 +317,8 @@ function saveDesktopCache(cache) {
 	}
 }
 
-/** 默认隧道地址（占位）。自建部署改这里或设 `mobile.json` 的 `endpoint`。 */
-const DEFAULT_ENDPOINT = 'https://dsh-remote.example.com';
+/** 默认隧道地址。 */
+const DEFAULT_ENDPOINT = 'https://dsh-remote.jiulingssh.xyz';
 
 /**
  * 凭据只允许发往这个 DNS 区（见 `assertTrustedHost`）。
@@ -267,7 +329,7 @@ const DEFAULT_ENDPOINT = 'https://dsh-remote.example.com';
  * 开源版留 `example.com` 占位；自建部署把 `zone` 设成自己的域名即可，
  * **不需要改源码**。
  */
-const CF_ZONE_NAME = 'example.com';
+const CF_ZONE_NAME = 'jiulingssh.xyz';
 
 /**
  * 配对服务地址（默认值）。
@@ -279,7 +341,16 @@ const CF_ZONE_NAME = 'example.com';
  * **必须指向同一个服务** —— 两端各写一份是因为这两个包要能独立安装，
  * 不能互相 import（一个是 host 插件、一个是另一台机器上的 host 插件）。
  */
-const PAIR_ENDPOINT = 'https://pair.example.com';
+const PAIR_ENDPOINT = 'https://pair.jiulingssh.xyz';
+
+/**
+ * 每页拉多少条历史事件。
+ *
+ * 实测依据（手机→电脑隧道，5 次中位数）：10 条 85KB/0.94s、30 条 485KB/2.16s、
+ * 50 条 1050KB/2.74s。地板 0.6s 是隧道往返，与条数无关。
+ * 取 30 是在「翻页次数」和「单次流量」之间的折中。
+ */
+const HISTORY_PAGE_SIZE = 30;
 
 /**
  * 当前生效的配对服务地址。
@@ -303,16 +374,68 @@ function currentPairEndpoint() {
  * @param token - 访问令牌。
  * @returns 落盘后的 `{ endpoint, token }`。
  */
-function saveConfig(endpoint, token) {
+function saveConfig(endpoint, token, extra) {
+	// ⚠️⚠️ **必须保留已有配置里的 `zone` / `pairEndpoint`**（曾经是 bug）。
+	//
+	// 原来这里只写 `{endpoint, token}` 两个字段，整份文件被覆盖 ——
+	// 于是「手工在 `mobile.json` 里加一行 `zone`」这个唯一的自建部署办法
+	// **一次配对就被抹掉了**。症状是：改好配置、配对成功，紧接着所有请求
+	// 又报「拒绝对 <你的域名> 发送凭据」，且重启 App 也不会好
+	//（重启只会重新读到一份没有 `zone` 的文件）。
+	//
+	// 现在的规则：新值优先，没传就沿用磁盘上原有的，最后才退回默认值。
+	const previous = loadConfig();
 	const record = {
 		endpoint: String(endpoint).replace(/\/+$/, ''),
 		token: String(token),
 	};
+	const zone = extra && typeof extra.zone === 'string' ? extra.zone : previous.zone;
+	const pairEndpoint =
+		extra && typeof extra.pairEndpoint === 'string' ? extra.pairEndpoint : previous.pairEndpoint;
+	if (typeof zone === 'string' && zone !== '') record.zone = zone;
+	if (typeof pairEndpoint === 'string' && pairEndpoint !== '') record.pairEndpoint = pairEndpoint;
 	mkdirSync(STATE_DIR, { recursive: true });
 	const tmp = `${CONFIG_PATH}.${process.pid}.tmp`;
 	writeFileSync(tmp, JSON.stringify(record, null, 2), { mode: 0o600 });
 	renameSync(tmp, CONFIG_PATH);
 	return record;
+}
+
+/**
+ * 从隧道主机名推导**凭据白名单**（DNS 区）。
+ *
+ * ## 为什么需要它
+ *
+ * 白名单原来只有编译期的 `jiulingssh.xyz` 一个默认值。服务方一旦换域名
+ * （例如旧域名隧道数满了，改用另一个域名签发隧道），**所有用户**都会撞上
+ * 「拒绝对 xxx 发送凭据」，而用户手上没有任何入口去改它 —— 这是个死局：
+ * 配对能成功（配对服务还在旧域名），但配对完一个请求都发不出去。
+ *
+ * 配对服务器返回的 `hostname` 就是权威的隧道域名，从它推导区名即可，
+ * 不需要用户配任何东西。
+ *
+ * ## 取法
+ *
+ * 取**最后两段**：`dsh-fbu0nk87.jiuling.xyz` → `jiuling.xyz`。
+ *
+ * ⚠️ 这对 `co.uk` / `com.cn` 这类二级后缀是**错的**（会得到 `co.uk`）。
+ * 但那只是让白名单**变宽**到整个 `co.uk`，属于可用性优先的取舍：
+ * 凭据本来就只发给配对服务器亲自下发的那个主机，白名单只是第二道闸。
+ * 若配对服务器将来直接返回 `zone` 字段，**优先用服务器的**，见 `claimPairing`。
+ *
+ * @param hostname - 形如 `dsh-xxx.example.com`。
+ * @returns 推导出的区名；无法推导时返回空串。
+ */
+function zoneFromHostname(hostname) {
+	if (typeof hostname !== 'string' || hostname === '') return '';
+	// 去掉端口（`hostname` 一般不含端口，防一手）
+	const bare = hostname.split(':')[0].trim().toLowerCase();
+	if (bare === '') return '';
+	// IP 地址没有「区」的概念，交给 loopback 规则放行
+	if (/^\d+\.\d+\.\d+\.\d+$/.test(bare) || bare.indexOf(':') >= 0) return '';
+	const parts = bare.split('.').filter((x) => x !== '');
+	if (parts.length < 2) return '';
+	return parts.slice(-2).join('.');
 }
 
 /**
@@ -668,6 +791,211 @@ function loadDesktopTitles() {
  *
  * @returns `Record<sessionId, number>`（值是偏移量，目前只有 1）。
  */
+/**
+ * 「电脑侧元数据」独立存储文件的路径。
+ *
+ * ## 为什么不塞进 `sessions.json`
+ *
+ * `sessions.json` 里已经有**六份**清单（`sessions` / `synced` / `paths` /
+ * `titles` / `turnOffsets` / `models`），由 `saveRemoteSessions()` 一起写、
+ * 而它有 **10 个调用点**（同步、删除、选模型、跟随建流……）。再往里加第七份，
+ * 每一个调用点都必须改一遍传参 —— 漏一个就会把新字段**抹掉**
+ *（`body.xxx` 不传就等于「删掉这一节」，这是该函数注释里反复强调的坑）。
+ *
+ * 排序时间与置顶标记属于**纯展示元数据**：丢了最坏是「顺序退回旧行为、置顶没同步」，
+ * 不影响会话可用性。独立一个文件、独立一个 save，改动面最小，
+ * 也绝不可能因为某个调用点没传参而把已有的六份清单搞坏。
+ *
+ * ## 内容
+ *
+ *     {
+ *       "times": { "<sessionId>": 1730…  },   // 电脑上的真实活动时间（毫秒）
+ *       "pins":  { "<sessionId>": true }      // 电脑上是否置顶
+ *     }
+ */
+const DESKTOP_META_PATH = join(STATE_DIR, 'desktop-meta.json');
+
+/**
+ * 读「同步会话 → 电脑上那次的真实活动时间」的落盘映射。
+ *
+ * ## 为什么需要它（用户 2026-10-29 报障）
+ *
+ * 用户原话：
+ *   「你同步过来的对话，你没有按时间顺序进行一个排序，就是我在 APP 内设置的是
+ *    按时间排序的，我电脑上设置的也是按时间排序的，但是你确实没有体现出来。」
+ *
+ * ## 根因：手机本地会话的 `updatedAt` 是「同步那一刻」，不是「电脑上真实聊过的时间」
+ *
+ * 侧边栏「按时间排序」读的是**手机本地**会话行的 `updatedAt`
+ *（`dsh-client-ui-workspace/lib/client.js:886` 的 `orderByRecency`，
+ *  按 `summary.updatedAt` 降序）。而同步会话在本地是个**空壳** ——
+ * `markSessionNonBlank()` 为了让它在侧边栏可见，补写了一个**占位轮次**
+ *（`turn/start` + `turn/end`，见 `PLACEHOLDER_TURN`）。
+ *
+ * 而官方的 `updatedAt(header, metadata)` 是
+ *（`dsh-api-session-controller/lib/index.js:2124`）：
+ *
+ *     Math.max(header.createdAt, metadata?.lastPromptAt ?? 0)
+ *
+ * 这两个值都来自**本地日志的时间戳**。`session.append()` 内部写死
+ * `Date.now()`（`dsh-session` 里 append 的 `time` 字段），**不能从外部指定**。
+ *
+ * 于是：所有同步过来的对话，`updatedAt` ≈ **这次同步的时刻**，
+ * 彼此相差几十毫秒到几秒 ⇒ 排序结果基本等于「谁先被同步」，
+ * 与用户电脑上的时间顺序毫无关系。**排了等于没排。**
+ *
+ * ## 解法：把电脑的真实时间记下来，在**读快照时**覆盖上去
+ *
+ * 改不了本地日志的时间戳，但可以改**投影后的快照**。前端在
+ * `sessions.list` 外面包一层（`wrapSessionListClock`），读 `byId[id].updatedAt`
+ * 时优先用这里的值。官方侧边栏、搜索、置顶排序全都读同一个快照
+ * ⇒ 一处覆盖，全局生效，而且**不落盘任何伪造的日志事件**。
+ *
+ * @returns `Record<sessionId, number>`（毫秒时间戳）。
+ */
+function loadDesktopTimes() {
+	return readDesktopMeta().times;
+}
+
+/**
+ * 读「同步会话 → 我们给它建本地空壳的时刻」的落盘映射。
+ *
+ * 见 `readDesktopMeta()` 里 `syncedAt` 的注释：前端要靠它区分
+ * 「本地那个 `updatedAt` 是同步那一刻的假值」还是「用户真的在手机上聊过」。
+ *
+ * @returns `Record<sessionId, number>`（毫秒时间戳）。
+ */
+function loadDesktopSyncedAt() {
+	return readDesktopMeta().syncedAt;
+}
+
+/**
+ * 读「哪些同步会话在电脑上是置顶的」的落盘映射。
+ *
+ * 用户 2026-10-29 报障：「电脑的某些对话人家是置顶的状态，你也没有把置顶的
+ * 状态同步过来」。
+ *
+ * 置顶在官方是 `workspaceRegistry` 的**全局**集合（`pinnedSessionIds`），
+ * 前端从 `workspaces.list` 快照的 `pinnedSessionIds` 里读
+ *（`dsh-client-ui-workspace/lib/client.js:3525`）。手机上这个集合是空的 ——
+ * 因为同步会话从没在手机上调过 `pinSession()`。
+ *
+ * 本映射记录「电脑说这条是置顶的」，供前端在会话就绪后
+ * 调官方 `workspaces.pinSession()` 把它补上。
+ *
+ * ⚠️ **必须等会话在本地"已知"**才能 pin：宿主的
+ * `workspaceRegistry.pinSession()` 会校验 `sessionKnown(id)`
+ *（活会话 / header 索引 / 持久化清单三者之一），且拒绝已归档的 id。
+ *
+ * @returns `Record<sessionId, true>`。
+ */
+function loadDesktopPins() {
+	return readDesktopMeta().pins;
+}
+
+/**
+ * 读 `desktop-meta.json`（容错：文件不存在 / 损坏 / 形状不对一律当空）。
+ *
+ * ⚠️ 校验要**严**：这两个值直接进排序比较。混进一个字符串或 `NaN`，
+ * `b.rank - a.rank` 就是 `NaN`，整段排序静默失效 —— 那正是本版要修的 bug 本身，
+ * 不能在新代码里重新制造一遍。
+ *
+ * @returns `{{times: Record<string, number>, pins: Record<string, true>}}`。
+ */
+function readDesktopMeta() {
+	const empty = { times: {}, pins: {}, syncedAt: {} };
+	let parsed;
+	try {
+		parsed = JSON.parse(readFileSync(DESKTOP_META_PATH, 'utf8'));
+	} catch {
+		return empty;
+	}
+	if (parsed === null || typeof parsed !== 'object') return empty;
+	/** @type {Record<string, number>} */
+	const times = {};
+	const rawTimes = parsed.times;
+	if (rawTimes !== null && typeof rawTimes === 'object') {
+		for (const [key, value] of Object.entries(rawTimes)) {
+			if (typeof key !== 'string' || key === '') continue;
+			// ⚠️ 只认**有限的非负数字**：`NaN` / `Infinity` / 字符串都会让
+			// 排序比较得出 `NaN`（JS 里 `NaN - x` 恒为 NaN），整段排序失效。
+			if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) continue;
+			times[key] = value;
+		}
+	}
+	/** @type {Record<string, true>} */
+	const pins = {};
+	const rawPins = parsed.pins;
+	if (rawPins !== null && typeof rawPins === 'object') {
+		for (const [key, value] of Object.entries(rawPins)) {
+			if (typeof key === 'string' && key !== '' && value === true) pins[key] = true;
+		}
+	}
+	/**
+	 * `sessionId → 我们给它建本地空壳的时刻`（毫秒）。
+	 *
+	 * ## 为什么必须有这个基准（否则整个修复无效）
+	 *
+	 * 前端覆盖 `updatedAt` 时必须判断「本地那个时间戳是真的还是假的」：
+	 *
+	 *   · 同步建出来的空壳，本地 `updatedAt` **就是同步那一刻**
+	 *     （占位轮次的时间）；这是**假值**，必须用电脑的替换 ——
+	 *     哪怕电脑的时间**更小**；
+	 *   · 用户在同步之后真的在手机上聊过，本地 `updatedAt` 是**真值**，
+	 *     这时用电脑的旧时间覆盖会让它往下沉，是错的。
+	 *
+	 * 光看「谁大」**区分不了这两种情况**：
+	 * 假值的特征是「≈ 同步时刻」，而它必然比电脑上的真实时间**大**
+	 *（同步发生在电脑那次对话之后）。所以「取 max」在所有同步会话上
+	 * 都是**空操作** —— 这个修复会完全失效，而代码看起来完全正确。
+	 *
+	 * 有了这个基准，判据就变成：
+	 * `本地 updatedAt <= 建壳时刻 + 宽限` ⇒ 假值 ⇒ 用电脑时间；
+	 * 否则 ⇒ 真值 ⇒ 取 max。
+	 */
+	/** @type {Record<string, number>} */
+	const syncedAt = {};
+	const rawSynced = parsed.syncedAt;
+	if (rawSynced !== null && typeof rawSynced === 'object') {
+		for (const [key, value] of Object.entries(rawSynced)) {
+			if (typeof key !== 'string' || key === '') continue;
+			if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) continue;
+			syncedAt[key] = value;
+		}
+	}
+	return { times, pins, syncedAt };
+}
+
+/**
+ * 把 `desktop-meta.json` 写盘。
+ *
+ * 与 `saveRemoteSessions` 一样**从不外抛**：这两个字段是纯展示元数据，
+ * 写不进去最坏是「下次启动顺序退回旧行为」，绝不能让同步流程失败。
+ *
+ * @param times - `Record<sessionId, number>`。
+ * @param pins - `Record<sessionId, true>`。
+ * @param syncedAt - `Record<sessionId, number>`（建壳时刻，见 `readDesktopMeta`）。
+ * @param logger - Cordis logger。
+ */
+function saveDesktopMeta(times, pins, syncedAt, logger) {
+	try {
+		mkdirSync(STATE_DIR, { recursive: true });
+		writeFileSync(
+			DESKTOP_META_PATH,
+			JSON.stringify(
+				{ times: { ...times }, pins: { ...pins }, syncedAt: { ...syncedAt } },
+				null,
+				2,
+			),
+			{ mode: 0o600 },
+		);
+	} catch (error) {
+		logger?.warn?.(
+			`[dsh-remote-mobile] 保存电脑侧元数据失败: ${String(error?.message ?? error)}`,
+		);
+	}
+}
+
 function loadTurnOffsets() {
 	try {
 		const parsed = JSON.parse(readFileSync(SESSIONS_PATH, 'utf8'));
@@ -741,6 +1069,271 @@ function saveRemoteSessions(set, logger, synced, paths, titles, turnOffsets, mod
  * @param init - `fetch` 的第二参数。
  * @returns 响应。
  */
+/**
+ * 单次远程请求的**整体超时**（毫秒）。
+ *
+ * ## ⚠️ 为什么必须有（用户报障 2026-10-28）
+ *
+ * 用户原话：「手机同步电脑端工作区会话…电脑端能正常拉起新增的模型，手机端
+ * 同步工作区后看不到新增的模型，选择模型也没有新增的模型选项，**并提示模型
+ * 列表刷新中**」—— 截图里那句「正在刷新模型列表…」一直挂着不消失。
+ *
+ * 根因：`remoteFetch` 只做了「重试」，**从来没有任何超时**。隧道一旦出现
+ * 半死连接（TCP 连着但对端不回、Cloudflare 边缘挂住、电脑进程被冻结），
+ * `fetch` 就会无限等下去：
+ *
+ *   - `modelCatalog` 挂住 ⇒ 前端 `ModelCatalogDirectory.load()` 的 Promise
+ *     永不 settle ⇒ 加载态永远不收 ⇒ 用户看到「正在刷新模型列表…」；
+ *   - 连带 `mergeCatalog` 那一行 `await desktopCatalog()` 也永不返回，
+ *     于是**电脑那几组模型根本进不了菜单**，用户只能看到手机本地的官方模型。
+ *
+ * 两个症状是**同一个根因**，只是表现不同。这在用户截图里同时出现了。
+ *
+ * ## 取值理由
+ *
+ * 正常 RPC（`modelCatalog` / `presetList` / `listDirectory`）在良好网络下
+ * 都是几十毫秒到一两秒。跨公网走隧道 + 电脑侧要扫描 provider，给到 15 秒
+ * 已经非常宽裕；再长用户就真的会以为「卡死了」。
+ *
+ * ⚠️ 两条底层通道（undici 池 / `node:https`）**都已经支持 `init.signal`**，
+ * 所以 abort 会真正断开 socket，不是只 reject 外层。
+ */
+/*
+ * ## ⚠️⚠️ 默认超时：**60 秒**，不是 15 秒（用户 2026-10-29 严厉批评后改）
+ *
+ * 用户原话：「你妈的 我是不是明确说过 超时时间你给我调长一点？既然能配对
+ * 成功 肯定说明是联通的呀 你又突然给我搞一个 15 秒超时 是何意味啊」——
+ * 他说得对，而且这是我**第二次**犯同一个错。
+ *
+ * ## 错在哪（思路本身是错的，不只是数值）
+ *
+ * 上一版我用的是「逐个方法延长」：只给 `readHistory` 等几个"重活"调大，
+ * 其余全部落回 15 秒默认值。结果 `listDirectory`（列电脑目录）就是 15 秒
+ * —— 用户在「选择工作区目录」面板里选电脑、列目录，慢一点就报
+ * 「电脑没有响应（15 秒超时）」，而这个报错还是硬编码的字符串。
+ *
+ * 补丁式的思路注定漏 —— **会有下一个没列进白名单的方法**。
+ *
+ * ## 现在的思路：反过来
+ *
+ * **默认值必须宽**（60 秒），只有**明确希望快速失败**的少数方法才单独缩短。
+ * 这样即使将来新增 RPC 忘了登记，最坏结果只是"等久一点"，而不是"误报超时"。
+ *
+ * ## 60 秒的依据
+ *
+ * 用户反复要求：「通的话你就多等一会嘛，等个一分钟也没有问题的」。
+ * 而"真的连不上"这种情况**不靠超时值来发现** —— 靠 `probeTunnelBeforeHeavyCall`
+ * 那 4 秒的 ping 预检（不通就立刻报错，不让用户白等）。
+ * 也就是说：ping 负责快速发现"断"，超时负责容忍"慢"。两者分工，互不干扰。
+ */
+const REMOTE_FETCH_TIMEOUT_MS = 60_000;
+
+/**
+ * 电脑侧数据（模型目录 / 预设名单）缓存的**保鲜期**（毫秒）。
+ *
+ * ## ⚠️⚠️ 为什么必须定义在**模块级**
+ *
+ * 它同时被两个作用域使用：
+ *
+ *   · `apply()` 里的 `desktopCatalog` / `patchPresets`（闭包）；
+ *   · `handleBridge`（**模块级**）里的 `modelCatalog` / `presetList` 分支。
+ *
+ * 如果只在 `apply()` 里定义 `const`，模块级那两个分支引用它就是
+ * `DESKTOP_CACHE_TTL_MS is not defined` —— 而这两个分支正是
+ * **模型与预设菜单的唯一数据源**，挂了就是两个菜单全空。
+ *
+ * 这与 `invalidateDesktopCache` 崩溃（同一天真机报错）是**同一个坑**：
+ * 闭包常量被模块级代码引用。上提到模块级就彻底消除了这类可能。
+ *
+ * ## 取值理由
+ *
+ * 5 分钟：够短（用户在电脑上改完预设、回到手机点新建对话，
+ * 大概率超过 5 分钟），也够长（前端在加载态里会反复调，
+ * 5 分钟窗口把它们全部压成缓存命中，不会每次都走隧道）。
+ */
+const DESKTOP_CACHE_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * 按方法覆盖超时（毫秒）。没列出的走 `REMOTE_FETCH_TIMEOUT_MS`（60 秒）。
+ *
+ * ⚠️ **这里的语义是"例外"，不是"白名单"**：
+ * 只有那些"慢到 60 秒仍然不正常、宁可早点报错"的方法才需要写进来。
+ * 新增 RPC 忘了登记**不会有问题**（走 60 秒默认值）。
+ *
+ * ## 各方法取值
+ *
+ * · `readHistory` 120 秒 —— 一页 30 条实测 485 KB，弱网 + 电脑冷启动读
+ *   热会话 + 消息带图片时能到 20 秒以上。用户明确要求"等一分钟也没问题"，
+ *   历史是他主动点开等着的，多等无妨。
+ * · `readEvents` 90 秒 —— 比 history 小但要连续拉，给宽一点。
+ * · `attachment` 120 秒 —— 图片/文件字节，体积不可控。
+ * · `listDirectory` 60 秒 —— 电脑侧要扫盘（网络盘、机械盘慢），
+ *   走默认值即可，**不要缩短**（上一版就是因为这里落回 15 秒报的错）。
+ * · `modelCatalog` / `presetList` 60 秒 —— 电脑要扫描 provider 配置，
+ *   同样走默认值，不缩短。
+ */
+const TIMEOUT_BY_METHOD = {
+	readHistory: 120_000,
+	readEvents: 90_000,
+	attachment: 120_000,
+};
+
+/**
+ * 取某个方法该用的超时。
+ *
+ * @param method - RPC 方法名。
+ * @returns 毫秒。
+ */
+function timeoutForMethod(method) {
+	const custom = TIMEOUT_BY_METHOD[method];
+	if (typeof custom === 'number' && custom > 0) return custom;
+	return REMOTE_FETCH_TIMEOUT_MS;
+}
+
+/**
+ * 隧道连通性的**近期快照**（内存，不落盘）。
+ *
+ * ## 为什么需要（用户 2026-10-29 的要求）
+ *
+ * 用户原话：「你设计的 15 秒超时时间，我个人觉得是有点短了，而且你是根据
+ * 什么来判断它超时的，是因为 15 秒电脑还没有返回数据列表还是因为什么原因，
+ * 我觉得你完全可以就是配对成功同步之前就先 ping 一下通不通，通的话你就
+ * 多等一会嘛，等个一分钟也没有问题的」。
+ *
+ * 用户说的完全对：**「超时」和「连不上」是两件事**，用同一个时间阈值
+ * 区分不了。正确做法是分开判断：
+ *
+ *   · 先花 4 秒 ping 一次 —— 通了说明隧道是活的，慢只是"数据多"；
+ *   · 通了 ⇒ 重活（读历史）放宽到 90 秒，用户要的"多等一会"；
+ *   · 不通 ⇒ 立刻报"连不上电脑"，不让用户白等 90 秒。
+ *
+ * ## 缓存 30 秒的理由
+ *
+ * 每次读历史前都 ping 一次会多一个隧道往返（冷启动 2–3 秒），
+ * 反而变慢。而隧道状态在 30 秒内不会突变，所以缓存住结论：
+ * 一次 ping 管 30 秒内的所有重活。
+ */
+const tunnelProbe = { at: 0, ok: false, latencyMs: null, reason: '' };
+
+/** 探测结论的有效期（毫秒）。 */
+const TUNNEL_PROBE_TTL_MS = 30_000;
+
+/**
+ * 在线状态探针的超时（见 `pingStatus`）。
+ *
+ * 比 `REMOTE_FETCH_TIMEOUT_MS` 短得多：探针要快速给出结论，
+ * 4 秒足够覆盖 Cloudflare 隧道冷启动的首包延迟，又不会让状态灯长时间失准。
+ */
+const PING_STATUS_TIMEOUT_MS = 4_000;
+
+/**
+ * 重活前置预检的 ping 超时（毫秒）。
+ *
+ * ## ⚠️ 为什么不复用 `PING_STATUS_TIMEOUT_MS`（4 秒）
+ *
+ * 两者目的完全不同：
+ *
+ *   · 状态灯（4 秒）：要**快速**给出"亮/灰"。宁可偶尔误报离线，
+ *     也不能让状态灯长时间失准 —— 它只是个提示，错了代价很小；
+ *   · 前置预检（这个）：要**准确地**回答"能不能连上"。它一旦判"不通"，
+ *     用户就直接看到报错、什么都读不到。所以宁可多等，不能误杀。
+ *
+ * 用户原话：「既然能配对成功 肯定说明是联通的呀」。配对成功已经证明隧道
+ * 配置正确，那就该给它足够的时间证明自己活着 —— 15 秒。
+ *
+ * 真正的死连接由 60 秒的重活超时兜底，预检只是"提前止损"，不是"唯一判据"。
+ */
+const TUNNEL_PROBE_TIMEOUT_MS = 15_000;
+
+/**
+ * 读历史这类"重活"执行前的连通性预检。
+ *
+ * @param config - `{ endpoint, token }`。
+ * @param method - 要执行的方法（用于日志）。
+ * @returns `{ ok, latencyMs, reason }`；`ok === false` 表示隧道不通。
+ */
+async function probeTunnelBeforeHeavyCall(config, method) {
+	const now = Date.now();
+	// 缓存有效就直接用上一个结论（省一次隧道往返）。
+	if (tunnelProbe.at !== 0 && now - tunnelProbe.at < TUNNEL_PROBE_TTL_MS) {
+		return { ok: tunnelProbe.ok, latencyMs: tunnelProbe.latencyMs, reason: tunnelProbe.reason, cached: true };
+	}
+	const startedAt = Date.now();
+	try {
+		await withTimeout(
+			(signal) => remoteFetch(`${config.endpoint}/api/dsh-remote/rpc`, {
+				method: 'POST',
+				headers: {
+					'content-type': 'application/json',
+					'x-dsh-remote-token': config.token,
+				},
+				body: JSON.stringify({ id: randomUUID(), method: 'ping', params: {} }),
+				signal,
+			}),
+			TUNNEL_PROBE_TIMEOUT_MS,
+			'连通性预检',
+		);
+		tunnelProbe.at = Date.now();
+		tunnelProbe.ok = true;
+		tunnelProbe.latencyMs = tunnelProbe.at - startedAt;
+		tunnelProbe.reason = '';
+		return { ok: true, latencyMs: tunnelProbe.latencyMs, reason: '', cached: false };
+	} catch (error) {
+		const reason = String((error && (error.message || error.code)) || error);
+		/*
+		 * ## ⚠️⚠️ 失败结论**不进缓存**（2026-10-29 修，是个隐患）
+		 *
+		 * 上一版这里把失败写进了 `tunnelProbe`，于是「一次预检超时」会锁定
+		 * 接下来 30 秒：用户马上再点一次，仍然立刻报「连不上电脑」，
+		 * 一秒机会都不给 —— 而隧道抖动、电脑刚唤醒都很常见。
+		 *
+		 * 用户原话：「既然能配对成功 肯定说明是联通的呀」。对：配对成功是
+		 * 一个**强证据**，不该被一次 15 秒的探测失败推翻。
+		 *
+		 * 所以失败只影响**这一次**调用（返回 ok:false 让调用方决定怎么办），
+		 * 缓存保持「未知」状态，下次调用会重新探测。
+		 *
+		 * 只有成功才缓存 —— 那是确定的事实，30 秒内不必重复探。
+		 */
+		void method;
+		return { ok: false, latencyMs: null, reason, cached: false };
+	}
+}
+
+/**
+ * 把一次探测结论记进缓存（供 `pingStatus` 复用，避免两条路各自 ping）。
+ *
+ * @param ok - 是否连通。
+ * @param latencyMs - 延迟毫秒。
+ * @param reason - 不通时的原因。
+ */
+function rememberTunnelProbe(ok, latencyMs, reason) {
+	tunnelProbe.at = Date.now();
+	tunnelProbe.ok = ok === true;
+	tunnelProbe.latencyMs = typeof latencyMs === 'number' ? latencyMs : null;
+	tunnelProbe.reason = typeof reason === 'string' ? reason : '';
+}
+
+/**
+ * 给一次远程调用套超时。
+ *
+ * @param run - `(signal) => Promise`，接收一个会被超时触发的 signal。
+ * @param ms - 超时毫秒。
+ * @param label - 出错信息里的标识。
+ */
+async function withTimeout(run, ms, label) {
+	const controller = new AbortController();
+	const timer = setTimeout(() => {
+		controller.abort(new Error(`${label} 超过 ${Math.round(ms / 1000)} 秒未响应`));
+	}, ms);
+	timer.unref?.();
+	try {
+		return await run(controller.signal);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 async function remoteFetch(url, init) {
 	// ⚠️⚠️ **禁止跟随重定向**（外部审计 M7）。实测：302 跨源会**带着
 	// `x-dsh-remote-token`** 打到攻击者的主机上，307 则会把整个请求体
@@ -1063,20 +1656,63 @@ async function callRemote(config, method, params = {}) {
 		// 未配对 = 没有令牌。**不要**提示用户去手改文件：面向大众的主路径是配对。
 		throw new Error('还没配对：请在电脑的「设置 → 手机远程」里生成配对码，再到「添加工作区 → 电脑」填进去');
 	}
-	const res = await remoteFetch(`${config.endpoint}/api/dsh-remote/rpc`, {
-		method: 'POST',
-		headers: {
-			'content-type': 'application/json',
-			'x-dsh-remote-token': config.token,
-		},
-		body: JSON.stringify({ id: randomUUID(), method, params }),
-	}).catch((error) => {
+	// ⚠️ **必须套超时**，理由见 `REMOTE_FETCH_TIMEOUT_MS` 的长注释
+	//（用户报障：模型菜单永远「正在刷新模型列表…」、电脑的自定义模型不出现）。
+	const res = await withTimeout(
+		(signal) => remoteFetch(`${config.endpoint}/api/dsh-remote/rpc`, {
+			method: 'POST',
+			headers: {
+				'content-type': 'application/json',
+				'x-dsh-remote-token': config.token,
+			},
+			body: JSON.stringify({ id: randomUUID(), method, params }),
+			signal,
+		}),
+		/*
+		 * 按方法分级（见 `TIMEOUT_BY_METHOD` 的长注释）。
+		 *
+		 * ⚠️ 这里不能写死 `REMOTE_FETCH_TIMEOUT_MS`：`readHistory` 一页几百 KB，
+		 * 15 秒在弱网下必然 abort，而 abort 之后历史拦截器会退回读**本地**，
+		 * 同步会话本地又没有历史 ⇒ 界面永远「载入历史…」。
+		 */
+		timeoutForMethod(method),
+		`请求电脑（${method}）`,
+	).catch((error) => {
 		// ⚠️ **网络层失败也要说人话**（同下面按状态码分档的理由）。
 		//
 		// `fetch` 抛的是 `TypeError: fetch failed` / `UND_ERR_CONNECT_TIMEOUT`
 		// 这类东西，用户完全看不懂。而这几种都是**手机自己没网**（地铁里、
 		// 飞行模式、Wi-Fi 刚断），是最常见的场景之一，必须给一句能行动的提示。
 		const text = String((error && (error.code || error.message)) || error);
+		// ⚠️ **超时/取消要和「没网」分开说**：超时意味着连上了但电脑不回
+		//（隧道半死、电脑休眠、进程冻结），让用户去查手机网络只会白费力气。
+		// ⚠️ 判据要**宽**：不同通道 abort 抛的东西不一样 ——
+		//    undici 抛 `AbortError`，`node:https` 那条自己构造的是
+		//    `Error('The operation was aborted')`，而 `controller.abort(reason)`
+		//    在部分路径上会把我们传进去的 reason（`…未响应`）原样抛出。
+		//    实测（假服务器永不响应）：`name` 是 `Error`、message 带「未响应」。
+		//    只认 `AbortError` 会漏掉，于是用户看到一句英文原文。
+		if (
+			error
+			&& (
+				error.name === 'AbortError'
+				|| error.name === 'TimeoutError'
+				|| /abort|超时|未响应|取消|timeout/i.test(text)
+			)
+		) {
+			/*
+			 * ⚠️ 秒数必须取**这次实际用的超时**，不能写全局常量。
+			 *
+			 * 原来这里写 `REMOTE_FETCH_TIMEOUT_MS`，而实际生效的是
+			 * `timeoutForMethod(method)` —— 于是 `readHistory`（120 秒）超时后
+			 * 提示里说的是 15 秒（当时的默认值），用户对着错误的数字排查。
+			 * 这类"文案与实际不符"的 bug 比报错本身更让人困惑。
+			 */
+			throw new Error(
+				`电脑没有响应（${Math.round(timeoutForMethod(method) / 1000)} 秒超时）。`
+					+ '请确认电脑上的 DSH 还开着、没休眠、隧道没断，然后重试一次',
+			);
+		}
 		if (/ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ETIMEDOUT|UND_ERR|fetch failed|network/i.test(text)) {
 			throw new Error(`手机这边连不上外网，请检查网络后重发（${text.slice(0, 60)}）`);
 		}
@@ -1177,7 +1813,22 @@ async function claimPairing(code) {
 	if (typeof endpoint !== 'string' || typeof token !== 'string' || token === '') {
 		throw new Error('配对服务器没有返回完整的连接信息');
 	}
-	return saveConfig(endpoint, token);
+	// ⚠️ **配对成功这一刻就把白名单落盘**，别指望用户自己去配。
+	//
+	// 服务方换域名后，编译期默认值 `jiulingssh.xyz` 就过期了，所有用户配对
+	// 完一个请求都发不出去（「拒绝对 <新域名> 发送凭据」），而界面上没有任何
+	// 修改入口。这里用服务器返回的 `hostname` 反推区名写进 `mobile.json`，
+	// 用户什么都不用做。
+	//
+	// 优先级：服务器显式给的 `zone` > 从 `hostname` 推导 > 保持原值。
+	const derivedZone =
+		typeof payload.zone === 'string' && payload.zone.trim() !== ''
+			? payload.zone.trim()
+			: zoneFromHostname(payload.hostname);
+	const saved = saveConfig(endpoint, token, derivedZone === '' ? undefined : { zone: derivedZone });
+	// 立刻生效，不必等重启：`assertTrustedHost` 读的是这个模块级变量。
+	if (saved.zone !== undefined) activeZone = saved.zone;
+	return saved;
 }
 
 /**
@@ -1353,6 +2004,61 @@ function isWireEvent(event) {
  * @param state - 该会话的搬运状态 `{ skippedSeeds }`。
  * @returns 是否写入了。
  */
+/**
+ * 校验一条 `agent/inbox/spliced` 能不能安全写入本地日志。
+ *
+ * 返回 `null` 表示合法，否则返回不合法的原因。
+ *
+ * ## 规则完全取自官方（不自己发明）
+ *
+ * `dsh-agent-loop/lib/index.js:38-40` 的投影器：
+ *
+ *     const inbox = state[splice.target];            // 重放出来的数组
+ *     if (splice.start < 0 || splice.start > inbox.length) throw ...
+ *     if (splice.start + removedCount > inbox.length) throw ...
+ *
+ * 所以只要我们先重放一遍得到同样的 `inbox`，就能提前知道
+ * 这条写进去会不会把会话搞废。
+ *
+ * @param session - 本地镜像会话（需要 `log`）。
+ * @param splice - 待写入的 splice data。
+ * @returns `null` 表示合法；否则是原因字符串。
+ */
+function rejectInboxSplice(session, splice) {
+	const target = splice?.target;
+	if (target !== 'next-turn' && target !== 'next-step') return `未知 target=${JSON.stringify(target)}`;
+	const log = Array.isArray(session?.log) ? session.log : null;
+	if (log === null) return '拿不到本地日志，无法校验';
+	// 用与官方相同的形状重放：只关心两个队列的**长度**
+	//（splice 只依赖长度与位置，不依赖内容）。
+	const inbox = { 'next-turn': [], 'next-step': [] };
+	for (const record of log) {
+		if (record === null || typeof record !== 'object') continue;
+		if (record.type !== 'agent/inbox/spliced') continue;
+		const past = record.data;
+		if (past === null || typeof past !== 'object') continue;
+		const bucket = inbox[past.target];
+		if (bucket === undefined) continue;
+		const start = past.start;
+		const removedCount = past.removedCount ?? 0;
+		if (!Number.isSafeInteger(start) || start < 0 || start > bucket.length) continue;
+		if (!Number.isSafeInteger(removedCount) || removedCount < 0) continue;
+		if (start + removedCount > bucket.length) continue;
+		const inserted = Array.isArray(past.inserted) ? past.inserted.length : 0;
+		bucket.splice(start, removedCount, ...new Array(inserted).fill(0));
+	}
+	const bucket = inbox[target];
+	const start = splice.start;
+	const removedCount = splice.removedCount ?? 0;
+	if (!Number.isSafeInteger(start) || start < 0) return `start 非法=${String(start)}`;
+	if (!Number.isSafeInteger(removedCount) || removedCount < 0) return `removedCount 非法=${String(removedCount)}`;
+	if (start > bucket.length) return `start=${start} 超出本地 inbox 长度=${bucket.length}`;
+	if (start + removedCount > bucket.length) {
+		return `start=${start}+removed=${removedCount} 超出本地 inbox 长度=${bucket.length}（序列错位）`;
+	}
+	return null;
+}
+
 function mirrorEvent(session, event, state) {
 	// 同理：`type` 必须是字符串，否则 `session.append` 会拿到非字符串的键。
 	if (typeof event.type !== 'string' || event.type === '') {
@@ -1476,6 +2182,51 @@ function mirrorEvent(session, event, state) {
 	if (turnOffset > 0 && data !== null && typeof data === 'object' && typeof data.turn === 'number') {
 		data = { ...data, turn: data.turn + turnOffset };
 	}
+	/*
+	 * ## ⚠️⚠️ 写入前对 `agent/inbox/spliced` 做一道前置校验（2026-10-29 真机报错）
+	 *
+	 * 用户报障原文：
+	 *   「我在手机新建电脑对话，成功，但后续我再次打开该对话就报错了」
+	 * 界面红字：
+	 *   `历史加载失败： failed to project session "…":
+	 *    invalid persisted inbox splice at session seq 5 (gateway/internal)`
+	 *
+	 * ## 为什么会出这个错
+	 *
+	 * 官方投影器（`dsh-agent-loop/lib/index.js:34`）重放时要求：
+	 *
+	 *     splice.start + removedCount <= inbox.length
+	 *
+	 * 而 `inbox` 是**重放过来**的待处理消息数组。两端的事件序列只要差一条
+	 *（比如本地多了占位轮次、标题事件、end-seed），
+	 * 「插入用户消息」那条就会被当成「已写过」丢掉，
+	 * 而「消费它」的 `removedCount:1` 又照样写进去 ⇒ splice 链断裂
+	 * ⇒ **整个会话永久打不开**（每次打开都重放到这里就报错）。
+	 *
+	 * `seqDelta` 校准靠的是「第一条到达的事件」反推，而事件流可以从
+	 * 任意位置开始（断流重连、新建会话后重开、补洞），
+	 * 所以这个校准**本身就不可靠**。彻底修正需要换掉猜测式对齐（见下方 TODO）。
+	 *
+	 * ## 这道防线做什么
+	 *
+	 * 在写入**之前**用官方同一套规则验一遍：不合法就**丢弃这一条**。
+	 *
+	 * 丢一条 splice 的后果是「本地 inbox 多了一条未被消费的消息」
+	 *（界面上可能多一个气泡），而写进去的后果是**对话永远打不开**。
+	 * 两害相权取其轻 —— 宁可少一个气泡，不能让会话变砖。
+	 *
+	 * ⚠️ 只限 `agent/inbox/spliced`：其它事件没有这种「索引依赖上游状态」
+	 * 的特性，丢了只会少一段内容，不会让整个会话报错。
+	 */
+	if (event.type === 'agent/inbox/spliced' && data !== null && typeof data === 'object') {
+		const bad = rejectInboxSplice(session, data);
+		if (bad !== null) {
+			void debugLog(
+				`丢弃不合法 inbox splice session=${session.id} seq=${event.seq}: ${bad}`,
+			);
+			return false;
+		}
+	}
 	session.append(event.type, data, opts);
 	return true;
 }
@@ -1553,6 +2304,105 @@ function deriveRunning(ctx, sessionId, event, state) {
 
 /** 降级（= 拿不到引擎判据）只告警一次，别刷屏。 */
 let bridgeDegradedWarned = false;
+
+/**
+ * **补拉电脑上还等着手机回答的 ask 弹窗。**
+ *
+ * ## 这个函数存在的唯一理由（2026-10-28 粉丝反馈）
+ *
+ * 用户原话（作者转述）：
+ *
+ * 「他电脑上面已经有一个会话了，但此时他是没有在手机 APP 内的，
+ *   它已经发起了一个 ask 弹窗，然后此时用户去打开我们的 APP，
+ *   它虽然消息同步过来了，但是弹窗没有同步过来，也就是说它如果是
+ *   后打开的话，它的弹窗是无法显示的，用户就无法审批。」
+ *
+ * ## 为什么会这样
+ *
+ * ask 是**推送**（电脑 → 手机 SSE）。手机没连着就收不到。而原来的
+ * 电脑端实现更彻底：手机没连着时**连请求都不登记**，直接 fallback
+ * 给官方 GUI —— 所以手机后来打开时，电脑上没有任何东西可以补。
+ *
+ * 现在电脑端改成「无论手机在不在都登记」，于是这里有东西可补了。
+ *
+ * ## 什么时候调
+ *
+ * · 每次建立事件流之后（`followSynced` / `controller.follow` 那条路）；
+ * · 手机端 App 回到前台时（`visibilitychange`）。
+ *
+ * 两处都是"手机刚重新连上"的时刻 —— 正是用户说的"后打开 APP"。
+ *
+ * ## 幂等
+ *
+ * 同一条 ask 可能被补拉多次（流断重连），所以用 `requestId` 去重：
+ * 已经弹过的直接跳过，不会在界面上叠出两个一样的弹窗。
+ *
+ * ⚠️ **不 await、不抛错**：补拉失败（电脑离线、隧道断）绝不能让
+ * 事件流建不起来 —— 那是主链路。
+ *
+ * @param ctx - Cordis 上下文。
+ * @param config - 连接配置（`{endpoint, token}`）。
+ */
+const pulledAskIds = new Set();
+
+function pullPendingAsks(ctx, config) {
+	if (config === undefined || config === null || config.token === '') return;
+	callRemote(config, 'pendingAsks', {})
+		.then(async (result) => {
+			const requests = Array.isArray(result?.requests) ? result.requests : [];
+			if (requests.length === 0) return;
+			try {
+				appendFileSync(
+					join(STATE_DIR, 'mobile-debug.log'),
+					`${new Date().toISOString()} 补拉待审批 ask: ${requests.length} 条\n`,
+					'utf8',
+				);
+			} catch { /* 日志失败不影响主流程 */ }
+			for (const item of requests) {
+				const requestId = typeof item?.requestId === 'string' ? item.requestId : '';
+				if (requestId === '') continue;
+				// 已经弹过就别重复弹（流断重连会反复调到这里）。
+				if (pulledAskIds.has(requestId)) continue;
+				pulledAskIds.add(requestId);
+				/*
+				 * ⚠️ 已收集的 id 集合不能无限增长：用户一天下来可能积几百条。
+				 * 超过上限就清掉最老的一半 —— 用 Set 的插入顺序（JS 保证）。
+				 */
+				if (pulledAskIds.size > 500) {
+					let drop = 250;
+					for (const old of pulledAskIds) {
+						if (drop <= 0) break;
+						pulledAskIds.delete(old);
+						drop -= 1;
+					}
+				}
+				const sessionId = typeof item.sessionId === 'string' ? item.sessionId : '';
+				const payload = item.payload !== null && typeof item.payload === 'object' ? item.payload : {};
+				/*
+				 * `ghost === true`：这条在电脑端**已经 fallback 给本地 GUI** 了，
+				 * 手机现在作答改不了那一轮的结果（见电脑端 `ghostAsks` 注释）。
+				 *
+				 * 仍然弹出来 —— 用户要的是"知道有这回事"；但带上标记，
+				 * 让界面显示"电脑端可能已处理"，避免他以为自己没点成功。
+				 */
+				if (item.ghost === true) payload.ghost = true;
+				try {
+					// 与实时推送走**完全同一条**渲染路径，保证观感一致。
+					await showAskViaOfficial(ctx, sessionId, { ...payload, requestId, kind: item.kind });
+				} catch (error) {
+					ctx.logger?.warn?.(
+						`[dsh-remote-mobile] 补拉 ask 失败 ${requestId}: ${String(error?.message ?? error)}`,
+					);
+				}
+			}
+		})
+		.catch((error) => {
+			// 电脑离线 / 还没升级到带 pendingAsks 的版本 ⇒ 静默跳过。
+			ctx.logger?.info?.(
+				`[dsh-remote-mobile] 补拉 pendingAsks 跳过: ${String(error?.message ?? error)}`,
+			);
+		});
+}
 
 /**
  * 问一次电脑「这个会话此刻在不在跑」，并把结果派发给前端。
@@ -1727,6 +2577,22 @@ const RPC_BODY_LIMIT = 48 * 1024 * 1024;
 const SSE_BUFFER_LIMIT = 8 * 1024 * 1024;
 
 /**
+ * 运行态「卡死自愈」的静默阈值。
+ *
+ * 用于 `followSynced`：连接还在、运行态为 true，但这么久**一个事件都没来**时，
+ * 主动向电脑问一次真实状态（见那里调用处的长注释）。
+ *
+ * 取 90 秒的理由：
+ *   · 正常一轮会有 reasoning / text / tool 等大量帧，90 秒完全静默几乎不可能是
+ *     「真的还在跑」；
+ *   · 也不能太短 —— 模型长时间思考、或某个工具调用本身很慢（比如跑一次构建）
+ *     时，中间可能确实几十秒没有帧。取 60 秒会误判，120 秒又让用户多等半分钟。
+ *
+ * ⚠️ 这个值同时用作「两次校正之间的最小间隔」，避免持续卡死时每分钟狂问。
+ */
+const STALL_RECONCILE_MS = 90_000;
+
+/**
  * 一次 SSE 连接活过这么久，就认为它是**健康**的，重连退避归零。
  *
  * 桌面端每 15s 发一条 `: ping` 心跳，所以一条正常连接必然能活过 15s 以上。
@@ -1853,13 +2719,81 @@ function bridgeRejection(ctx, req) {
  *
  * @param ctx - Cordis 上下文。
  */
+function mergePresets(local, desktop) {
+	const presets = (desktop?.presets ?? []).map((preset) => ({ ...preset, desktop: true }));
+	const seen = new Set(presets.map((preset) => preset.id));
+	for (const preset of local?.presets ?? []) {
+		if (!seen.has(preset.id)) presets.push(preset);
+	}
+	return { ...local, presets, localPresets: local?.presets ?? [] };
+}
+
 export function apply(ctx) {
+
+	/*
+	 * ## ⚠️⚠️ 刷新必须定义在 `apply` 顶层（1.2.81 修）
+	 *
+	 * 它原来定义在 `ctx.effect(() => {…})` 的回调里（行 5283 开始），
+	 * 而使用它的地方在 `ctx.webServer.register({handler: … handleBridge({io: {…}})})`
+	 * （行 6347 开始）—— **两个不同的闭包**，后者取不到前者的 `const`。
+	 *
+	 * 后果不是「小功能失效」，而是**整个插件宿主侧加载失败**：
+	 *
+	 *     dsh: fatal load failure: ReferenceError: refreshOfficialModelCatalog is not defined
+	 *         at .../dsh-jiuling-remote-mobile/lib/index.js:6487:8
+	 *
+	 * 所以目录列表、模型、预设、新建对话全部失效 ——
+	 * 用户截图里那三个症状是同一个根因。
+	 *
+	 * 这正是本文件反复踩过的闭包作用域坑
+	 *（`invalidateDesktopCache` / `DESKTOP_CACHE_TTL_MS` / `mergePresets` / `logWarn`）。
+	 * 定义在 `apply` 顶层，两个闭包就都可见了。
+	 */
+	const refreshModelCatalogDetail = () => {
+		try {
+			const svc = ctx.get?.('modelDirectories');
+			if (svc === undefined || svc === null) return { ok: false, reason: '未注册目录服务' };
+			const catalog = svc.catalog;
+			if (catalog === undefined || catalog === null) return { ok: false, reason: '无 catalog 字段' };
+			if (typeof catalog.refresh !== 'function') return { ok: false, reason: '无 refresh 方法' };
+			catalog.refresh();
+			return { ok: true, reason: '' };
+		} catch (error) {
+			const detail = (error && error.message) ? String(error.message) : String(error);
+			return { ok: false, reason: '刷新抛错：' + detail };
+		}
+	};
+	/* 旧签名保留 */
+	const refreshOfficialModelCatalog = () => refreshModelCatalogDetail().ok === true;
 	const config = loadConfig();
 	// ⚠️ 先把白名单区名切成配置里那个，再走任何网络请求。
 	// 漏了这一步的症状很具体：配对成功、隧道也通，但每次请求都被
 	// `assertTrustedHost` 拦住，报「拒绝对 <你的域名> 发送凭据」。
 	if (typeof config.zone === 'string' && config.zone !== '') activeZone = config.zone;
 	if (typeof config.pairEndpoint === 'string' && config.pairEndpoint !== '') activePairEndpoint = config.pairEndpoint;
+	// ## 老用户自愈：已配对但白名单还是编译期默认值
+	//
+	// 服务方换域名后，**已经配对成功**的用户不会再去走一遍 `claimPairing`，
+	// 于是 `mobile.json` 里没有 `zone`，`activeZone` 仍是过期的 `jiulingssh.xyz`
+	// ⇒ 升级完照样报「拒绝对 <新域名> 发送凭据」，用户只能解绑重配（甚至重配
+	// 也未必好，因为配对服务本身也可能换了域名）。
+	//
+	// 这里按**已落盘的 endpoint** 反推一次：能推出来、且与当前生效值不同，
+	// 就就地修正并写盘。只动 `zone` 一个字段，不碰凭据。
+	if (config.token !== EMPTY_TOKEN) {
+		try {
+			const derived = zoneFromHostname(new URL(config.endpoint).hostname);
+			if (derived !== '' && derived.toLowerCase() !== activeZone.toLowerCase()) {
+				const saved = saveConfig(config.endpoint, config.token, { zone: derived });
+				activeZone = saved.zone;
+				ctx.logger?.info?.(
+					`[dsh-remote-mobile] 白名单按已配对域名自愈: ${config.zone} → ${activeZone}`,
+				);
+			}
+		} catch {
+			// endpoint 不是合法 URL / 写盘失败：保持原样，不影响启动
+		}
+	}
 	ctx.logger?.info?.(
 		`[dsh-remote-mobile] 远端: ${config.endpoint}（凭据白名单: ${activeZone}，配对服务: ${activePairEndpoint}）`,
 	);
@@ -1904,6 +2838,75 @@ export function apply(ctx) {
 	const syncedSessions = loadSyncedSessions();
 
 	/**
+	 * 「App 回到前台」的信号通道。
+	 *
+	 * ## 为什么需要它（用户 2026-10-27 反馈，两条）
+	 *
+	 * 用户原话：「手机悬浮窗没法对话，必须点开前台消息才能发送出去并收到回复」
+	 * 和「必须点开前台才可以对话」。
+	 *
+	 * ## 根因
+	 *
+	 * 手机切到后台后，系统会冻结 JS 定时器（Doze / App Standby）。而我们的
+	 * SSE 重连靠 `await new Promise(r => setTimeout(r, wait))` —— 一旦被冻结，
+	 * 这个 `setTimeout` **永远不会到期**，于是：
+	 *
+	 *   ① 后台期间电脑推来的事件全部丢失（流已断，没人重连）；
+	 *   ② 用户切回前台，`setTimeout` 的剩余时间才开始重新计时 ——
+	 *      最长还要等满 15 秒退避；
+	 *   ③ 这 15 秒里用户发的消息能出去（prompt 是主动 RPC），但**收不到回复**
+	 *      （回复走 SSE，还没连上）。表现就是「发了没反应，得再点一下」。
+	 *
+	 * ## 做法
+	 *
+	 * 维护一组「可被提前唤醒的等待器」。回到前台时调用 `wakeAllRemoteStreams()`，
+	 * 把所有正在退避的等待**立即结束**，流立刻重连。
+	 *
+	 * 唤醒是安全的：等待结束后只是走 `while` 循环的下一轮、重新建连，
+	 * 不涉及任何状态机跳转。
+	 */
+	const streamWakers = new Set();
+
+	/**
+	 * 可被提前唤醒的 sleep。
+	 *
+	 * 与裸 `setTimeout` 的区别只有一点：外部可以在到期前把它叫醒。
+	 * 用于 SSE 重连退避 —— 回到前台时应当**立刻**重连，而不是等退避走完。
+	 *
+	 * @param ms - 最长等待毫秒数。
+	 * @returns 等待结束的 Promise（正常到期或被唤醒都 resolve）。
+	 */
+	function sleepWakable(ms) {
+		return new Promise((resolve) => {
+			let done = false;
+			const finish = () => {
+				if (done) return;
+				done = true;
+				streamWakers.delete(finish);
+				clearTimeout(timer);
+				resolve();
+			};
+			const timer = setTimeout(finish, ms);
+			streamWakers.add(finish);
+		});
+	}
+
+	/**
+	 * 立刻唤醒所有正在退避的远程流。
+	 *
+	 * 由宿主在 App 回到前台时调用（见下面的 `ctx.effect`）。
+	 * 幂等、无副作用：没有等待者时就是空操作。
+	 */
+	function wakeAllRemoteStreams() {
+		if (streamWakers.size === 0) return 0;
+		const n = streamWakers.size;
+		// 复制一份再遍历：`finish()` 会从集合里删自己。
+		for (const finish of [...streamWakers]) finish();
+		return n;
+	}
+
+
+	/**
 	 * `sessionId → 电脑路径` 的落盘映射（见 `loadRemotePaths` 的注释）。
 	 *
 	 * ⚠️ **落盘**，与 `pendingPlans`（故意的内存 Map）不同：这份要活过 App 重启，
@@ -1943,6 +2946,32 @@ export function apply(ctx) {
 	 * 侧边栏重新变「未命名」—— 而用户不会去重新同步一遍。
 	 */
 	const desktopTitles = loadDesktopTitles();
+
+	/**
+	 * `sessionId → 电脑上那次的真实活动时间`（毫秒，**落盘**）。
+	 *
+	 * 见 `loadDesktopTimes()` 的长注释：手机本地会话的 `updatedAt` 是
+	 * 「同步那一刻」，不是「电脑上真正聊过的时间」，所以「按时间排序」
+	 * 排不出用户期望的顺序。这张表由同步流程写入，前端读快照时覆盖上去。
+	 */
+	const desktopTimes = loadDesktopTimes();
+
+	/**
+	 * `sessionId → 这条在电脑上是置顶的`（**落盘**）。
+	 *
+	 * 见 `loadDesktopPins()`。前端据此调官方 `workspaces.pinSession()`，
+	 * 让手机侧边栏的置顶与电脑一致。
+	 */
+	const desktopPins = loadDesktopPins();
+
+	/**
+	 * `sessionId → 我们给它建本地空壳的时刻`（毫秒，**落盘**）。
+	 *
+	 * 见 `readDesktopMeta()` 里 `syncedAt` 的注释 —— 前端全靠这个基准
+	 * 区分「本地 `updatedAt` 是同步时的假值」还是「用户真的聊过」。
+	 * 少了它，「按时间排序」的修复会变成空操作（取 max 永远选本地假值）。
+	 */
+	const desktopSyncedAt = loadDesktopSyncedAt();
 
 	/**
 	 * `sessionId → 本地轮次偏移量`（**落盘**，见 `loadTurnOffsets`）。
@@ -2252,6 +3281,111 @@ export function apply(ctx) {
 		return false;
 	}
 
+	/**
+	 * 找出「野壳」—— 引擎在读不出旧日志时静默新建的随机 id 空会话。
+	 *
+	 * ## 背景（用户真机实测）
+	 *
+	 * 官方 `sessionController.create({sessionId})` 在**读不出**旧日志时
+	 *（损坏 / 格式升级不兼容）会**静默新建一个会话**并正常返回。插件三个调用点
+	 * 原来都不看返回值，于是每点一次同步、每收一次事件就留几个空壳 ——
+	 * 真机累计攒出 **1595 + 1384 + 59 + 10** 个（报告实测数据）。
+	 *
+	 * ## ⚠️ id 形态**不能**用来区分
+	 *
+	 * 我一开始想当然地认为「野壳 id 不以 `session-` 开头」，**这是错的**。
+	 * 官方 `createAgent(brandString(\`session-${randomUUID()}\`), …)`
+	 *（`dsh-api-session-controller/lib/index.js:509`）—— 野壳和真身
+	 * **是同一个格式**，形态上完全无法区分。
+	 *
+	 * ## 判据（三重，全部满足才删）
+	 *
+	 * ① **不在任何账本里** —— `remoteSessions` / `syncedSessions` /
+	 *    `remotePaths` / `desktopTitles` / `turnOffsets` 全都没有它。
+	 *    这是最强的一道：真身一定有账。
+	 * ② **体积 < 1 KB** —— 空壳稳定在 **400 字节**（实测）。
+	 *    门槛定 1 KB 而不是 2 KB：实测 1.5 KB 的「刚建还没说话的会话」
+	 *    会被 2 KB 误删，1 KB 能干净分开（400 vs 1500 间隔足够大）。
+	 * ③ **不是本次刚同步成功的那条**。
+	 *
+	 * 三道同时满足才删。宁可漏删也不误删：留着只是列表里多一个空项，
+	 * 误删就是用户的对话没了。
+	 *
+	 * @param keepId - 本次同步成功的会话 id（永远保留）。
+	 * @returns 可安全删除的野壳 id 列表（可能为空）。
+	 */
+	function findOrphanShells(keepId) {
+		const home = process.env.DSH_HOME ?? '';
+		if (home === '') return [];
+		const root = join(home, 'sessions');
+		let slugs;
+		try {
+			slugs = readdirSync(root, { withFileTypes: true });
+		} catch {
+			return [];
+		}
+		const orphans = [];
+		for (const slug of slugs) {
+			if (!slug.isDirectory()) continue;
+			let ids;
+			try {
+				ids = readdirSync(join(root, slug.name), { withFileTypes: true });
+			} catch {
+				continue;
+			}
+			for (const entry of ids) {
+				if (!entry.isDirectory()) continue;
+				const id = entry.name;
+				if (id === keepId) continue;
+				// ① 任何账本里有它 ⇒ 是在用的会话，绝不碰
+				if (remoteSessions.has(id) || syncedSessions.has(id)) continue;
+				if (remotePaths[id] !== undefined) continue;
+				if (desktopTitles[id] !== undefined) continue;
+				if (turnOffsets[id] !== undefined) continue;
+				// ② 体积判据
+				//
+				// 「空壳」的定义要**同时**满足三条，缺一不可：
+				//
+				//   a. 目录里**没有子目录** —— 有子目录说明可能存着附件、
+				//      分支或其它会话数据，一律不动。
+				//   b. 所有文件加起来 < 1 KB —— 真实会话带一轮对话就远超这个数
+				//      （实测最小真实会话 1500 B）。
+				//   c. 文件数 ≤ 2 —— 正常会话目录会有多个文件（日志、元数据、
+				//      附件索引）；只有一个两个的通常是建了壳没写内容。
+				//
+				// ⚠️ **`size === 0` 也必须算空壳**。早先写成 `size > 0 && size < 1024`，
+				//   把「目录建了但一个字节都没写」这种最典型的空壳排除在外了 ——
+				//   而那恰恰是崩溃/中断时最常见的残留。空目录留着只会越积越多。
+				const dir = join(root, slug.name, id);
+				let size = 0;
+				let fileCount = 0;
+				let hasSubdir = false;
+				try {
+					for (const f of readdirSync(dir, { withFileTypes: true })) {
+						if (f.isDirectory()) {
+							hasSubdir = true;
+							break;
+						}
+						if (!f.isFile()) continue;
+						fileCount += 1;
+						try {
+							size += statSync(join(dir, f.name)).size;
+						} catch {
+							/* 单个文件读不到就当 0 */
+						}
+					}
+				} catch {
+					continue;
+				}
+				if (hasSubdir) continue;
+				if (fileCount > 2) continue;
+				if (size >= 1024) continue;
+				orphans.push(id);
+			}
+		}
+		return orphans;
+	}
+
 	async function ensureLocalMirror(sessionId) {
 		const existing = ctx.sessions?.get?.(sessionId);
 		if (existing !== undefined && existing !== null && typeof existing.append === 'function') {
@@ -2397,7 +3531,131 @@ export function apply(ctx) {
 	 * 读路径**完全不碰网络**。`dirs` **不落盘** —— 它是按层预取的临时加速，
 	 * 数量会膨胀到几百条，存下来既无必要也让文件变大。
 	 */
-	const desktopCache = { catalog: null, presets: null, directory: null, dirs: emptyDirCache(), at: 0 };
+	// `failedAt`：上次拉取失败的时刻，用于短时间内的**失败冷却**（见 `desktopCatalog`）。
+	// 0 表示「从没失败过 / 上次成功」。
+	const desktopCache = {
+		catalog: null,
+		presets: null,
+		directory: null,
+		dirs: emptyDirCache(),
+		at: 0,
+		failedAt: 0,
+		/*
+		 * ## ⚠️⚠️ 拆分时间戳（1.2.44 修 —— 这是「只有一个能刷新」的根因）
+		 *
+		 * `at` 原来被 `catalog`（模型）和 `presets`（预设）**共用**。
+		 * 于是出现了这个致命的时序（都能从代码推出，无需真机）：
+		 *
+		 *   1. 同步完成 ⇒ `invalidateDesktopCache()` ⇒ `at = 0`
+		 *      ⇒ 模型和预设**都该重拉**；
+		 *   2. 前端只要先调其中一个（比如 `mergedPresetList` 拉预设），
+		 *      它拉成功后就把 `at` 刷新成 `Date.now()`；
+		 *   3. 紧接着另一个（`modelCatalog`）看到 `at` 是"刚刚"
+		 *      ⇒ 判定缓存新鲜 ⇒ **不重拉** ⇒ 继续返回旧数据。
+		 *
+		 * 结果：**每次同步后只有先被调用的那一个会更新，另一个永远停在旧数据**。
+		 *
+		 * 这完美解释了用户报的现象：
+		 *   · 「模型列表和预设列表还是老问题，没有同步」——总有一个不刷新；
+		 *   · 「重启之后就马上能显示出来了」——重启后 `at` 从磁盘恢复
+		 *     （或为 0），两者重新竞争，表现与运行中不同，用户以为"重启能修"。
+		 *
+		 * 我前 10 轮一直在改**判据写法**，从没怀疑过"两者共用一个时间戳"
+		 * 这个数据模型本身的错误 —— 判据再怎么改，只要时间戳共用，
+		 * 这个互相"代表"的问题就永远存在。
+		 *
+		 * 现在：模型和预设各有自己的时间戳，互不影响。
+		 * `at` 保留为"最后一次拉到任意数据的时刻"，只用于持久化记录。
+		 */
+		catalogAt: 0,
+		presetsAt: 0,
+	};
+
+	/**
+	 * 电脑模型目录拉失败后的冷却时长（毫秒）。
+	 *
+	 * 见 `desktopCatalog` 的长注释：避免电脑离线时前端每次重试都白等 15 秒，
+	 * 把「正在刷新模型列表…」拖成无限转圈。
+	 */
+	const DESKTOP_CATALOG_RETRY_COOLDOWN_MS = 30_000;
+
+	/**
+	 * 电脑侧数据（模型目录 / 预设名单）缓存的**保鲜期**（毫秒）。
+	 *
+	 * ## 为什么必须有（用户 2026-10-29 报障）
+	 *
+	 * 用户原话：「模型列表和预设列表还是老问题，没有同步……奇怪的是我重启之后
+	 * 再打开它就马上能显示出来了，所以我觉得数据肯定是已经到了手机这边的，
+	 * 肯定是你本地处理有问题」。
+	 *
+	 * 根因：`desktopCache` 的设计是「拉到一次就永远用那份」。这在**离线兜底**
+	 * 场景下是对的（电脑关机时还能看到上次的列表），但用户是在**电脑在线、
+	 * 刚同步完**的时候看菜单 —— 那时他期待的是最新数据。
+	 *
+	 * 于是出现那个很迷惑的现象：数据层是对的（电脑明明有那 8 个预设），
+	 * 手机显示的却是几小时前的旧快照，**重启才刷新**（重启后缓存从磁盘恢复、
+	 * 第一次调用走"为空"分支重新拉）。
+	 *
+	 * ## 取值理由
+	 *
+	 * 5 分钟：
+	 *   · 够短 —— 用户在电脑上改完预设、回到手机点新建对话，大概率超过 5 分钟
+	 *     才需要新数据；即使没超过，下拉刷新/重启也能立刻拿到；
+	 *   · 够长 —— 前端在加载态里会反复调 `remoteExportList` / `modelCatalog`，
+	 *     5 分钟窗口把它们全部压成缓存命中，不会每次都走隧道。
+	 *
+	 * ⚠️ 过期后**先重拉、拉失败就用旧缓存** —— 绝不因为一次网络抖动把菜单清空。
+	 */
+	/* TTL 常量已上提到模块级（见 `DESKTOP_CACHE_TTL_MS` 的定义）。*/
+
+	/**
+	 * 强制刷新一次电脑侧数据（模型目录 + 预设名单 + 目录树）。
+	 *
+	 * 供「同步完成」「配对成功」「用户手动刷新」等明确时机调用 ——
+	 * 那是用户真的期待最新数据的时刻，不该等 TTL 自然过期。
+	 *
+	 * @returns 拉取结果摘要（仅用于日志）。
+	 */
+	const invalidateDesktopCache = () => {
+		/*
+		 * ⚠️⚠️ 只让**过期**，不要清空数据（1.2.40 修）
+		 *
+		 * 原来这里把 `catalog` / `presets` 一律置 `null`：
+		 *
+		 *     desktopCache.catalog = null;
+		 *     desktopCache.presets = null;
+		 *     desktopCache.at = 0;
+		 *
+		 * 后果很具体 —— 同步完成那一刻，好数据被**扔掉**了：
+		 *
+		 *   · `desktopCatalog()` 开头有 `if (catalog !== null)` 的"保留旧缓存"
+		 *     逻辑，拉失败时也有 `return desktopCache.catalog` 的降级；
+		 *   · 但 `catalog` 已被清成 `null` ⇒ 这两条保护全部失效；
+		 *   · 于是同步完成后的第一次重拉只要失败（电脑刚同步完可能正忙、
+		 *     隧道短抖），模型菜单就**直接变空**，用户以为同步把模型搞没了。
+		 *
+		 * 我上一版还在 `desktopCatalog` 里写了「失败时返回旧缓存而不是 null」，
+		 * 却在这里亲手把旧缓存清掉 —— 两处自相矛盾。
+		 *
+		 * ## 现在
+		 *
+		 * 只把 `at` 归零（`at === 0` 在所有判据里都表示"陈旧"），数据保留：
+		 *
+		 *   · 下一次读取 ⇒ 判定过期 ⇒ 真的重新拉（原本的目的，达到）；
+		 *   · 万一这次拉失败 ⇒ 降级返回**旧的但可用的**数据（不再变空）。
+		 *
+		 * `failedAt` 仍要清：那是"上次失败"的冷却标记，同步完成是新的起点，
+		 * 不该继续压制请求。
+		 *
+		 * ⚠️ 两个时间戳**必须一起清**：只清一个等于让另一个继续"代表"
+		 * 它（见 `desktopCache` 里 `catalogAt` / `presetsAt` 的长注释）。
+		 */
+		desktopCache.at = 0;
+		desktopCache.catalogAt = 0;
+		desktopCache.presetsAt = 0;
+		desktopCache.failedAt = 0;
+	};
+
 
 	// 启动即从磁盘恢复上次拉到的电脑配置 —— 这是「配对后只拉一次」的落地点。
 	const restoredCache = loadDesktopCache();
@@ -2407,6 +3665,9 @@ export function apply(ctx) {
 		desktopCache.directory = restoredCache.directory;
 		desktopCache.dirs = restoredCache.dirs;
 		desktopCache.at = restoredCache.at;
+		// ⚠️ 两个独立时间戳也必须恢复，否则重启后会把新数据当"从未拉过"重拉一遍。
+		desktopCache.catalogAt = restoredCache.catalogAt;
+		desktopCache.presetsAt = restoredCache.presetsAt;
 	}
 
 	/** 把当前内存里的三项落盘（`dirs` 不存，见 `desktopCache` 的注释）。 */
@@ -2415,7 +3676,11 @@ export function apply(ctx) {
 			catalog: desktopCache.catalog,
 			presets: desktopCache.presets,
 			directory: desktopCache.directory,
+			dirs: desktopCache.dirs,
 			at: desktopCache.at,
+			// ⚠️ 必须一起传：不传的话落盘时写 0，重启后每次都重拉（1.2.44）。
+			catalogAt: desktopCache.catalogAt,
+			presetsAt: desktopCache.presetsAt,
 		});
 	};
 
@@ -2556,13 +3821,41 @@ export function apply(ctx) {
 				return null;
 			}),
 		]);
+		/*
+		 * ⚠️⚠️ **时间戳只在真的拉到东西后才更新**（2026-10-29 修，这是个隐蔽坑）
+		 *
+		 * 原来是无条件 `desktopCache.at = Date.now()`。而 `at` 是 TTL 判据 ——
+		 * 于是「预拉全失败」也会把时间戳刷新成"刚刚"：
+		 *
+		 *   · 电脑睡了 / 隧道抖了一下 ⇒ 三个请求全失败；
+		 *   · `at` 被刷新 ⇒ 接下来 5 分钟内 `desktopCatalog` / `presetList`
+		 *     都认为缓存**新鲜**，一次都不重拉；
+		 *   · 用户看到的就是「模型和预设还是老的，重启才好」。
+		 *
+		 * 这正是用户反复报的那个现象的另一个成因（前两个在 `modelCatalog` /
+		 * `presetList` 分支的"绕过 TTL"）。
+		 *
+		 * 现在：只有至少一个请求成功，才推进时间戳；全失败则**保留旧时间戳**，
+		 * 于是下一次调用仍认为缓存陈旧、会重新尝试。失败不该获得"新鲜"资格。
+		 */
+		const anyOk = catalog !== null || presets !== null || directory !== null;
 		if (catalog !== null) desktopCache.catalog = catalog;
 		if (presets !== null) desktopCache.presets = presets;
 		if (directory !== null) desktopCache.directory = directory;
-		desktopCache.at = Date.now();
+		/*
+		 * ⚠️ 两个时间戳**各自独立推进**（1.2.44）。
+		 *
+		 * 预拉通常两者都成功；但若只有其中一个成功（电脑侧某个 RPC 报错），
+		 * 必须只推进成功那个的时间戳 —— 失败的另一个还得靠 TTL 判定重拉。
+		 * 以前共用一个 `at`，会在这种"半成功"情况下把两者都标成新鲜。
+		 */
+		const nowAt = Date.now();
+		if (catalog !== null) desktopCache.catalogAt = nowAt;
+		if (presets !== null) desktopCache.presetsAt = nowAt;
+		if (anyOk) desktopCache.at = nowAt;
 		// ⚠️ 只有**真的拉到东西**才落盘。全失败时保留上次的本地快照，
 		// 而不是把缓存写成空 —— 用户要的是「上次拉到的结果存死在本地」。
-		if (catalog !== null || presets !== null || directory !== null) persistDesktopCache();
+		if (anyOk) persistDesktopCache();
 		const models = catalog?.groups?.reduce((n, g) => n + (g.models?.length ?? 0), 0) ?? 0;
 		const dirs = directory?.entries?.length ?? directory?.items?.length ?? 0;
 		ctx.logger?.info?.(
@@ -2583,18 +3876,134 @@ export function apply(ctx) {
 	 * @returns 电脑的模型目录；拉不到时 `null`。
 	 */
 	const desktopCatalog = async () => {
-		if (desktopCache.catalog !== null) return desktopCache.catalog;
+		/*
+		 * ## ⚠️ 缓存**过期**也要重拉，不只是为空时（2026-10-29 修）
+		 *
+		 * 原来这里只有 `if (desktopCache.catalog !== null) return ...`，
+		 * 意味着第一次拉到之后**永远不再更新**。用户现象：
+		 *
+		 * 「模型列表和预设列表还是老问题，没有同步……奇怪的是我重启之后
+		 *   再打开它就马上能显示出来了」
+		 *
+		 * 重启能好，正因为重启后从磁盘恢复、第一次调用走"为空"分支重新拉。
+		 * 这与预设那边是**同一个 bug**，两处都修（否则会出现"模型刷新了、
+		 * 预设还是旧的"的割裂，用户早就报过这一点）。
+		 *
+		 * ## 过期了但拉失败怎么办
+		 *
+		 * **保留旧缓存**继续用（`desktopCache.catalog` 不动），
+		 * 只记 `failedAt` 走冷却。绝不能因为一次网络抖动让菜单变空 ——
+		 * 「用稍旧的列表」永远好过「没有列表」。
+		 */
+		/*
+		 * ⚠️⚠️ 这个判据原来把 `at === 0` 当成「**新鲜**」，是错的（1.2.40 修）
+		 *
+		 * 原代码（变量名还叫 `stale`，语义完全相反）：
+		 *
+		 *     const stale = at === 0 || Date.now() - at <= TTL;
+		 *     if (stale) return cache.catalog;      // ← at===0 时直接返回旧的
+		 *
+		 * `at === 0` 恰恰是 `invalidateDesktopCache()` 刚跑过的标记
+		 * （表示"数据已作废，请重拉"）。把它当成新鲜，等于：
+		 *
+		 *   **同步完成后，模型目录永远不会重拉** —— `invalidateDesktopCache`
+		 *   对模型侧一直是**完全无效**的。
+		 *
+		 * 这和预设侧那个 `(at !== 0 && ...)` 是同一类错误的两面：
+		 * 两边都把 `at === 0` 的语义理解反了，只是一个表现为"永不重拉"、
+		 * 一个被 `catalog === null` 的短路偶然掩盖。
+		 *
+		 * 现在统一成与另外三处（`presetList` / `mergedPresetList` /
+		 * `patchPresets`）**完全一致**的写法：`at === 0` ⇒ 陈旧。
+		 */
+		if (desktopCache.catalog !== null) {
+			/*
+			 * ⚠️ 用 `catalogAt`，**不能用 `at`**（1.2.44 修）。
+			 *
+			 * 用共用 `at` 时，前端只要先拉过一次预设（`mergedPresetList`
+			 * 会把它刷新成"刚刚"），这里就认为模型也是新鲜的 ⇒ 不重拉
+			 * ⇒ 模型菜单永远停在旧数据。见 `desktopCache` 的长注释。
+			 */
+			const fresh =
+				desktopCache.catalogAt !== 0
+				&& Date.now() - desktopCache.catalogAt <= DESKTOP_CACHE_TTL_MS;
+			if (fresh) return desktopCache.catalog;
+			// 过期：往下走重拉；拉成功会覆盖，拉失败则保留旧值（见 catch）。
+		}
+
+		// ## ⚠️⚠️ 同一个失败**不要在短时间内反复重打**
+		//
+		// `callRemote` 现在有 15 秒超时了，但前端在**加载态**里会不断重试
+		// `modelCatalog`（`ModelCatalogDirectory.load()` 每次渲染都可能触发）。
+		// 电脑那边真的离线时，每个调用都要白等 15 秒，还都开一条新连接 ——
+		// 用户看到的就是「正在刷新模型列表…」转个不停（他反馈里的原话）。
+		//
+		// 所以失败后记一个 `failedAt`，**冷却期内直接返回 null**（= 用手机本地
+		// 列表先顶着），不再发请求。冷却期取 30 秒：
+		//   · 够长，能把「一次离线」期间的所有重试压成一次探测；
+		//   · 够短，电脑一开用户最多等半分钟就能看到电脑的模型。
+		//
+		// ⚠️ 这只是**避免打爆**，不是「不再重试」—— 冷却过后会照常再试，
+		// 所以电脑上线后最终一定能同步过来。
+		if (Date.now() - desktopCache.failedAt < DESKTOP_CATALOG_RETRY_COOLDOWN_MS) {
+			/*
+			 * ⚠️ 冷却期内**如果有过期缓存，先用旧的**，不要返回 null。
+			 *
+			 * 新旧对比：
+			 *   · 返回 null ⇒ 前端拿不到电脑目录 ⇒ 只剩手机本地模型
+			 *     ⇒ 用户看到"电脑的模型全都不见了"，以为同步坏了；
+			 *   · 返回旧目录 ⇒ 用户看到的是几小时前的模型列表，
+			 *     但至少是他熟悉的那些，切换过去也能用。
+			 *
+			 * 后者明显更好。这是"降级但可用"与"直接坏掉"的区别。
+			 */
+			if (desktopCache.catalog !== null) return desktopCache.catalog;
+			return null;
+		}
 		try {
-			desktopCache.catalog = await callRemote(config, 'modelCatalog', {});
+			const fetched = await callRemote(config, 'modelCatalog', {});
+			/*
+			 * ⚠️⚠️ **必须先校验返回值形状，再写缓存**（2026-10-29 修）
+			 *
+			 * 原来是直接 `desktopCache.catalog = await callRemote(...)`。
+			 * 只要宿主/引擎在某种情况下返回 `null` / `undefined`（比如电脑侧
+			 * 插件版本旧、或 `io.body` 解析异常），就会把一份**好的缓存覆盖成空**，
+			 * 同时 `at` 被刷新成"刚刚"⇒ 接下来 5 分钟都不会再重拉。
+			 *
+			 * 结果：模型菜单一片空白，而且"过一会儿自己好"要等 TTL 到期。
+			 * 用户看到的就是「模型没同步 / 忽有忽无」。
+			 *
+			 * 现在：形状不对就当这次失败处理 —— 保留旧缓存、走冷却重试。
+			 */
+			if (fetched === null || fetched === undefined) {
+				desktopCache.failedAt = Date.now();
+				return desktopCache.catalog;
+			}
+			if (typeof fetched !== 'object') {
+				desktopCache.failedAt = Date.now();
+				return desktopCache.catalog;
+			}
+			desktopCache.catalog = fetched;
 			// 第一次拉到就落盘：此后重开 App / 电脑下线都从本地读，不再联网。
-			desktopCache.at = Date.now();
+			// ⚠️ 只更新**模型自己的**时间戳，绝不碰 `presetsAt`（1.2.44）。
+			desktopCache.catalogAt = Date.now();
+			desktopCache.at = desktopCache.catalogAt;
+			desktopCache.failedAt = 0;
 			persistDesktopCache();
 			return desktopCache.catalog;
 		} catch (error) {
+			desktopCache.failedAt = Date.now();
 			ctx.logger?.warn?.(
 				`[dsh-remote-mobile] 取电脑模型列表失败: ${String(error?.message ?? error)}`,
 			);
-			return null;
+			/*
+			 * ⚠️ 失败时**返回旧缓存**而不是 `null`。
+			 *
+			 * 返回 `null` 会让前端只剩手机本地模型 ⇒ 用户看到"电脑的模型全没了"。
+			 * 旧目录虽然可能是几小时前的，但用户熟悉的那些还在、切换过去也能用。
+			 * 「降级但可用」永远好过「直接坏掉」。
+			 */
+			return desktopCache.catalog;
 		}
 	};
 
@@ -2715,38 +4124,80 @@ export function apply(ctx) {
 	 * @param desktop - 电脑的 `{presets}`。
 	 * @returns 合并后的名单（额外带 `localPresets`）。
 	 */
-	function mergePresets(local, desktop) {
-		const presets = (desktop?.presets ?? []).map((preset) => ({ ...preset, desktop: true }));
-		const seen = new Set(presets.map((preset) => preset.id));
-		for (const preset of local?.presets ?? []) {
-			if (!seen.has(preset.id)) presets.push(preset);
+	/* `mergePresets` 已提到模块级（见 `export function apply` 之前）。 */
+
+	/**
+	 * 找出「**这个会话的**」本地存活根 agent；没有就返回 undefined。
+	 *
+	 * ## 判据**只认精确匹配**（1.2.90 修，这是个真实的事故点）
+	 *
+	 * 老代码是这样兜底的：
+	 *
+	 *     liveRootAgent = roots.find(a => a?.session?.id === sessionId);
+	 *     if (liveRootAgent === undefined && roots.length > 0) liveRootAgent = roots[0];
+	 *
+	 * 后半句「找不到就随便拿一个」是**错的**：
+	 *
+	 * · 官方 UI（`dsh-client-ui-user-questions/lib/client.js:1765`）用
+	 *   `ctx.sessions.scopeOf(owner)` 决定卡片挂在哪个会话下 —— 传了别的会话的
+	 *   agent，卡片就渲染到**另一个会话**里去了，用户看着当前会话什么都没有；
+	 * · 而且 `assertLiveRoot()` 只校验"活着/是根"，**不校验会话对不对**，
+	 *   所以它不会报错，只会静默挂错地方 —— 这类 bug 最难查。
+	 *
+	 * 所以现在：**只认 `agent.session.id === sessionId`**，不匹配就是 undefined，
+	 * 由调用方改走自绘卡片。
+	 *
+	 * ## 为什么绝大多数时候这里都会返回 undefined
+	 *
+	 * 手机的远程会话是**同步来的镜像空壳**：只往本地日志 append 电脑的事件，
+	 * **从来不在手机上跑 agent**（跑的是电脑那台）。所以这个函数返回 undefined
+	 * 是**正常状态**，不是异常 —— 调用方据此走自绘卡片。
+	 *
+	 * @param ctx - 宿主上下文。
+	 * @param sessionId - 会话 id。
+	 * @returns 该会话的本地根 agent，或 undefined。
+	 */
+	function liveRootAgentFor(ctx, sessionId) {
+		if (typeof sessionId !== 'string' || sessionId === '') return undefined;
+		const agents = ctx.get('agents');
+		if (agents === undefined || agents === null) return undefined;
+		try {
+			const roots = typeof agents.roots === 'function' ? agents.roots() : [];
+			if (!Array.isArray(roots)) return undefined;
+			for (const agent of roots) {
+				if (agent?.session?.id === sessionId) return agent;
+			}
 		}
-		return { ...local, presets, localPresets: local?.presets ?? [] };
+		catch (error) {
+			ctx.logger?.warn?.(`[dsh-remote-mobile] 取 agents 失败: ${String(error?.message ?? error)}`);
+		}
+		return undefined;
 	}
 
 	/**
-	 * 把电脑发起的 ask 显示成**手机上的官方卡片**。
+	 * 把电脑发起的 ask 显示到手机上。
 	 *
-	 * ## 为什么调官方而不是自绘（用户原话：「手机的原声引擎也是有这个卡片的呀，
-	 *    你就不能直接调用吗？」）
+	 * ## 现在的策略：**自绘卡片优先，官方卡片只在本地真有 agent 时用**（1.2.90）
 	 *
-	 * 对，能直接调，而且这才该是正解。手机本地引擎里就装着
-	 * `dsh-client-ui-user-questions` / `dsh-client-ui-approval`，它们挂在
-	 * 本地 `user-questions/request` / `approval/request` waterfall 上。
-	 * 这里只要调一次 `ctx.userQuestions.ask()`，官方就把那张卡片原样渲染出来 ——
-	 * 带选项序号、带「推荐」标、带跳过/提交、带多题翻页，与手机自己提问
-	 * 长得一模一样。
+	 * 用户报障（2026-10-29 带截图）：「还是没弹窗。我记得之前已经修复过的了。」
+	 * 截图里能看到「提问 · 等待回答」和 `(reading 'answers')` ——
+	 * ask **已经到手机了**，但没有出现任何可交互的卡片。
 	 *
-	 * 自绘那套（`showAskCard`）的代价是维护一套平行 UI，官方改版就落后；
-	 * 而且窄屏下手写的按钮很难和官方的观感对齐。所以改走这条路。
+	 * 根因：这条链路原来完全依赖官方 `ctx.userQuestions.ask()`，而它要求
+	 * 「当前存活的运行时根 agent」（`dsh-user-questions/lib/index.js:668` 的
+	 * `assertLiveRoot`）。手机的远程会话是镜像空壳、**不跑 agent**，
+	 * 所以永远找不到 —— 要么抛 `NO_PROVIDER`（被 catch 静默吞掉），
+	 * 要么退而取 `roots[0]` 把卡片挂到**别的会话**里。
+	 * 两种结果在用户看来都是「没弹窗」。
 	 *
-	 * ## 为什么不传 `agent`
+	 * ## 为什么自绘是对的
 	 *
-	 * `ask()` 的 `request.agent` 是**可选**的：传了会先过 `assertLiveRoot()`
-	 * 校验「必须是当前存活的运行时根」，不传则直接派发到根 waterfall。
-	 * 电脑那边的 Agent 实例在手机进程里根本不存在，传任何一个手机本地的
-	 * agent 都只会让 `assertLiveRoot` 抛 `CALLER_NOT_LIVE`。
-	 * 所以不传 —— 走根作用域，由官方 UI 接手。
+	 * `approval` 类一直走 `broadcast('ask') → showAskCard() → answerAsk`，
+	 * 那条链路**不依赖 agent**，一直可用。question 类走同一条路即可。
+	 *
+	 * 观感上不如官方原生卡片，但「能答」远比「长得像」重要 ——
+	 * 一个不出现的卡片等于没有。官方那张卡片保留：只有本地真的存在这个
+	 * 会话的活 agent 时才用（`liveRootAgentFor` 精确匹配）。
 	 *
 	 * @param ctx - 宿主上下文。
 	 * @param sessionId - 这个 ask 属于哪个远程会话（回传时要用）。
@@ -2768,120 +4219,123 @@ export function apply(ctx) {
 		ctx.logger?.info?.(
 			`[dsh-remote-mobile] 收到 ask: kind=${payload.kind} requestId=${payload.requestId} 有userQuestions=${svc !== undefined && svc !== null} questions=${Array.isArray(payload.questions) ? payload.questions.length : 'n/a'}`,
 		);
-		// 引擎里没有这个服务（老版本 / 被关掉）⇒ 静默放弃。
-		// 电脑端会一直等到 ASK_TIMEOUT_MS 再走官方兜底，不会永久卡住。
-		if (svc === undefined || svc === null) {
-			ctx.logger?.warn?.('[dsh-remote-mobile] 本机没有 userQuestions 服务，电脑的 ask 无法显示');
-			return;
-		}
+		/*
+		 * ## ⚠️⚠️ 这里**不能**因为缺 `userQuestions` 就 return（1.2.92 修）
+		 *
+		 * 老代码是这样：
+		 *
+		 *     if (svc === undefined || svc === null) {
+		 *         ctx.logger?.warn?.('本机没有 userQuestions 服务，电脑的 ask 无法显示');
+		 *         return;
+		 *     }
+		 *
+		 * 这个判断本身没错（官方卡片确实需要它），但**自绘卡片不需要它**。
+		 * 把 return 放在函数入口，等于让「没有官方服务」连带把自绘那条路也堵死 ——
+		 * 而自绘恰恰是 1.2.90 起的主力路径。
+		 *
+		 * 用户报障（2026-10-29 第二次带截图）：「依旧不行」。截图里
+		 * `(reading 'answers')` 已经消失（说明 1.2.90 的改动生效了），但卡片仍没有 ——
+		 * 就是卡在这个入口判断上：ask 到了、代码进了函数、**在 try 之前就 return 了**。
+		 *
+		 * 所以现在：判空**下沉到官方卡片分支内部**。走自绘时完全不看 svc。
+		 */
 
 		try {
-			if (payload.kind === 'approval') {
-				// ── 权限授权 ──
-				//
-				// 官方的 approval 卡片是 `ctx.approval.request()` 触发的，
-				// 而手机插件没 inject approval（它是引擎内部服务，调用方必须是
-				// 真实发起工具调用的那一方，凭空构造一个「谁请求了什么」在
-				// 语义上不成立）。
-				//
-				// 所以授权这类**不借官方卡片**，仍用自绘的那张两按钮卡片：
-				// 它的信息量本来就小（工具名 + 允许/拒绝），自绘反而更清楚。
-				broadcast('ask', { sessionId, ...payload });
-				return;
-			}
-
+			/*
+			 * ## ⚠️⚠️ question 也必须走**自绘卡片**（1.2.90 修，本轮真正的根因）
+			 *
+			 * 用户报障（2026-10-29，带截图）：
+			 *   「还是没弹窗。我记得之前已经修复过的了。」
+			 * 截图里能看到「提问 · 等待回答」和 `(reading 'answers')` ——
+			 * 说明 ask 已经到手机了，**但可交互的卡片一次都没出现**。
+			 *
+			 * ## 为什么走官方 `svc.ask()` 是死路
+			 *
+			 * `svc.ask()` 要求传一个「**当前存活的运行时根 agent**」：
+			 *
+			 *   dsh-user-questions/lib/index.js:668 `ask(request)`
+			 *     → `assertLiveRoot(agent)`
+			 *         · `agents.get(agent.id) !== agent`  → CALLER_NOT_LIVE
+			 *         · `!agents.roots().includes(agent)` → DELEGATED_CALLER
+			 *
+			 * 而手机的远程会话是**同步来的镜像空壳**：它只往本地日志 append
+			 * 电脑的事件，**从来不在手机上跑 agent**（跑的是电脑那台）。
+			 * 所以 `agents.roots()` 里永远没有它 ⇒ 下面是老代码的兜底：
+			 *
+			 *     liveRootAgent = roots.find(a => a?.session?.id === sessionId)
+			 *     if (liveRootAgent === undefined && roots.length > 0) liveRootAgent = roots[0]
+			 *
+			 * 退而取 `roots[0]` 更糟：那是**别的会话**的 agent。官方 UI 用
+			 * `ctx.sessions.scopeOf(owner)` 决定卡片挂在哪个会话下 ⇒ 卡片会跑到
+			 * 另一个会话里，用户看着当前会话什么也没有。
+			 *
+			 * 也就是说：这条路**要么抛 NO_PROVIDER、要么把卡片挂错会话**，
+			 * 两种结果在用户看来都是「没弹窗」。这解释了为什么改了几轮都没好 ——
+			 * 之前一直在修"能不能收到 ask"，而**收到之后根本没有能用的渲染器**。
+			 *
+			 * ## 自绘卡片是**已经验证可用**的那条路
+			 *
+			 * `approval` 类一直走 `broadcast('ask', ...)` → 前端 `showAskCard()`
+			 * → 用户点选 → `answerAsk` 回传，这条链路是通的（因为它不依赖 agent）。
+			 * 所以 question 类走同一条路即可，**不需要 agent、不需要官方卡片**。
+			 *
+			 * 代价：观感与官方原生卡片不完全一致（自绘一张）。但「能答」比
+			 * 「长得像官方」重要得多 —— 一个不出现的卡片等于没有。
+			 *
+			 * 官方卡片那条路**保留为兜底**：只有当本地真的存在这个会话的活
+			 * agent 时（例如手机本地工作区也在跑同一个会话）才用它，否则直接
+			 * 自绘。判据严格：**只认 sessionId 精确匹配**，不再退而取 `roots[0]`。
+			 */
 			const questions = Array.isArray(payload.questions) ? payload.questions : [];
-			if (questions.length === 0) return;
+			if (questions.length === 0 && payload.kind !== 'approval') return;
 
-			// 找一个「当前存活的运行时根 agent」。
-			//
-			// 为什么必须找：`ask()` 里 `assertLiveRoot()` 要求传入的 agent
-			// 满足 `agents.get(id) === agent` 且 `agents.roots().includes(agent)`，
-			// 否则抛 `CALLER_NOT_LIVE` / `DELEGATED_CALLER`。
-			//
-			// 为什么优先选「这个远程会话对应的」：官方 UI 用
-			// `ctx.sessions.scopeOf(owner)` 决定卡片挂在哪个会话下。选错 agent
-			// 会让卡片出现在**另一个会话**里 —— 用户看着当前会话，卡片却在别处。
-			//
-			// ⚠️ 一个都找不到就放弃：手机端这个远程会话没在本地跑 agent 时，
-			//    强行传一个别的 agent 会把卡片挂错地方，比不弹更糟。
-			const agents = ctx.get('agents');
-			let liveRootAgent;
-			if (agents !== undefined && agents !== null) {
-				try {
-					const roots = typeof agents.roots === 'function' ? agents.roots() : [];
-					// 先找 session 匹配的
-					liveRootAgent = roots.find((a) => a?.session?.id === sessionId);
-					// 没有就退而取第一个（卡片至少能弹出来，用户能选）
-					if (liveRootAgent === undefined && roots.length > 0) liveRootAgent = roots[0];
-				} catch (error) {
-					ctx.logger?.warn?.(`[dsh-remote-mobile] 取 agents 失败: ${String(error?.message ?? error)}`);
-				}
-			}
-			ctx.logger?.info?.(
-				`[dsh-remote-mobile] ask 的 agent: ${liveRootAgent === undefined ? '找不到活的根 agent（将不带 agent 调用）' : liveRootAgent.session?.id ?? 'unknown'}`,
-			);
-
-			// 把线上形状翻成官方 `QuestionSpec`。
-			//
-			// ⚠️ `id` 必须是字符串且唯一：官方拿它当 React key，也拿它回传
-			// `questionId`。电脑那边生成的是短 id，直接沿用即可。
-			const spec = questions.map((q, index) => ({
-				id: typeof q.id === 'string' && q.id !== '' ? q.id : `remote-${index}`,
-				question: String(q.question ?? ''),
-				...(typeof q.header === 'string' && q.header !== '' ? { header: q.header } : {}),
-				...(q.multiSelect === true ? { multiSelect: true } : {}),
-				options: (Array.isArray(q.options) ? q.options : []).map((o) => ({
-					label: String(o.label ?? ''),
-					...(typeof o.description === 'string' && o.description !== '' ? { description: o.description } : {}),
-				})),
-			}));
-
-			const answer = await svc.ask({
-				questions: spec,
-				// ⚠️⚠️ **必须传 agent，而且必须是「当前存活的运行时根」。**
-				//
-				// 一开始我没传（以为不传就走根 waterfall 更宽松），结果是
-				// **官方 UI 直接 `next()`、没人接、抛 `NO_PROVIDER`**。
-				//
-				// 依据 `dsh-client-ui-user-questions` 的 `answerQuestion()`：
-				//
-				//     const sessionId = ctx.sessions.scopeOf(owner);
-				//     if (sessionId === undefined) return next();
-				//
-				// `owner` 就是派发时的 carrier（`this`）。不传 agent ⇒
-				// `waterfall("user-questions/request", request, noAnswerer)`
-				// 没有 carrier ⇒ `scopeOf` 返回 undefined ⇒ 官方放行 ⇒ 无人应答。
-				//
-				// 传了 agent 还要过 `assertLiveRoot()`：
-				//     agents.get(agent.id) !== agent  → CALLER_NOT_LIVE
-				//     !agents.roots().includes(agent) → DELEGATED_CALLER
-				// 所以必须是 `ctx.agents` 里**真实的那个实例**，不能自己 new。
-				//
-				// 找不到活的根 agent（手机端这个会话没在跑）⇒ 放弃，
-				// 让电脑端超时后走官方兜底 —— 至少不会卡死。
-				...(liveRootAgent === undefined ? {} : { agent: liveRootAgent }),
+			/*
+			 * ## ⚠️⚠️ 一律走自绘卡片（1.2.96 修「两张卡片同时出现」）
+			 *
+			 * 用户报障（2026-10-29，图3）：
+			 *   「我在前台直接让他发起询问，此时就会出现你自绘的样式和系统样式
+			 *     同时出现。」
+			 *
+			 * 根因：两条渲染路径**同时被触发**了：
+			 *
+			 *   · `broadcast('ask')` → 前端 `showAskCard()`  → 自绘卡片
+			 *   · `svc.ask()`       → 官方 waterfall      → 系统卡片
+			 *
+			 * 原来用 `localAgent === undefined` 二选一，但那个判据在真机上
+			 * **经常同时成立**：电脑上这个会话在跑，手机本地镜像会话也会被官方
+			 * 建出 agent（同一个 sessionId）⇒ `localAgent` 拿得到 ⇒ 走官方；
+			 * 而电脑端 SSE 那条 ask 早就 `broadcast` 过 ⇒ 自绘也弹了。
+			 * 于是两张卡片叠在一起。
+			 *
+			 * 而官方那条路本身也**不该**在这里用：
+			 *   · `svc.ask()` 要求「当前存活的根 agent」，手机镜像是空壳；
+			 *   · 官方 UI 用 `ctx.sessions.scopeOf(owner)` 决定卡片挂哪个会话，
+			 *     挂错了用户就看不见；
+			 *   · 官方卡的答案回传要再经 `answerAsk` 转一手，多一层出错点。
+			 *
+			 * 自绘那条路才是**稳定可用**的（用户原话：「你自绘的这个弹窗它出现的
+			 * 稳定性高很多」）。所以现在**只走自绘**，官方分支整个不再进入 ——
+			 * 这不是"暂时禁用"，是明确选择：一条能答的路胜过两条互相干扰的路。
+			 */
+			/*
+			 * 自绘卡片通道（**唯一通道**）。
+			 *
+			 * `ghost` = 电脑端已经 fallback 给本地 GUI 了（见电脑端
+			 * `ghostAsks` 注释）。这是**补拉**出来的一条，不是实时推送 ——
+			 * 用户很可能已经在电脑上处理过了。
+			 *
+			 * 额外带一个 `note`，前端会显示在卡片上，
+			 * 免得用户点了之后发现"没反应"而困惑。
+			 */
+			trace(`走自绘卡片: kind=${payload.kind}`);
+			broadcast('ask', {
+				sessionId,
+				...payload,
+				note: payload.ghost === true
+					? '这是电脑端早先发起的请求。如果电脑上已经处理过，这里点击会提示已处理。'
+					: undefined,
 			});
-			trace(`官方 ask 返回: ${JSON.stringify(answer)?.slice(0, 200)}`);
-
-			// 用户在手机上选完了 ⇒ 原样回传电脑。
-			//
-			// 官方返回 `{ answers: [{ questionId, selected: [...], custom? }] }`，
-			// 与电脑端 answerer 期望的形状一致，不需要再转换。
-			//
-			// ⚠️ 用闭包里那份 `config`（`apply()` 顶部 `loadConfig()` 的产物），
-			// 不重新读盘：配对会 `Object.assign` 就地改写它，读盘拿到的可能
-			// 是**上一台电脑**的地址。
-			const result = await callRemote(config, 'answerAsk', {
-				requestId: payload.requestId,
-				answer,
-			});
-			trace(`回传结果: ${JSON.stringify(result)?.slice(0, 120)}`);
-			if (result?.ok !== true) {
-				ctx.logger?.warn?.(
-					`[dsh-remote-mobile] 答案没送回去（${String(result?.reason ?? 'unknown')}），电脑端会自行兜底`,
-				);
-			}
+			return;
 		} catch (error) {
 			// 用户点了「跳过」/ 这一轮被中断 / 电脑端已超时 —— 都到这里。
 			// 这**不是故障**，别往日志里写 error 级别，也别弹提示。
@@ -2891,7 +4345,22 @@ export function apply(ctx) {
 	}
 
 	/** 往所有浏览器订阅者推一条 SSE。 */
-	const broadcast = (eventName, payload) => {		if (watchers.size === 0) return;
+	const broadcast = (eventName, payload) => {		/*
+		 * **惰性清掉已经死掉的 watcher**（1.2.94）。
+		 *
+		 * `watchers` 的清理挂在 `req.on('close')` 上，但 App 退后台被系统
+		 * 掐断时那个事件**未必触发**（进程被冻结，回调排不上）。残留的死连接
+		 * 会让 `watchers.size` 一直大于 0 ⇒ 轮询以为「还有人在看」，
+		 * 每隔 3 秒照打公网 RPC，白烧电和流量。
+		 *
+		 * 这里主动筛一遍：`writableEnded` / `destroyed` 的都是死的，删掉。
+		 */
+		for (const watcher of watchers) {
+			if (watcher === null || watcher === undefined || watcher.writableEnded === true || watcher.destroyed === true) {
+				watchers.delete(watcher);
+			}
+		}
+		if (watchers.size === 0) return;
 		const chunk = `event: ${eventName}\ndata: ${JSON.stringify(payload)}\n\n`;
 		for (const res of watchers) {
 			try {
@@ -2995,6 +4464,18 @@ export function apply(ctx) {
 			// `followSynced`）必须用**同一张状态表**，否则一边校正了 `running`、
 			// 另一边还拿着旧值去判重，会漏派发或重复派发。
 			reconcileRunning(ctx, config, sessionId, () => !controller.signal.aborted);
+
+			/*
+			 * **补拉待审批的 ask**（见 `pullPendingAsks` 的长注释）。
+			 *
+			 * 这里是"手机刚连上电脑"的时刻，正是粉丝反馈里
+			 * 「后打开 APP 看不到弹窗」的补救点。放在 `reconcileRunning`
+			 * 旁边：两者都是"重连时校正手机侧状态"的同一个时机。
+			 *
+			 * `pulledAskIds` 去重保证同一条 ask 只弹一次，
+			 * 所以流断重连反复走到这里也不会叠出多个弹窗。
+			 */
+			pullPendingAsks(ctx, config);
 
 			const decoder = new TextDecoder();
 			let buffer = '';
@@ -3425,6 +4906,260 @@ export function apply(ctx) {
 	 * @param fromSeq - 已经交给前端的最后一条的电脑 seq；之后只要更新的。
 	 * @param signal - 前端取消（关掉会话 / 切走）时中止。
 	 */
+	/**
+	 * ## 定时轮询补齐：不依赖长连接的「最终保底」（1.2.94 新增）
+	 *
+	 * 用户原话（2026-10-29，这句话直接指出了正确方向）：
+	 *
+	 *   「我就是有一点搞不懂，既然我们点添加工作群的时候会触发刷新，
+	 *     那我们为什么不能实时刷新呢？」
+	 *
+	 * 对。既然那一下能刷新，说明 **HTTP 短连接（RPC）是通的** —— 不通的是
+	 * SSE 长连接：App 退后台时被 Android 冻结/掐断，回来也不保证自愈。
+	 * 我们却把全部实时性押在了那条会死的长连接上。
+	 *
+	 * 所以这里补一条**短连接轮询**：
+	 *
+	 *   每 3 秒问一次电脑 `sessionCursors`（只回每个会话的末尾 seq，几百字节），
+	 *   发现本地落后就 `readEventRange` 把缺的事件补拉回来，照常走
+	 *   `mirrorEvent` 落盘 + `broadcast` 给前端。
+	 *
+	 * 于是即使长连接彻底死掉，最多 3 秒后手机也能看到新内容 —— 这就是
+	 * 「为什么不能实时刷新」的答案：能，只是要走对通道。
+	 *
+	 * ## 三条设计约束
+	 *
+	 * ① **只在有前端订阅者时才轮询**（`watchers.size > 0`）。App 退到后台后
+	 *    WebView 冻结、连接断开，`watchers` 自然归零 —— 这时还每隔 3 秒打一次
+	 *    公网 RPC 纯属浪费电和流量。用户回来时前端重连（见 `subscribe()` 的
+	 *    `visibilitychange`），`watchers` 恢复，轮询自动继续。
+	 *
+	 * ② **只补「已同步过的」会话**。手机本地没有的会话（用户没勾选同步的那些）
+	 *    不该因为电脑上有就凭空冒出来。判据就是 `ctx.sessions.get(id)` 有没有。
+	 *
+	 * ③ **落后太多就不补**（`POLL_MAX_GAP`）。补洞是为了"晚几秒看到"，
+	 *    不是"把 3 万条历史全搬过来"。缺口过大时让用户自己开同步对话框，
+	 *    那才是搬历史的正确入口。
+	 */
+	const POLL_INTERVAL_MS = 3000;
+	/** 一次轮询最多补这么多条；超过就认为该走「同步对话」而不是补洞。 */
+	const POLL_MAX_GAP = 200;
+	/** 轮询状态：避免上一次还没跑完就又发一次。 */
+	let pollBusy = false;
+	/**
+	 * 已经广播过的 ask id —— 防止轮询每 3 秒把同一个弹窗重复推一次
+	 *（前端会看到卡片反复出现 / 闪烁）。
+	 */
+	const askedSeen = new Set();
+
+	/**
+	 * 跑一次轮询补齐。失败一律静默（电脑离线、隧道断了都属正常）。
+	 *
+	 * @param config - 当前配对配置。
+	 */
+	async function pollCatchUp(config) {
+		if (config === undefined || config === null || config.token === '') return false;
+		if (pollBusy) return false;
+		/*
+		 * **惰性清掉已经死掉的 watcher**（1.2.94）。
+		 *
+		 * `watchers` 的清理挂在 `req.on('close')` 上，但 App 退后台被系统
+		 * 掐断时那个事件**未必触发**（进程被冻结，回调排不上）。残留的死
+		 * 连接会让 `watchers.size` 一直大于 0 ⇒ 轮询以为「还有人在看」，
+		 * 每 3 秒照打公网 RPC，白烧电和流量。
+		 *
+		 * 所以每次轮询前先自己筛一遍：`writableEnded` / `destroyed` 都算死的。
+		 * （`broadcast` 里也有同样的清理，但那是推送时才跑 —— 轮询不能依赖它。）
+		 */
+		for (const watcher of watchers) {
+			if (watcher === null || watcher === undefined || watcher.writableEnded === true || watcher.destroyed === true) {
+				watchers.delete(watcher);
+			}
+		}
+		/*
+		 * ## ⚠️⚠️ 这里**不能**因为 `watchers.size === 0` 就 return（1.2.95 修）
+		 *
+		 * 1.2.94 就是这么写的，逻辑是「没人在看就别打 RPC，省电」——
+		 * 听起来对，但**恰好把最需要它的情况关掉了**：
+		 *
+		 *   App 退到后台 ⇒ 长连接被系统掐断 ⇒ `watchers` 归零
+		 *   ⇒ 轮询停 ⇒ 用户回来时当然什么都没补上。
+		 *
+		 * 也就是说：轮询存在**就是为了**覆盖「长连接已死」这个场景，
+		 * 却用「长连接还活着」当它的前置条件。用户报障原话：
+		 *
+		 *   「还是不行，你的那个自动同步还是没有出现，
+		 *     还是要我手动打开添加工作区才触发。」
+		 *
+		 * 完全吻合 —— 轮询一次都没跑过。
+		 *
+		 * ## 现在怎么省电
+		 *
+		 * 不靠 `watchers`，靠**配对状态**：没配对直接不打（`config.token` 已判）。
+		 * 配对之后每 3 秒一次 `sessionCursors` 只有几百字节，可接受；
+		 * 而「用户退后台到底还要不要继续轮询」由系统统一决定 ——
+		 * Android 冻结 WebView 时 Node 定时器也会被压低，不会是真的 3 秒一次。
+		 */
+		pollBusy = true;
+		/** 本轮是否有进展（补到了事件 / 拉到了待回答的 ask）。 */
+		let progressed = false;
+		try {
+			const result = await callRemote(config, 'sessionCursors', {});
+			const cursors = result !== null && typeof result === 'object' ? result.cursors : undefined;
+			if (cursors === undefined || cursors === null || typeof cursors !== 'object') return false;
+			for (const sessionId of Object.keys(cursors)) {
+				const remoteSeq = cursors[sessionId];
+				if (typeof remoteSeq !== 'number' || !Number.isSafeInteger(remoteSeq) || remoteSeq < 0) continue;
+				// 约束②：只补本地已经存在的会话（用户同步过的那些）。
+				const local = ctx.sessions?.get?.(sessionId);
+				if (local === undefined || local === null) continue;
+				const localSeq = typeof local.seq === 'number' ? local.seq : 0;
+				/*
+				 * 本地 seq 与电脑 seq 之间可能有整体偏移（镜像会话带占位轮次，
+				 * 见 `mirrorStateOf` 的 `turnOffset` / `skippedSeeds`）。
+				 * 所以不能直接比大小，要先按 delta 折算 —— 与 `mirrorEvent` 里
+				 * 那段对齐逻辑同源。
+				 */
+				const state = mirrorStateOf(sessionId);
+				const delta = typeof state.seqDelta === 'number' ? state.seqDelta : 0;
+				const localAsRemote = localSeq - delta;
+				if (remoteSeq <= localAsRemote) continue;
+				const gap = remoteSeq - localAsRemote;
+				if (gap > POLL_MAX_GAP) {
+					void debugLog(`轮询补洞跳过 session=${sessionId} 缺口=${gap} 过大（该走同步对话）`);
+					continue;
+				}
+				// 从「本地最后一条的电脑 seq」+1 拉到远端末尾。
+				const fromSeq = localAsRemote + 1;
+				let page;
+				try {
+					page = await callRemote(config, 'readEventRange', {
+						sessionId,
+						fromSeq,
+						toSeq: remoteSeq,
+						maxEvents: POLL_MAX_GAP,
+					});
+				} catch (error) {
+					void debugLog(`轮询补洞取事件失败 session=${sessionId}: ${String(error?.message ?? error)}`);
+					continue;
+				}
+				const events = page !== null && typeof page === 'object' && Array.isArray(page.events) ? page.events : [];
+				if (events.length === 0) continue;
+				const sorted = events
+					.filter((event) => isWireEvent(event))
+					.sort((left, right) => left.seq - right.seq);
+				void debugLog(`轮询补洞 session=${sessionId} 补 ${sorted.length} 条 (${fromSeq}..${remoteSeq})`);
+				/*
+				 * ⚠️ **进展以「本地 seq 真的前进了」为准，不是「拉到事件了」为准**。
+				 *
+				 * 第一版写成「拉到事件就 progressed = true」，于是「有进展就立刻
+				 * 接下一轮」变成死循环：那几条事件因为对齐不上被 `mirrorEvent`
+				 * 拒收，本地 seq 原地不动 ⇒ 下一轮又从同一个 fromSeq 拉到同样
+				 * 几条 ⇒ 再置 true ⇒ 0 延迟无限循环。
+				 * 实测（test/poll.mjs）：3 秒内打了 1195 次 RPC。
+				 *
+				 * 所以改成写完之后看 `session.seq` 有没有真变大。真变大了才
+				 * 「立刻接下一轮」，否则按正常节拍等 3 秒 —— 既不会卡住用户
+				 * 看到内容，也不会把自己跑成 CPU 烤肉。
+				 */
+				const seqBefore = typeof ctx.sessions?.get?.(sessionId)?.seq === 'number'
+					? ctx.sessions.get(sessionId).seq
+					: -1;
+				for (const event of sorted) {
+					try {
+						const session = ctx.sessions?.get?.(sessionId);
+						if (session === undefined || session === null) break;
+						const wrote = mirrorEvent(session, event, mirrorStateOf(sessionId));
+						/*
+						 * 无论写没写进去，都要把事件推给前端 —— 与 `followSynced` 的
+						 * 处理一致：落盘失败只影响投影，不该让用户看不到消息。
+						 */
+						broadcast('event', { sessionId, event });
+						deriveRunning(ctx, sessionId, event, reconcileStateOf(sessionId));
+						if (wrote && (event?.type === 'assistant/message' || event?.type === 'assistant/attempt')) {
+							broadcast('settled', {
+								sessionId,
+								turn: event?.data?.turn,
+								step: event?.data?.step,
+							});
+						}
+					} catch (error) {
+						void debugLog(`轮询补洞写入失败 session=${sessionId} seq=${event?.seq}: ${String(error?.message ?? error)}`);
+					}
+				}
+				const seqAfter = typeof ctx.sessions?.get?.(sessionId)?.seq === 'number'
+					? ctx.sessions.get(sessionId).seq
+					: -1;
+				if (seqAfter > seqBefore) progressed = true;
+			}
+		} catch (error) {
+			// 电脑离线 / 隧道断了 / 未配对都走这里 —— 常态，不记 error 级。
+			void debugLog(`轮询补齐失败: ${String(error?.message ?? error)}`);
+		} finally {
+			pollBusy = false;
+		}
+		/*
+		 * ---- 顺路把「待回答的 ask」也拉一遍（1.2.95） ----
+		 *
+		 * 用户报障：「手动去添加工作区刷新了才显示，但是它也只显示文字，
+		 * 没有显示弹窗。」
+		 *
+		 * 文字和弹窗是两条路：
+		 *   · 文字 = `session/event`，落盘的，能靠补事件拿回来；
+		 *   · 弹窗 = ask，**不落盘、只活在电脑端 `pendingAsks` 里**，
+		 *            必须显式问 `pendingAsks` 才有。
+		 *
+		 * 所以光补事件永远补不出弹窗 —— 必须单独拉。原来只有前端 `pullAsks`
+		 * 一个入口（用户点进会话 / 回前台时触发），后台期间发起的 ask
+		 * 就漏在这两个时机之间。现在轮询每轮都顺路拉一次。
+		 */
+		try {
+			const pending = await callRemote(config, 'pendingAsks', {});
+			const requests = pending !== null && typeof pending === 'object' && Array.isArray(pending.requests)
+				? pending.requests
+				: [];
+			if (requests.length > 0) {
+				/*
+				 * 用 `requestId` 去重，避免同一个 ask 每 3 秒重复弹一次
+				 *（用户会看到卡片反复出现 / 闪烁）。
+				 *
+				 * `askedSeen` 是 Set，条目在 ask 被回答或消失后自然失去意义，
+				 * 所以这里顺带做个小清理：只保留本批仍然存在的 id，
+				 * 不让它无限增长。
+				 */
+				const alive = new Set();
+				for (const request of requests) {
+					const requestId = request !== null && typeof request === 'object' ? request.requestId : undefined;
+					if (typeof requestId !== 'string' || requestId === '') continue;
+					alive.add(requestId);
+					if (askedSeen.has(requestId)) continue;
+					askedSeen.add(requestId);
+					/*
+					 * 走与 `pullAsks` **同一个**广播形状，前端不需要区分来源。
+					 * `ghost` 标记保留（电脑端可能已经 fallback 给本地 GUI）。
+					 */
+					const payload = request.payload !== null && typeof request.payload === 'object' ? request.payload : {};
+					if (request.ghost === true) payload.ghost = true;
+					broadcast('ask', {
+						requestId,
+						kind: request.kind,
+						sessionId: request.sessionId,
+						...payload,
+					});
+					progressed = true;
+					void debugLog(`轮询补出待回答 ask requestId=${requestId} kind=${request.kind}`);
+				}
+				// 清掉已经消失的 id，防止 Set 无限增长。
+				for (const id of askedSeen) {
+					if (!alive.has(id)) askedSeen.delete(id);
+				}
+			}
+		} catch (error) {
+			void debugLog(`轮询拉取 pendingAsks 失败: ${String(error?.message ?? error)}`);
+		}
+		return progressed;
+	}
+
 	async function* followSynced(sessionId, fromSeq, signal) {
 		// 诊断：确认这条流真的被建起来了（排查「同步会话没有运行态」第一步）。
 		try {
@@ -3438,6 +5173,11 @@ export function apply(ctx) {
 		// snapshot 里给的基线是 `assistantStream: {revision: 0}`，
 		// 所以第一帧 assistant-stream 的 revision 从 1 开始（见下面的自增处）。
 		let assistantRevision = 0;
+		// ⚠️ **卡死自愈**用的时间戳（见下面 `deriveRunning` 附近的说明）。
+		// 记录「最近一次收到任何事件」的时刻；只看运行态为 true 且长时间静默时
+		// 才去问一次电脑，正常连着（有事件来往）时一次都不发。
+		let lastEventAt = Date.now();
+		let lastStallCheckAt = 0;
 		while (!signal?.aborted) {
 			const controller = new AbortController();
 			const onAbort = () => controller.abort();
@@ -3450,7 +5190,36 @@ export function apply(ctx) {
 					headers: { accept: 'text/event-stream', 'x-dsh-remote-token': config.token },
 					signal: controller.signal,
 				});
-				if (!res.ok || res.body === null) throw new Error(`HTTP ${res.status}`);
+				if (!res.ok || res.body === null) {
+					// ## ⚠️ 404 必须熔断，不能无限重连
+					//
+					// `404` 的含义很确定：**电脑上没有这个会话**。常见于两种情形：
+					//   ① 用户在电脑上把对话删了，手机这边 `syncedSessions` 还留着；
+					//   ② 这条会话是我们自建的、从没在电脑上真正建出来过。
+					//
+					// 这两种情况**重连多少次都是 404**。而原来的写法对所有失败
+					// 一视同仁地重试（1s→2s→…→15s 封顶），于是每 15 秒就去打一次
+					// 电脑，日志里 404 刷屏，手机跟着掉电 —— 报告里那条
+					// 「几千条空流压垮电脑」有一半是这么来的。
+					//
+					// 做法：404 时把会话从「已同步」里摘掉（它确实同步不上了），
+					// 并直接结束这条流。下次用户点开时会退回本地路径，行为正常。
+					// 注意**不要**删 `remoteSessions`：那是「归电脑管」的账本，
+					// 用户可能在电脑上重建同名会话后还要用。
+					if (res.status === 404) {
+						void debugLog(`followSynced(${sessionId}) 电脑上不存在（404），停止重连`);
+						ctx.logger?.info?.(
+							`[dsh-remote-mobile] 同步会话 ${sessionId} 在电脑上已不存在，停止跟踪`,
+						);
+						syncedSessions.delete(sessionId);
+						saveRemoteSessions(
+							remoteSessions, ctx.logger, syncedSessions, remotePaths,
+							desktopTitles, turnOffsets, remoteModels,
+						);
+						return;
+					}
+					throw new Error(`HTTP ${res.status}`);
+				}
 				wait = 1000;
 
 				// ⚠️ **连上了就校正一次运行态**（用户 2026-10-20 报障根因）。
@@ -3466,6 +5235,44 @@ export function apply(ctx) {
 				// ⚠️ 传 `isLive`：流断掉之后这次校正的结果已经过期，
 				// 不能拿旧结果去覆盖新状态。
 				reconcileRunning(ctx, config, sessionId, () => !controller.signal.aborted);
+
+				/*
+				 * 同样是"手机刚连上"的时刻 ⇒ 补拉待审批的 ask。
+				 * 与上面 `followSynced` 里那一处同源，`pulledAskIds`
+				 * 去重保证不会重复弹窗。
+				 */
+				pullPendingAsks(ctx, config);
+
+				// ⚠️⚠️ **静默看门狗必须独立于事件循环。**
+				//
+				// 下面那个卡死检查写在 `for await (const chunk of res.body)` 里面 ——
+				// 那意味着**有数据进来它才会被求值**。而真正要防的场景恰恰是
+				// 「流连着但一个字节都不来」：此时 `for await` 挂在那里等，
+				// 检查代码一次都不会执行，自愈形同虚设。
+				//
+				// 所以这里再起一个独立定时器，只做一件事：定期看
+				// 「运行态是否还停在 true、且已经静默太久」，是就校正一次。
+				//
+				// 清理放在下面的 `finally` 里（与 removeEventListener 同一个块），
+				// 保证流断/重连/abort 都不会留下裸定时器。
+				const stallWatchdog = setInterval(() => {
+					try {
+						if (controller.signal.aborted) return;
+						const nowMs = Date.now();
+						if (reconcileStateOf(sessionId).running !== true) return;
+						if (nowMs - lastEventAt <= STALL_RECONCILE_MS) return;
+						if (nowMs - lastStallCheckAt <= STALL_RECONCILE_MS) return;
+						lastStallCheckAt = nowMs;
+						void debugLog(
+							`followSynced(${sessionId}) 流静默 ${Math.round(
+								(nowMs - lastEventAt) / 1000,
+							)}s 且运行态为 true，看门狗主动校正`,
+						);
+						reconcileRunning(ctx, config, sessionId, () => !controller.signal.aborted);
+					} catch {
+						/* 看门狗自身绝不能让流崩掉 */
+					}
+				}, 30_000);
 
 				const decoder = new TextDecoder();
 				let buffer = '';
@@ -3600,7 +5407,47 @@ export function apply(ctx) {
 						//   - 「深度求索中 用时 N 秒」；
 						//   - 输入框的「停止生成」按钮；
 						//   - 顶部「N 个后台任务运行中」。
+						lastEventAt = Date.now();
 						deriveRunning(ctx, sessionId, payload, reconcileStateOf(sessionId));
+
+						// ## ⚠️ 卡死自愈（用户 2026-10-27 邮件反馈）
+						//
+						// 用户原话：「加载出来我问了一句在吗电脑那边回答出来了，
+						// 这边还是一直卡在深度思考出不来」。
+						//
+						// **发得出去、电脑也回了，但手机停在『深度求索中』。**
+						// 这说明 `turn/end` 那条事件没到 —— 而原来的兜底只在
+						// **建流时**校正一次（`reconcileRunning` 在 `res.ok` 之后）。
+						// 流一旦连着，就再没有任何人纠正它：前端会永远转圈，
+						// 「停止生成」也永远亮着。
+						//
+						// 实测场景：公网隧道抖动丢一条 SSE、或电脑侧那一轮被
+						// 中断而没发出 `turn/end`。两种都真实存在。
+						//
+						// 判据故意保守：
+						//   · 运行态必须是 true（false 时前端不转会，无所谓）；
+						//   · 且 **90 秒**没有任何事件进来（正常一轮会有
+						//     reasoning / text / tool 等大量帧，静默 90 秒几乎
+						//     不可能是真的在跑）；
+						//   · 且距离上次检查已过 90 秒（避免短时间内狂问）。
+						//
+						// 代价：一个卡住的会话最多每分钟一次一问一答的 RPC，
+						// 而且是**只在疑似卡死时**才发。正常使用零开销。
+						const nowAt = Date.now();
+						if (
+							reconcileStateOf(sessionId).running === true &&
+							nowAt - lastEventAt > STALL_RECONCILE_MS &&
+							nowAt - lastStallCheckAt > STALL_RECONCILE_MS
+						) {
+							lastStallCheckAt = nowAt;
+							void debugLog(
+								`followSynced(${sessionId}) 静默 ${Math.round(
+									(nowAt - lastEventAt) / 1000,
+								)}s 且运行态为 true，主动校正一次`,
+							);
+							reconcileRunning(ctx, config, sessionId, () => !controller.signal.aborted);
+						}
+
 						yield { type: 'event', event: payload };
 					}
 				}
@@ -3611,9 +5458,18 @@ export function apply(ctx) {
 				);
 			} finally {
 				signal?.removeEventListener?.('abort', onAbort);
+				// 看门狗必须随每条流一起清掉：不清的话每次重连都多留一个
+				// 永不停的定时器，越积越多（正是我们前几轮在别处修过的泄漏模式）。
+				try {
+					clearInterval(stallWatchdog);
+				} catch {
+					/* 已清理 */
+				}
 			}
 			if (signal?.aborted) return;
-			await new Promise((resolve) => setTimeout(resolve, wait));
+			// ⚠️ 用可唤醒的 sleep，而不是裸 `setTimeout`：
+			// 用户切回前台时应当立刻重连，不该干等退避（见 `sleepWakable` 注释）。
+			await sleepWakable(wait);
 			wait = Math.min(wait * 2, 15000);
 		}
 	}
@@ -4294,7 +6150,12 @@ export function apply(ctx) {
 		// 手机自己新建的远程会话（`createSession` 桥建的）历史在本地，读本地更快，
 		// 不该白跑一趟隧道。所以判据是 `syncedSessions.has(...)` 而不是
 		// `remoteSessions.has(...)`。
-		const originalPage = typeof controller.page === 'function' ? controller.page.bind(controller) : null;
+		/* ⚠️ controller 可能不存在（1.2.81 补判空）—— 5330 行那个分支有判空，这里原来没有：
+		 * `typeof controller.page` 在 controller 为 undefined 时直接抛 TypeError，
+		 * 而它在 ctx.effect 回调里 ⇒ 整个插件 FAILED。 */
+		const originalPage = (controller !== undefined && controller !== null && typeof controller.page === 'function')
+			? controller.page.bind(controller)
+			: null;
 		if (originalPage !== null) {
 			controller.page = async (request, signal) => {
 				const sessionId = request?.address?.sessionId;
@@ -4333,12 +6194,23 @@ export function apply(ctx) {
 					// 见文件头「seq 坐标系」），所以直接转发即可，不需要换算。
 					const body = {
 						sessionId,
-						// ⚠️ 默认只拉 10 条 —— 用户原话：「只加载最近 10 条左右」。
-						// 前端传的 `maxMessages: 50` 对手机隧道来说太大：实测一条消息
-						// 平均 4 KB 量级，50 条就是 200 KB，而 10 条只要 40 KB。
-						// 上滑时前端自己会再要一页，体验上没差别。
-						maxMessages: 10,
-					};
+						// ⚠️ 条数取 `HISTORY_PAGE_SIZE`（30），不再硬编码 10。
+						//
+						// 早先写死 10 是照着「只加载最近 10 条」的原话，但实测下来
+						// 一页 10 条读起来太碎：一段正常对话要连点四五次「加载更早」，
+						// 每次都要吃一个隧道往返（地板 0.6s），体感是「点了半天还在原地」。
+						//
+						// 30 条是本机实测的折中点（手机→电脑隧道，5 次中位数）：
+						//   10 条 →  85 KB / 0.94s
+						//   30 条 → 485 KB / 2.16s
+						//   50 条 → 1050 KB / 2.74s
+						// 30 条把「翻页次数」降到原来的三分之一，单次耗时仍在可接受范围；
+						// 50 条虽然只慢 0.6s，但流量翻倍（手机流量是要钱的）。
+						//
+						// 另外：这里**不能**直接用前端传的 `maxMessages`（它给 50），
+						// 那会把每次上滑都变成 1 MB 流量。
+					maxMessages: HISTORY_PAGE_SIZE,
+				};
 					// ⚠️ 优先用 `throughSeq`（精确边界，见上）。
 					if (typeof request?.throughSeq === 'number' && Number.isSafeInteger(request.throughSeq) &&
 						request.throughSeq >= -1) {
@@ -4347,6 +6219,33 @@ export function apply(ctx) {
 						// 兜底：没有 `throughSeq` 时按 `beforeSeq - 1` 推（两者语义等价，
 						// 因为 `prepend` 的 `through` 恒等于 `before - 1`）。
 						body.throughSeq = request.beforeSeq - 1;
+					}
+					/*
+					 * ## 读历史前先预检隧道（见 `probeTunnelBeforeHeavyCall`）
+					 *
+					 * 「上滑加载更多」是用户**主动触发**的动作，最忌点了没反应。
+					 * 不通就立刻报错，通了才给 90 秒的大窗口。
+					 */
+					const probe = await probeTunnelBeforeHeavyCall(config, 'readHistory');
+					/*
+					 * ## ⚠️⚠️ 预检失败**不阻断**，只记录（2026-10-29 再修）
+					 *
+					 * 上一版这里是 `if (!probe.ok) throw ...` —— 等于用一次 15 秒的探测
+					 * **否决掉 120 秒的读取机会**。这与用户截图里那个
+					 * 「电脑没有响应（15 秒超时）」是同一类错误。
+					 *
+					 * 用户原话：「既然能配对成功 肯定说明是联通的呀」。完全正确：
+					 * 配对成功 = 隧道配置正确 = 大概率活着。探测失败更可能是
+					 * 「那一瞬间慢」，而不是「真的断了」。
+					 *
+					 * 现在：预检只用于记录与提前警告，**不做最终裁决**。
+					 * 失败也照样去读，让真正的读取带着完整超时窗口自己试 ——
+					 * 真断了它会报出准确原因，只是慢那这次就成功了（用户要的正是这个）。
+					 */
+					if (!probe.ok) {
+						ctx.logger?.warn?.(
+							`[dsh-remote-mobile] 预检未通过（${probe.reason || '隧道不通'}），仍尝试读取`,
+						);
 					}
 					const page = await callRemote(config, 'readHistory', body);
 					if (page !== null && typeof page === 'object' && Array.isArray(page.records)) {
@@ -4379,10 +6278,81 @@ export function apply(ctx) {
 					// 电脑给的形状不对（老版本电脑端？）就退回本地，至少不白屏。
 					return originalPage(request, signal);
 				} catch (error) {
+					/*
+					 * ## ⚠️⚠️ 读电脑历史失败时**绝不能退回本地**（2026-10-29 修）
+					 *
+					 * 原来这里 `return originalPage(request, signal)`。看起来是"优雅降级"，
+					 * 实际是**把界面推进死循环**：
+					 *
+					 * 同步来的会话在手机本地**一条历史都没有**（历史按需从电脑拉，
+					 * 这是用户明确的设计：「用户点击对话的时候，它只同步最近的那几条
+					 * 消息而已，这样子会减小带宽压力」）。
+					 * 所以 `originalPage` 只能返回空页 —— 而前端
+					 * `RemoteJournalStream.prepend()` 拿到空页后，游标不前进，
+					 * 界面就永远停在「载入历史…」。
+					 *
+					 * 用户原话：「它一直载入历史，很久很久都没有成功，然后后面直接
+					 * 啥都没有了，发消息也发不过去」。
+					 *
+					 * ## 现在怎么做
+					 *
+					 * 把真实原因**抛出去**，让前端显示错误。这比无限转圈好得多：
+					 * 用户至少知道是"连不上电脑"，而不是"App 卡死了"。
+					 *
+					 * 抛错前把原因写清楚（超时 / 电脑离线 / 电脑端拒绝），
+					 * 前端 `MessageList` 的错误态会把它显示出来。
+					 */
+					const reason = String((error && (error.message || error.code)) || error);
 					ctx.logger?.warn?.(
-						`[dsh-remote-mobile] 读电脑历史失败（退回本地）: ${String(error?.message ?? error)}`,
+						`[dsh-remote-mobile] 读电脑历史失败 session=${sessionId}: ${reason}`,
 					);
-					return originalPage(request, signal);
+					/*
+					 * ## ⚠️⚠️ 「本地日志坏了」导致的读失败 ⇒ **当场自愈**（2026-10-29）
+					 *
+					 * 用户报障：「我在手机新建电脑对话，成功，但后续我
+					 * 再次打开该对话就报错了」，界面红字：
+					 *
+					 *     历史加载失败： failed to project session "…":
+					 *     invalid persisted inbox splice at session seq 5 (gateway/internal)
+					 *
+					 * 为什么要在**这里**自愈：
+					 *
+					 * 已有的 `removeCorruptMirror` 只挂在两条路上 ——
+					 * 「SSE 事件到达」与「selectModel」。而用户打开会话走的是
+					 * `controller.page`（本函数），**两条都没走到** ⇒ 坏日志永远不被清理
+					 * ⇒ 这个会话对用户而言**永久打不开**，只能删掉重同步。
+					 *
+					 * 现在把它接上：识别出「本地投影坏了」就删日志、重建壳、
+					 * 再重试一次。成功的话用户**什么都不用做**，下一帧历史就出来了。
+					 *
+					 * ⚠️ 只在错误文案明确指向**本地日志损坏**时才动：
+					 * 「连不上电脑」「电脑拒绝」等等删了也没用，反而白丢本地历史。
+					 */
+					const localCorrupt = /project session|invalid persisted|corrupt|SessionFormatError|SessionQueryError/i.test(reason);
+					if (localCorrupt && mirrorWarnedAt.get(sessionId) !== true) {
+						mirrorWarnedAt.set(sessionId, true);
+						try {
+							const removed = await removeCorruptMirror(sessionId, reason);
+							void debugLog(
+								`page(${sessionId}) 本地日志损坏已清理（${removed ? '成功' : '未找到目录'}），将重建后重试`,
+							);
+							if (removed) {
+								await ensureLocalMirror(sessionId).catch(() => undefined);
+								// 重试一次读取：壳已重建，历史会从电脑重拉。
+								return await controller.page(request, signal);
+							}
+						} catch (healError) {
+							void debugLog(
+								`page(${sessionId}) 损坏自愈失败: ${String(healError?.message ?? healError)}`,
+							);
+						}
+					}
+					/*
+					 * ⚠️ 抛之前先确认：这个会话**真的**是从电脑同步来的
+					 *（进入本函数时已判过 `syncedSessions.has`），本地没有历史。
+					 * 所以这里抛错不会遮蔽任何"本来能读本地"的场景。
+					 */
+					throw new Error(`读取电脑上的对话历史失败：${reason}`);
 				}
 			};
 			undo.push(() => {
@@ -4408,7 +6378,10 @@ export function apply(ctx) {
 		//（`dsh-api-session-controller/lib/index.js:911`）会用
 		// `attachments.readImage(ref)` 读出原始字节并 base64 回来，形状与官方
 		// RPC 的返回**完全一致**（`{attachment, data}`），所以前端不需要任何改动。
-		const originalAttachment = typeof controller.attachment === 'function' ? controller.attachment.bind(controller) : null;
+		/* ⚠️ 同 5515：controller 可能不存在（1.2.81） */
+		const originalAttachment = (controller !== undefined && controller !== null && typeof controller.attachment === 'function')
+			? controller.attachment.bind(controller)
+			: null;
 		if (originalAttachment !== null) {
 			controller.attachment = async (request, signal) => {
 				const sessionId = request?.sessionId;
@@ -4472,7 +6445,10 @@ export function apply(ctx) {
 		//
 		// 所以同步会话**不落本地日志**：`follow` 直接把电脑的事件流搬给前端，
 		// 全程使用**电脑的 seq 体系**（前端只做相对比较，不关心从几开始）。
-		const originalFollow = typeof controller.follow === 'function' ? controller.follow.bind(controller) : null;
+		/* ⚠️ 同 5515：controller 可能不存在（1.2.81） */
+		const originalFollow = (controller !== undefined && controller !== null && typeof controller.follow === 'function')
+			? controller.follow.bind(controller)
+			: null;
 		/**
 		 * 取某会话的投影值，拼成 `follow` 首帧要的 `projections.values`。
 		 *
@@ -4561,14 +6537,79 @@ export function apply(ctx) {
 				// 先把电脑那一页历史拿下来（失败就老老实实走本地，不白屏）。
 				let firstPage = null;
 				try {
-					firstPage = await callRemote(config, 'readHistory', { sessionId, maxMessages: 10 });
+					/*
+					 * ## 先 ping 再决定要不要等（用户 2026-10-29 要求）
+					 *
+					 * 「通了就多等一会，等个一分钟也没问题；不通就别白等」。
+					 *
+					 * 读历史是重活（一页 30 条约 485 KB，跨隧道 2 秒起），
+					 * 所以先用 4 秒 ping 确认隧道活着，再给它 90 秒的读窗口
+					 *（见 `TIMEOUT_BY_METHOD`）。不通就立刻失败 —— 不让用户
+					 * 对着「载入历史…」干等一分半。
+					 */
+					const probe = await probeTunnelBeforeHeavyCall(config, 'readHistory');
+					/*
+					 * ## ⚠️⚠️ 预检失败**不阻断**，只记录（2026-10-29 再修）
+					 *
+					 * 上一版这里是 `if (!probe.ok) throw ...` —— 等于用一次 15 秒的探测
+					 * **否决掉 120 秒的读取机会**。这与用户截图里那个
+					 * 「电脑没有响应（15 秒超时）」是同一类错误。
+					 *
+					 * 用户原话：「既然能配对成功 肯定说明是联通的呀」。完全正确：
+					 * 配对成功 = 隧道配置正确 = 大概率活着。探测失败更可能是
+					 * 「那一瞬间慢」，而不是「真的断了」。
+					 *
+					 * 现在：预检只用于记录与提前警告，**不做最终裁决**。
+					 * 失败也照样去读，让真正的读取带着完整超时窗口自己试 ——
+					 * 真断了它会报出准确原因，只是慢那这次就成功了（用户要的正是这个）。
+					 */
+					if (!probe.ok) {
+						ctx.logger?.warn?.(
+							`[dsh-remote-mobile] 预检未通过（${probe.reason || '隧道不通'}），仍尝试读取`,
+						);
+					}
+					// 与 `page` 那条路径用同一个页大小，避免「首屏 30 条、上滑 10 条」
+					// 这种前后不一致（首屏 30 而翻页 10 会让窗口边界算得很别扭）。
+					firstPage = await callRemote(config, 'readHistory', {
+						sessionId,
+						maxMessages: HISTORY_PAGE_SIZE,
+					});
 				} catch (error) {
+					/*
+					 * ## ⚠️⚠️ 取开场历史失败时，**不要退回本地**（2026-10-29 修）
+					 *
+					 * 用户原话：「它同步过来的对话列表，我点开对话之后，它一直载入历史，
+					 * 很久很久都没有成功，然后后面直接啥都没有了，发消息也发不过去」。
+					 *
+					 * 原来这里 `firstPage = null`，然后往下走到
+					 * `yield* originalFollow(...)` 读**手机本地**历史 ——
+					 * 而同步会话在本地一条都没有（历史按需从电脑拉，这是用户的设计）。
+					 *
+					 * 于是前端拿到一个空 snapshot，窗口是白的、输入框发不出消息，
+					 * 用户只能退出去重进 —— 重进还是同样结果。
+					 *
+					 * ## 现在
+					 *
+					 * 把真实原因抛给前端。前端 `SessionEventStream.follow` 的错误态会把
+					 * 它显示出来，用户至少知道"是连不上电脑"，而不是"App 坏了"。
+					 *
+					 * 顺带把原因说得具体一点（超时 / 离线 / 电脑拒绝），
+					 * 这正是用户要的「必须把错误原因显示在 App 界面里」。
+					 */
+					const reason = String((error && (error.message || error.code)) || error);
 					ctx.logger?.warn?.(
-						`[dsh-remote-mobile] 同步会话 ${sessionId} 取开场历史失败（退回本地）: ${String(
-							error?.message ?? error,
-						)}`,
+						`[dsh-remote-mobile] 同步会话 ${sessionId} 取开场历史失败: ${reason}`,
 					);
-					firstPage = null;
+					/*
+					 * 先补一次运行态校正（一问一答，失败也不会抛），再抛错。
+					 * 这样即使用户看到错误提示，「电脑正在跑」的状态也不会丢。
+					 */
+					try {
+						reconcileRunning(ctx, config, sessionId);
+					} catch (reconcileError) {
+						/* 校正失败不影响报错本身 */
+					}
+					throw new Error(`读取电脑上的对话历史失败：${reason}`);
 				}
 				// 再单独问一次电脑的投影 —— `tokenUsage` / `contextPressure` 只有它
 				// 里面有，而 `readHistory` 是拿不到的（`page()` 只返回
@@ -4670,9 +6711,21 @@ export function apply(ctx) {
 		}
 
 		// ③ 预设名单
+		/**
+		 * 官方 `remoteExportList` **未打补丁**的原始实现。
+		 *
+		 * `patchPresets` 会把这个方法改写成「拉电脑名单 + 合并」。
+		 * 但 `mergedPresetList` 这个 RPC 需要**纯粹的手机本地名单**
+		 * 去做第二次合并 —— 拿到改写后的版本就会把电脑预设
+		 * 当成"本地预设"再混一遍（见 `localPresetList` 的注释）。
+		 *
+		 * 所以改写前先存一份原始引用。
+		 */
+		let presetListOriginal = null;
 		const patchPresets = (presets) => {
 			if (presets === undefined || typeof presets.remoteExportList !== 'function') return false;
 			const originalList = presets.remoteExportList.bind(presets);
+			presetListOriginal = originalList;
 			presets.remoteExportList = async (...args) => {
 				const local = await originalList(...args);
 				if (!paired()) return local;
@@ -4692,16 +6745,77 @@ export function apply(ctx) {
 				// 这与模型目录是**同一个坑**，`desktopCatalog()` 早就加了
 				// 「缓存为空就当场拉」的处理（见它的注释），预设这边一直漏着。
 				// 现在补齐，两边行为一致。
-				if (desktopCache.presets === null) {
+				/*
+				 * ## ⚠️⚠️ 缓存**过期也要重拉**，不只是为空时（2026-10-29 修）
+				 *
+				 * 用户原话：「模型列表和预设列表还是老问题，没有同步，我点击电脑
+				 * 工作区，或者我直接在侧边栏里面的电脑工作区行的右边按钮点击新建
+				 * 对话，然后新建对话的界面的模型列表和预设列表都没有加载过来，
+				 * 奇怪的是我重启之后再打开它就马上能显示出来了，所以我觉得数据肯定
+				 * 是已经到了手机这边的，肯定是你本地处理有问题」。
+				 *
+				 * 用户判断得完全正确 —— 就是本地处理的问题：
+				 *
+				 * 原来只在 `desktopCache.presets === null` 时才拉。一旦第一次拉到了
+				 * 某个值，这个缓存就**永远不会再更新**（除非 App 重启，因为重启后
+				 * 才从磁盘恢复、第一次调用又走"为空"分支）。
+				 *
+				 * 于是：用户在电脑上新增/修改预设 → 手机同步 → 手机缓存还是旧的
+				 * → 新建对话界面显示的是过期的那一份 → **重启 App 才刷新**。
+				 * 这与用户描述的现象逐字吻合。
+				 *
+				 * ## 现在：为空 or 过期 ⇒ 重拉
+				 *
+				 * 过期窗口取 `DESKTOP_CACHE_TTL_MS`（与模型目录同一档），
+				 * 这样两个菜单的数据新鲜度一致 —— 不会出现"模型是新的、
+				 * 预设是旧的"这种割裂感（用户早就报过这个）。
+				 */
+				/*
+				 * ⚠️⚠️ `at === 0` 必须算**过期**，不能算"新鲜"（1.2.40 修）
+				 *
+				 * 原来写的是：
+				 *
+				 *     presets === null ||
+				 *     (at !== 0 && Date.now() - at > TTL)
+				 *
+				 * 当 `at === 0`（= `invalidateDesktopCache` 刚跑过，或从没拉过）
+				 * 时，第二项恒为 `false`。于是只要 `presets` 不是 null，
+				 * `presetStale` 就是 `false` ⇒ **永远不重拉**。
+				 *
+				 * 也就是说 `invalidateDesktopCache` 对**预设**这一侧
+				 * 一直是**完全无效**的 —— 同步完成后预设不刷新，
+				 * 这是又一个独立成因（前几个在 `seat.load` / 强制刷新 / 形状上）。
+				 *
+				 * 之前 `at === 0` 时总是伴随 `presets === null`（因为
+				 * `invalidateDesktopCache` 会清空 presets），第一个条件
+				 * 恰好兜住了，所以这个错误被**掩盖**了。1.2.40 让失效只
+				 * 过期不清数据之后，它就会立刻暴露 —— 必须一起修。
+				 *
+				 * 正确语义：`at === 0` 表示"没有有效时间戳" ⇒ 陈旧。
+				 * 这与另外三处（`desktopCatalog` / `presetList` /
+				 * `mergedPresetList`）的写法一致 —— 五处判据必须完全同构，
+				 * 否则会出现"模型刷新了、预设还是旧的"这种割裂。
+				 */
+				const presetStale =
+					desktopCache.presets === null ||
+					desktopCache.at === 0 ||
+					Date.now() - desktopCache.at > DESKTOP_CACHE_TTL_MS;
+				if (presetStale) {
 					try {
-						desktopCache.presets = await callRemote(config, 'presetList', {});
-						desktopCache.at = Date.now();
-						persistDesktopCache();
+						const fresh = await callRemote(config, 'presetList', {});
+						/* 只有真的拿到合法形状才覆盖，失败保留旧缓存（不要清空）。 */
+						if (fresh !== null && typeof fresh === 'object') {
+							desktopCache.presets = fresh;
+							desktopCache.presetsAt = Date.now();
+							desktopCache.at = desktopCache.presetsAt;
+							persistDesktopCache();
+						}
 					} catch (error) {
 						ctx.logger?.warn?.(
 							`[dsh-remote-mobile] 取电脑预设列表失败: ${String(error?.message ?? error)}`,
 						);
-						return local;
+						/* 拉失败但有旧缓存 ⇒ 用旧的，总比没有好。 */
+						if (desktopCache.presets === null) return local;
 					}
 				}
 				if (desktopCache.presets === null) return local;
@@ -4712,6 +6826,65 @@ export function apply(ctx) {
 			});
 			return true;
 		};
+
+		/**
+		 * 让官方模型选择器**重新读一次目录**（1.2.45 新增）。
+		 *
+		 * ## 为什么需要它
+		 *
+		 * 1.2.44 修好了宿主侧「模型和预设共用时间戳」的根因 —— 缓存里
+		 * 确实换成了新数据。但这只解决了一半：
+		 *
+		 * 官方 `ModelCatalogDirectory` 有**自己的**内部缓存
+		 * （`#reads` 那张表，见 `dsh-client-ui-model-selection` 的
+		 * `refresh() { if (this.#reads.size === 0) return false; ... }`）。
+		 * 它会重跑读，也只在四个远程事件里被 `refresh()`：
+		 *
+		 *     llm/adapters-updated / settings/document-updated /
+		 *     credentials/record-updated / credentials/reference-updated
+		 *
+		 * **同步完成不属于任何一个** —— 和预设侧 `seat.load()` 完全同构。
+		 * 所以即使宿主缓存已是新数据，前端也不会重新读 ⇒ 菜单仍是旧的。
+		 *
+		 * 预设侧我早就加了 `forceRefreshPresets`，模型侧一直漏着。
+		 * 这就是「预设刷新了、模型没刷新」的另一半原因。
+		 *
+		 * ## 为什么用 `ctx.get` 而不是加进 `inject`
+		 *
+		 * 加 `inject: ['modelDirectories']` 有一旦服务名不对就整个
+		 * `apply()` 失败的风险 —— 1.0.29 就是这么让插件"不崩但也不工作"的。
+		 *
+		 * `ctx.get()` 是运行时查找：拿不到返回 `undefined`，全程 `try` 包着，
+		 * 什么都不会坏。本文件已在 `workspaceRegistry` / `agentPresets` /
+		 * `workspaceFiles` 三处用同一模式。
+		 */
+		/*
+		 * ## ⚠️⚠️ 返回「为什么失败」而不只是 false（1.2.63）
+		 *
+		 * 原来三种完全不同的故障都只 return false，界面统一显示
+		 * 「模型列表未刷新」。用户截一张图过来，我仍然不知道该往哪查：
+		 *
+		 *   · `ctx.get('modelDirectories')` 拿不到
+		 *       ⇒ 官方**根本没注册这个服务**（版本不同 / 改版）。
+		 *         这是最麻烦的一种：说明官方的目录机制变了，
+		 *         不是我们刷新姿势不对。
+		 *   · 服务在、但没有 `catalog`
+		 *       ⇒ 服务结构变了（官方把 catalog 挪走或改名）。
+		 *   · `catalog.refresh` 不是函数
+		 *       ⇒ refresh 被改名或改成私有。
+		 *
+		 * 三者需要的修法完全不同，报同一句话等于没报。
+		 * 所以改成返回 `{ ok, reason }`：
+		 *   ok=true  ⇒ 真的刷了
+		 *   ok=false ⇒ reason 带上具体原因，直接显示到界面
+		 */
+		/* 已在 `apply` 顶层定义（1.2.81）：本回调与 webServer 的 handler
+		 * 是两个不同的闭包，定义在这里 webServer 那边引用不到。 */
+		
+		/*
+		 * 旧签名保留：老的调用点（如果有）仍按布尔用。
+		 * 新代码一律用上面那个，能拿到原因。
+		 */
 
 		// 与标题守卫同构：先同步试一次，没就绪再交给依赖注入兜底。
 		// 两条路分开 try，否则 `ctx.get` 一抛错就把 `ctx.inject` 那条兜底也跳过了。
@@ -4921,6 +7094,15 @@ export function apply(ctx) {
 							// 没有 `apply()` 的闭包变量；漏传就是 `workspaceMap is not defined`，
 							// 用户点「在此新建对话」时必然失败（1.0.16 的真实报障）。
 							workspaceMap,
+							// ⚠️ 供 `desktopMeta` 桥读取（`handleBridge` 是模块级，
+							// 看不见 `apply()` 闭包 —— 这个坑在本文件踩过多次）。
+							desktopTimes,
+							desktopPins,
+							desktopSyncedAt,
+							// ⚠️ 同上：`remoteModels` 是 `apply()` 闭包里的落盘表，
+							// 供 `remoteModels` 桥读取（前端按会话显示「当前模型」，
+							// 与发送时用的是同一份数据 —— 见那条桥的注释）。
+							remoteModels,
 							// ⚠️ **同上，`pendingPlans` 也必须显式传**（1.0.64 的真实报障：
 							// `createSession` 桥里写 `pendingPlans.set(...)`，而 `handleBridge`
 							// 是模块级函数 ⇒ `ReferenceError: pendingPlans is not defined`
@@ -4936,6 +7118,16 @@ export function apply(ctx) {
 							// `handleBridge` 是模块级函数，看不见 `apply()` 闭包里的
 							// `remotePaths`。不传就 `rememberPath is not defined`
 							// ⇒ 同步会话时落盘路径失败 ⇒ 重启后又发不了消息。
+							// ⚠️ **必须显式传**（同 `pendingPlans` 那个坑，这是第 N 次踩）：
+							// `handleBridge` 是模块级函数，看不见 `apply()` 闭包里的
+							// `removeCorruptMirror`。不传就 `removeCorruptMirror is not
+							// defined` ⇒ 同步会话时清理野壳失败 ⇒ 那批 400 字节空会话
+							// 越攒越多（真机实测 1500+ 个）。
+							removeCorruptMirror: (sessionId, reason) =>
+								removeCorruptMirror(sessionId, reason),
+							// ⚠️ 同 `removeCorruptMirror`：模块级函数看不见 `apply()` 闭包，
+							// 必须显式注入，否则同步时清理野壳会 `ReferenceError`。
+							findOrphanShells: (keepId) => findOrphanShells(keepId),
 							rememberPath: (sessionId, desktopPath) => {
 								if (typeof sessionId !== 'string' || sessionId === '') return;
 								if (typeof desktopPath !== 'string' || desktopPath === '') return;
@@ -4952,6 +7144,59 @@ export function apply(ctx) {
 								// 立即落盘：`follow` 首帧要用它，重启后也要在
 								//（见 `loadDesktopTitles` 的注释）。
 								saveRemoteSessions(remoteSessions, ctx.logger, syncedSessions, remotePaths, desktopTitles, turnOffsets, remoteModels);
+							},
+							/**
+							 * 记「电脑上的真实活动时间」与「电脑上是否置顶」。
+							 *
+							 * ⚠️ 同 `rememberTitle`：`handleBridge` 是模块级函数，
+							 * 看不见 `apply()` 闭包里的 `desktopTimes` / `desktopPins`，
+							 * **必须**走这里注入。
+							 *
+							 * 两个字段各自独立校验：
+							 *   · `updatedAt` 只认有限非负数字 —— 混进字符串或 `NaN`
+							 *     会让侧边栏 `b.rank - a.rank` 变 `NaN`，排序静默失效
+							 *    （这正是本版要修的 bug 本身，不能在新代码里重犯）；
+							 *   · `pinned` 只认严格 `true`（电脑侧给 `false` 就是「没置顶」，
+							 *     那也不必记，省得文件里全是 false）。
+							 */
+							rememberDesktopMeta: (sessionId, updatedAt, pinned) => {
+								if (typeof sessionId !== 'string' || sessionId === '') return;
+								let dirty = false;
+								if (
+									typeof updatedAt === 'number' &&
+									Number.isFinite(updatedAt) &&
+									updatedAt >= 0
+								) {
+									// 只在**变化**时才写，避免同步一批对话时反复落盘。
+									if (desktopTimes[sessionId] !== updatedAt) {
+										desktopTimes[sessionId] = updatedAt;
+										dirty = true;
+									}
+								}
+								if (pinned === true) {
+									if (desktopPins[sessionId] !== true) {
+										desktopPins[sessionId] = true;
+										dirty = true;
+									}
+								} else if (pinned === false && desktopPins[sessionId] === true) {
+									// 电脑上取消置顶了 ⇒ 手机侧也要跟着取消。
+									delete desktopPins[sessionId];
+									dirty = true;
+								}
+								/*
+								 * 记「建壳时刻」—— 只在**第一次**记。
+								 *
+								 * 前端要靠它区分「本地 updatedAt 是同步那一刻的假值」
+								 * 还是「用户真的在手机上聊过」（见 `readDesktopMeta`
+								 * 里 `syncedAt` 那段）。重复覆盖会让基准一直往后推，
+								 * 于是「假值窗口」永远敞着 —— 用户后来真聊过的会话
+								 * 也会被电脑的旧时间盖回去。
+								 */
+								if (desktopSyncedAt[sessionId] === undefined) {
+									desktopSyncedAt[sessionId] = Date.now();
+									dirty = true;
+								}
+								if (dirty) saveDesktopMeta(desktopTimes, desktopPins, desktopSyncedAt, ctx.logger);
 							},
 							// ⚠️ 同 `rememberTitle`：`markSessionNonBlank` 是模块级函数，
 							// 看不见 `apply()` 闭包里的 `turnOffsets`。不传的话占位轮次
@@ -4970,6 +7215,64 @@ export function apply(ctx) {
 							// ⚠️ 也要显式传：`refreshAll` 是模块级 `handleBridge` 里的
 							// case 分支，同样看不见 `apply()` 的闭包变量。
 							persistDesktopCache,
+							/*
+							 * ⚠️⚠️ **必须传，否则同步完成时直接崩**（2026-10-29 真机报错）
+							 *
+							 * 真机弹窗原文：`invalidateDesktopCache is not defined`，
+							 * 出现在进度条跨完之后。
+							 *
+							 * 原因：`invalidateDesktopCache` 是 `apply()` 的闭包常量
+							 * （本文件 `:3137` 的 `const`），而 `autoSyncDesktop` 是
+							 * **模块级** `handleBridge` 里的 case 分支 —— 看不见闭包变量。
+							 *
+							 * 这与 `pendingPlans` / `desktopCache` / `desktopCatalog` 是**同一个坑**，
+							 * 本文件里已经踩过四次。所以这里把它一并传进 `io`。
+							 *
+							 * 后果不只是一句报错：这个异常会把
+							 * `syncProgress.phase` 永远卡在 `running`（异常发生在
+							 * `phase='done'` **之前**），于是前端显示
+							 * 「同步未完成」+ 红色进度条，而实际上已经同步完了
+							 * —— 正是用户截图里那个误报。
+							 */
+							invalidateDesktopCache,
+							/*
+							 * 让官方模型选择器重读目录（1.2.45 新增）。
+							 *
+							 * ⚠️ 必须传：`refreshOfficialModelCatalog` 是 `apply()` 的
+							 * 闭包常量，而 `handleBridge` 是模块级函数，直接引用就是
+							 * `refreshOfficialModelCatalog is not defined`
+							 * —— 本文件反复踩的闭包作用域坑（`invalidateDesktopCache`
+							 * / `DESKTOP_CACHE_TTL_MS` / `mergePresets` 都是同一个）。
+							 */
+							refreshOfficialModelCatalog,
+							refreshModelCatalogDetail,
+							/*
+							 * 取**手机本地**预设名单（给 `mergedPresetList` 用）。
+							 *
+							 * ⚠️⚠️ 不能调 `presets.remoteExportList()` ——
+							 * 那个函数已经被 `patchPresets` **改写**成
+							 * 「拉电脑名单 + 合并」的版本，再调一次会拿到
+							 * 已经合并过的数据，于是 `mergePresets` 里
+							 * `local?.presets` 就变成了「电脑 + 本地」的混合体，
+							 * 被当成"本地预设"塞进 `localPresets`。
+							 *
+							 * 结果：用户在手机工作区看到电脑预设混进来。
+							 *
+							 * 所以这里取**原始实现**（`presetListOriginal`，
+							 * 由 `patchPresets` 在改写前存下来）。
+							 */
+							localPresetList: async () => {
+								try {
+									if (typeof presetListOriginal === 'function') {
+										return await presetListOriginal();
+									}
+								} catch (error) {
+									ctx.logger?.warn?.(
+										`[dsh-remote-mobile] 取本地预设名单失败: ${String(error?.message ?? error)}`,
+									);
+								}
+								return null;
+							},
 							// ⚠️ **同上一行**：`modelCatalog` 分支里 `desktopCatalog()`
 							// 也是 `apply()` 的闭包常量（`:1629` 的 `const`），
 							// 不传就是 `desktopCatalog is not defined`
@@ -5032,18 +7335,300 @@ export function apply(ctx) {
 		'dsh-remote-mobile: browser stream route',
 	);
 
+	// ---- 「回到前台」通知端点 ----
+	//
+	// 客户端 `MainActivity.onStart()` → `EngineManager.notifyForeground()` →
+	// `POST /api/dsh-remote/wake`。收到就立刻唤醒所有退避中的 SSE 重连。
+	//
+	// ⚠️ 只接受本机（`127.0.0.1`）：这是给**同一个 App 的原生层**用的，
+	// 不该对外暴露。引擎监听 127.0.0.1，公网本来就到不了，这里再挡一道。
+	ctx.effect(() =>
+		ctx.webServer.register({
+			kind: 'exact',
+			path: ROUTE_WAKE,
+			handler: (req, res) => {
+				const remote = String(req.socket?.remoteAddress ?? '');
+				const isLocal =
+					remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
+				if (!isLocal) {
+					res.writeHead(403);
+					res.end();
+					return;
+				}
+				// ⚠️ **必须限定 POST**。
+				//
+				// 不限定的话，任何 GET 都能触发重连 —— 页面里一个
+				// `<img src="/api/dsh-remote/wake">`、一次误点、某个预取，
+				// 都会把所有会话的 SSE 重新拉一遍。本机来源挡不住这种情况：
+				// 发起方就是本机浏览器页面，`remoteAddress` 同样是 127.0.0.1。
+				//
+				// 这与 `ROUTE_RPC` 限定 content-type 是同一类防护：把「谁能调」
+				// 从「网络位置」收紧到「必须是一次明确的 POST」。
+				if (req.method !== 'POST') {
+					res.writeHead(405, { allow: 'POST' });
+					res.end();
+					return;
+				}
+				const woken = wakeAllRemoteStreams();
+				// 顺便把「已同步」的那批会话**立即重连**一次：
+				// 唤醒只结束退避等待，而有些流可能已经彻底退出循环了
+				// （比如 `signal.aborted` 过）。这里补一次 `follow`。
+				// ⚠️ **补连要有上限**。
+				//
+				// 回到前台时把「已同步」的会话全部重连是对的，但如果用户同步过
+				// 几十上百个对话，一次 onStart 就是几十上百条 SSE 同时起飞 ——
+				// 电脑端要为每条建流，手机侧同时开几十个 socket。
+				//
+				// 与启动恢复同样的顾虑（那里只跟随白名单，见下面的长注释）。
+				// 这里取 12：足够覆盖「用户真的在用的那几个」，又不会形成脉冲。
+				// 没被补连的会话仍会在用户点开时按需建流，不影响可用性。
+				const WAKE_REFOLOW_LIMIT = 12;
+				let refollowed = 0;
+				for (const sessionId of syncedSessions) {
+					if (refollowed >= WAKE_REFOLOW_LIMIT) break;
+					if (follows.has(sessionId)) continue;
+					try {
+						follow(sessionId);
+						refollowed += 1;
+					} catch {
+						/* 单条失败不影响其余 */
+					}
+				}
+				if (woken > 0 || refollowed > 0) {
+					ctx.logger?.info?.(
+						`[dsh-remote-mobile] 回到前台：唤醒 ${woken} 个退避中的流，补连 ${refollowed} 个`,
+					);
+				}
+				/*
+				 * **回到前台立刻补一次**，不等 3 秒轮询节拍。
+				 *
+				 * 长连接可能已经死透了（后台冻结），这时 `refollow` 拉起的新流要
+				 * 重新握手 + 补历史，用户会盯着一个空屏等好几秒。而 
+				 * `pollCatchUp` 走的是短连接，一次 RPC 就能把落下的内容补回来 ——
+				 * 两条路并行，谁先回来用谁的（`mirrorEvent` 会按 seq 去重）。
+				 */
+				void pollCatchUp(config).catch(() => { /* 静默 */ });
+				res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+				res.end(JSON.stringify({ ok: true, woken, refollowed }));
+			},
+		}, 'dsh-remote-mobile: foreground wake'),
+	);
+
 	// ---- 启动时恢复：把持久化的远程会话重新接上电脑 ----
+	//
+	// ⚠️⚠️ **必须是「已同步」白名单，不能是 `remoteSessions` 全量。**
+	//
+	// `remoteSessions` 只是「这个 id 归电脑管」的账本，里面包含大量
+	// **从没成功同步过 / 电脑上早已不存在**的条目（实测 3142 个）。
+	// 早先这里直接 `for (const id of remoteSessions) follow(id)`，等于启动瞬间
+	// 给三千多个会话各开一条 SSE —— 电脑端要为每一条建流，直接被打满，
+	// 手机侧日志刷屏 `HTTP 524`（Cloudflare 回源超时），整条链路越来越卡。
+	//
+	// 更糟的是其中相当一部分在电脑上**不存在**：那它们的 SSE 是永远 404、
+	// 永远重连的死循环，除了烧电和制造日志之外没有任何作用。
+	//
+	// 所以只跟随 `syncedSessions`（真正从电脑同步过历史的那些）—— 数量通常
+	// 是个位数，其余会话等用户真的点开时再由 `follow` 按需建立连接。
+	/*
+	 * ---- 定时轮询补齐（1.2.94 引入，1.2.95 改成**链式自调度**） ----
+	 *
+	 * 用户要求（2026-10-29 原话）：
+	 *
+	 *   「你就只需要把触发时机改成 APP 启动时，或者定时多少秒，比如实时刷新，
+	 *     刷新成功一次就马上接着刷新第二次。」
+	 *
+	 * 所以这里**不用** `setInterval`（它不管上一轮跑没跑完，到点就再发一次，
+	 * 慢网下会叠起来）。改成**跑完再排下一次**：
+	 *
+	 *     跑一轮 → 等 3 秒 → 跑下一轮 → …
+	 *
+	 * 这样「刷新成功一次立刻接第二次」是天然成立的 —— 中间只隔那 3 秒，
+	 * 而不是等一个固定节拍。跑得比 3 秒慢时也不会堆积（这一点比
+	 * `setInterval` 稳）。
+	 *
+	 * `pollBusy` 仍然保留：`wake` 端点会**额外**触发一次立即轮询，
+	 * 那一次可能和链式那一轮撞在一起，`pollBusy` 保证不并发。
+	 */
 	ctx.effect(() => {
-		for (const sessionId of remoteSessions) follow(sessionId);
+		let stopped = false;
+		let handle = null;
+
+		/** 排下一次；`delay=0` 表示「立刻接着跑」。 */
+		const schedule = (delay) => {
+			if (stopped) return;
+			handle = setTimeout(() => {
+				handle = null;
+				let progressed = false;
+				Promise.resolve()
+					.then(() => pollCatchUp(loadConfig()))
+					.then((result) => { progressed = result === true; })
+					.catch(() => { /* 电脑离线 / 未配对 ⇒ 静默 */ })
+					.then(() => {
+						/*
+						 * **有进展就立刻接着跑一轮**（用户明确要求）。
+						 *
+						 * 场景：用户离开期间电脑积了 500 条事件，而单轮上限
+						 * `POLL_MAX_GAP` 是 200 ⇒ 一轮补不完。如果每轮都等 3 秒，
+						 * 用户要等 9 秒才看到全部。有进展就立刻接下一轮，
+						 * 能连续把积压追平，追平后再回到 3 秒节拍。
+						 */
+						schedule(progressed === true ? 0 : POLL_INTERVAL_MS);
+					});
+			}, delay);
+			try {
+				if (handle && typeof handle.unref === 'function') handle.unref();
+			} catch { /* 忽略 */ }
+		};
+
+		// 开始：插件加载即启动（用户要求「APP 启动时就跑」）。
+		schedule(0);
+		/*
+		 * ⚠️ `unref`：插件卸载/进程退出时不要被这个定时器拖住。
+		 * 引擎重启频繁（每次 App 回前台都可能重启 Node），不 unref 会积累。
+		 */
+		try {
+			if (timer && typeof timer.unref === 'function') timer.unref();
+		} catch { /* 忽略 */ }
+		return () => {
+			stopped = true;
+			try {
+				if (handle !== null) clearTimeout(handle);
+			} catch { /* 忽略 */ }
+		};
+	}, 'dsh-remote-mobile: poll catch-up');
+
+	ctx.effect(() => {
+		const eager = [];
+		for (const sessionId of remoteSessions) {
+			if (syncedSessions.has(sessionId)) eager.push(sessionId);
+		}
+		for (const sessionId of eager) follow(sessionId);
 		if (remoteSessions.size > 0) {
-			ctx.logger?.info?.(`[dsh-remote-mobile] 已恢复 ${remoteSessions.size} 个远程会话的事件流`);
+			ctx.logger?.info?.(
+				`[dsh-remote-mobile] 启动恢复：仅跟随已同步的 ${eager.length} 个会话` +
+					`（远程会话总数 ${remoteSessions.size}，其余按需连接）`,
+			);
 		}
 		// 已配对的话，启动时也把电脑的模型/预设静默拉一次 —— 否则重启 App 后
 		// 用户直接打开模型菜单会看到空列表（缓存是内存态，重启即丢）。
 		// ⚠️ 不 await：这是后台动作，别拖慢引擎启动。`.catch` 兜住最后一道，
 		// 免得一个后台失败变成 unhandled rejection 打脏引擎日志。
 		prefetchDesktop('启动').catch(() => {});
+
+		// ---- 启动时**自动同步**电脑上的工作区与对话 ----
+		//
+		// 用户诉求（2026-10-27，多条反馈）：「每次打开软件都要自己同步工作区和
+		// 对话，非常非常繁琐……希望实现自动识别所有工作区内未归档的对话」。
+		//
+		// 实现要点：
+		//   ① **延迟 3 秒**再跑。启动瞬间引擎正在加载插件、建 WebView，
+		//      这时插一条跨公网隧道的 RPC 会跟启动抢资源（用户反馈过「一启动
+		//      就卡」）。3 秒后 UI 已经能交互，同步在后台悄悄完成。
+		//   ② **只在已配对时跑**，否则必然失败并刷一条 warn。
+		//   ③ **失败静默**。电脑关机、隧道没起、用户在外面没网 —— 都是常态，
+		//      不该在用户面前报错；侧边栏保持上次的持久化内容即可。
+		//   ④ 不 await，不阻塞任何东西。
+		const autoSyncTimer = setTimeout(() => {
+			// ## ⚠️⚠️ 这里**不能**调 `paired()`（2026-10-28 真机抓到的启动崩溃）
+			//
+			// `paired` 是 `ctx.effect(() => …)` 内部的一个**闭包局部函数**
+			// （见本文件 `const paired = () => config.token !== EMPTY_TOKEN;`），
+			// 它只在那一个 effect 的作用域里存在。本段代码在**另一个**
+			// `ctx.effect` 里，作用域根本不通。
+			//
+			// 原来的写法 `if (!paired()) return;` 一执行就抛：
+			//
+			//     ReferenceError: paired is not defined
+			//       at dsh-jiuling-remote-mobile/lib/index.js:5707
+			//
+			// 而它是包在 `setTimeout(…, 3000)` 里的 —— 启动时不报，**3 秒后
+			// 才炸**。Node 22+ 对定时器回调里的未捕获异常是**直接终止进程**，
+			// 于是症状变得极难归因：
+			//
+			//   · 用户的 App 打开后过几秒就「自己退回去 / 白屏重载」；
+			//   · 看起来像是启动卡死或引擎崩了，实际是**插件把自己杀了**；
+			//   · 只在**已配对**的机器上必现（未配对的账户……原来也会走到这行，
+			//     也就是说所有装了 mobile 插件的机器都在 3 秒后崩一次）。
+			//
+			// 判断条件直接内联，不依赖任何外层作用域：
+			// `config.token !== EMPTY_TOKEN` 就是「已配对」的定义（用同一个
+			// `EMPTY_TOKEN` 常量，避免两处口径漂移）。
+			if (config.token === EMPTY_TOKEN) return;
+			// ⚠️ 这里**不能**直接调 `handleBridge`：它需要一整套闭包对象（`io`），
+			// 而那个对象是在另一个 effect 里内联构造的（见上面 `handleBridge(ctx,
+			// config, {...})` 那段）。从本作用域拼不出等价的一份，硬塞只会漏字段。
+			//
+			// 所以只做自动同步**真正需要的最小动作**：问电脑有哪些工作区/对话，
+			// 把没同步过的记进账本。建壳那一步交给 `syncConversations` 那条路
+			//（用户点开对话时由 `ensureLocalMirror` 按需建），既避免了复制一大段
+			// 建会话逻辑，也不会在启动瞬间批量建几百个空壳。
+			callRemote(config, 'listWorkspaces', {})
+				.then((listed) => {
+					const workspaces = Array.isArray(listed?.workspaces) ? listed.workspaces : [];
+					let added = 0;
+					for (const ws of workspaces) {
+						// ⚠️ 必须是**绝对路径**：这个值后面会拼进文件操作
+						// （读镜像、发消息时定位电脑目录）。相对路径会让后续
+						// 每一步都在错误的基准目录上运算，而且不报错 ——
+						// 只是「文件找不到」。宁可这里跳过。
+						if (typeof ws?.path !== 'string' || ws.path === '') continue;
+						if (!ws.path.startsWith('/')) continue;
+						const sessions = Array.isArray(ws.sessions) ? ws.sessions.slice(0, 20) : [];
+						for (const item of sessions) {
+							const sessionId = typeof item?.sessionId === 'string' ? item.sessionId : '';
+							if (sessionId === '') continue;
+							// ⚠️ 只登记账本，**不建会话目录**。
+							//
+							// 建目录要 `ctx.sessionController.create()`，那会真的在
+							// 磁盘上写 session 文件。用户可能有一百个对话，启动时全建
+							// 一遍既慢又费空间，而其中大多数这次根本不会打开。
+							//
+							// 登记进账本的效果是：它下次出现在侧边栏（前端按 synced
+							// 集合渲染），点开时 `follow` 走远程路径按需拉历史。
+							if (remoteSessions.has(sessionId)) continue;
+							remoteSessions.add(sessionId);
+							syncedSessions.add(sessionId);
+							if (typeof item.title === 'string' && item.title !== '') {
+								desktopTitles[sessionId] = item.title;
+							}
+							// ⚠️ **只在没有值时写**，不要无条件覆盖。
+							//
+							// `remotePaths[sessionId]` 决定「往哪个电脑目录发消息」
+							// （见发消息那段用 `persistedPath` 的注释）。同一个
+							// sessionId 理论上只属于一个工作区，但用户在工作区之间
+							// **移动过**对话、或者电脑侧数据被手工改过时，可能出现
+							// 两条记录指向同一 id。
+							//
+							// 无条件赋值 = 用「最后遍历到的那个」覆盖先前的正确值，
+							// 于是消息发到错的工作区 —— 表现为「AI 说文件不存在」，
+							// 而用户明明看到对话就在那儿。这种错很难查。
+							//
+							// 已有值一定是之前**真正同步过**时落盘的，比这份
+							// 只含元数据的列表更可信，所以以它为准。
+							if (remotePaths[sessionId] === undefined) {
+								remotePaths[sessionId] = ws.path;
+							}
+							added += 1;
+						}
+					}
+					if (added > 0) {
+						saveRemoteSessions(
+							remoteSessions, ctx.logger, syncedSessions, remotePaths,
+							desktopTitles, turnOffsets, remoteModels,
+						);
+						ctx.logger?.info?.(`[dsh-remote-mobile] 自动同步：登记了 ${added} 个电脑对话`);
+					}
+				})
+				.catch((error) => {
+					// 电脑关机 / 隧道没起 / 用户在外面没网 —— 全是常态，不该报错。
+					ctx.logger?.info?.(
+						`[dsh-remote-mobile] 自动同步跳过（电脑可能不在线）: ${String(error?.message ?? error)}`,
+					);
+				});
+		}, 3000);
+
 		return () => {
+			clearTimeout(autoSyncTimer);
 			for (const controller of follows.values()) controller.abort();
 			follows.clear();
 			for (const res of watchers) {
@@ -5119,7 +7704,7 @@ export function apply(ctx) {
  * 纯字符替换会把 `C:\a-b` 与 `C:\a\b` 压成同一个名字。
  *
  * @param desktopPath - 电脑上的绝对路径（win32 语义）。
- * @returns 形如 `c-users-<user>-1a2b3c4d` 的 slug。
+ * @returns 形如 `c-users-xiaopan-1a2b3c4d` 的 slug。
  */
 function desktopSlug(desktopPath) {
 	const flat = desktopPath.replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase();
@@ -5142,6 +7727,58 @@ function desktopTitle(desktopPath) {
 	const cut = Math.max(trimmed.lastIndexOf('/'), trimmed.lastIndexOf('\\'));
 	const name = cut < 0 ? trimmed : trimmed.slice(cut + 1);
 	return name === '' ? desktopPath : name;
+}
+
+/**
+ * 镜像工作区在侧边栏里显示的名字 —— 带「电脑」分类标识。
+ *
+ * ## 用户需求（2026-10-28）
+ *
+ * 「侧边栏目前是有工作区的一个大标签，我们可以给它分类成一个手机工作区和
+ *   电脑工作区的两个大分类，这样分类有个好处，就是用户比较容易找到，
+ *   因为电脑同步过来内容比较多，这样就比较方便找。」
+ *
+ * ## 为什么用「名称前缀」而不是真的分组
+ *
+ * 侧边栏的工作区列表由**官方前端**渲染（`dsh-client-ui-workspace`），
+ * 本插件没有任何 slot 能插入分组标题 —— 官方没有暴露那种钩子。
+ *
+ * 唯一能影响到列表呈现的，就是插件的**镜像工作区标题**。所以给电脑侧
+ * 工作区统一加零宽前缀：
+ *
+ *   · 视觉上立刻区分（图标一眼可辨，不依赖排序）；
+ *   · 文本搜索/读音不受影响（`desktopTitle` 仍在后面，用户搜目录名照样命中）；
+ *   · 不破坏任何按路径的匹配逻辑（那套全程用 `workspaceMap` 的 slug，
+ *     与标题无关 —— 见 `mirrorWorkspaces`）。
+ *
+ * ⚠️ 前缀**不能**用会被当成路径分隔符的字符，也不能太长（侧边栏宽度有限，
+ * 手机上一行大约 14 个汉字）。用 emoji + 空格是最省字符的方案。
+ *
+ * @param desktopPath - 电脑上的绝对目录。
+ */
+/** * 电脑工作区标题的**文本前缀**（不含图标）。
+ *
+ * ⚠️ 这里**不再放 emoji**（用户 2026-10-29 明确否定：
+ * 「你在每个工作区名称前面加一个电脑是什么意思啊，这也太丑了
+ * 你起码你也得用 SVG 给我画一个比较符合 DSH 的一个小标识吧」）。
+ *
+ * 但文本前缀**不能完全去掉**：前端要靠它识别哪些行是电脑工作区
+ *（`data-` 属性在 React 重渲染时会丢，而 title 是数据本身、不会丢）。
+ *
+ * 所以现在的分工是：
+ *   · 数据层（本函数）—— 只留一个不可见的窄分隔符 `\u2009`（thin space）
+ *     + 正常名称，用户看到的就是干净的目录名；
+ *   · 视觉层（前端 `decorateDesktopRows`）—— 在这个前缀位置**插入官方
+ *     SVG 图标**（`IconGlobeOutlineRegular`，表示"远程电脑"），
+ *     真图上屏、跟着主题变色，比 emoji 协调得多。
+ *
+ * 判据仍然是"标题是否以这个前缀开头"，只是前缀换成了一个用户
+ * 基本看不见的字符。
+ */
+const DESKTOP_TITLE_PREFIX = '\u200B';
+
+function desktopCategoryTitle(desktopPath) {
+	return `${DESKTOP_TITLE_PREFIX}${desktopTitle(desktopPath)}`;
 }
 
 /**
@@ -5181,7 +7818,31 @@ async function ensureDesktopWorkspace(ctx, desktopPath, workspaceMap) {
 		workspaceMap[slug] = desktopPath;
 		saveWorkspaceMap(workspaceMap, ctx.logger);
 	}
-	return await registry.create(dir, desktopTitle(desktopPath));
+	const workspace = await registry.create(dir, desktopCategoryTitle(desktopPath));
+	/*
+	 * ⚠️ **`create()` 对已存在的路径不会改标题**（官方
+	 * `dsh-workspace/lib/index.js:642`：`for (const entity of ...) if
+	 * (entity.path === canonical) return entity;`）。
+	 *
+	 * 所以老用户升级上来时，工作区早已建好、标题还是旧格式（没有分类前缀），
+	 * 光靠 `create` 永远不会更新。必须显式 `setTitle` 一次。
+	 *
+	 * 只在标题**确实不同**时才写：`setTitle` 会落盘并广播 `domain/changed`，
+	 * 无条件调用会让侧边栏每次同步都重建一遍（白白闪烁）。
+	 */
+	const wantTitle = desktopCategoryTitle(desktopPath);
+	if (typeof workspace?.title === 'string' && workspace.title !== wantTitle
+		&& typeof workspace.setTitle === 'function') {
+		try {
+			await workspace.setTitle(wantTitle);
+		} catch (error) {
+			// 改名失败不影响主流程：工作区已经能用，只是分类不显示。
+			ctx.logger?.warn?.(
+				`[dsh-jiuling-remote-mobile] 镜像工作区改名失败 ${desktopPath}: ${String(error?.message ?? error)}`,
+			);
+		}
+	}
+	return workspace;
 }
 
 /**
@@ -5486,12 +8147,235 @@ function desktopPathOfMirror(workspaceMap, dir) {
  * @param config - 远程配置。
  * @param io - `{ remoteSessions, follow, follows, mirrorStates, persist, workspaceMap, body }`。
  */
+/**
+ * 同步进度（模块级）。
+ *
+ * ## 为什么要放模块级
+ *
+ * `autoSyncDesktop` 是一次同步 RPC：它跑完才返回，期间手机和电脑之间没有
+ * 「进度」这个概念的通道。而用户要的是**真实进度**而不是假循环动画
+ *（原话：「一定要有真实的进度提示，而不是那种假的循环动画，那样用户就会
+ * 以为是卡死了」）。
+ *
+ * 所以同步过程把进度写进这个模块级对象，前端在同步期间高频轮询
+ * `syncProgress` 桥（几毫秒一次，纯内存读，零网络开销）来画进度条。
+ *
+ * `phase` 的取值：
+ *   · `idle`      —— 没在同步（默认）
+ *   · `estimating`—— 正在问电脑「一共要做多少」（分母未知）
+ *   · `running`   —— 正在建本地空壳，`done/total` 有效
+ *   · `done`      —— 完成（前端据此收起动画）
+ *   · `failed`    —— 失败（`message` 里有原因）
+ */
+const syncProgress = {
+	phase: 'idle',
+	/** 已处理的对话条数（成功+跳过都算"处理过"）。 */
+	done: 0,
+	/** 总条数（分母）；0 表示还不知道。 */
+	total: 0,
+	/** 已建的工作区数。 */
+	workspaces: 0,
+	/** 预估的元数据体积（字节），仅供界面显示。 */
+	bytes: 0,
+	/** 失败原因（`phase === 'failed'` 时有效）。 */
+	message: '',
+	/*
+	 * 模型目录刷新是否成功（`done` 时有效）。
+	 *
+	 * ⚠️ 为什么要暴露到界面（1.2.53）：`refreshOfficialModelCatalog()`
+	 * 拿不到 `modelDirectories` 服务时**只 return false，没有任何声张**。
+	 * 于是「同步完成了、但模型菜单还是旧的」这个现象，我们和用户都
+	 * 无从判断到底是缓存没作废、还是官方服务根本没接上。
+	 *
+	 * 现在把它带出去：前端在 done 的副标题里显示「模型未刷新」，
+	 * 一张截图就能分开这两种完全不同的故障。
+	 *
+	 * 取值：`null` 未尝试 / `true` 成功 / `false` 失败。
+	 */
+	modelRefresh: null,
+	/*
+	 * 失败时的具体原因（1.2.63）。
+	 *
+	 * `modelRefresh` 只告诉界面「成不成」，但三种失败需要的修法
+	 * 完全不同（服务没注册 / 没 catalog / 没 refresh）。
+	 * 所以把原因也带出去，界面直接显示—— 用户截图就能定位。
+	 *
+	 * 成功时为空字符串（或 null），不打扰界面。
+	 */
+	modelRefreshReason: '',
+};
+
 async function handleBridge(ctx, config, io) {
 	const params = io.body?.params ?? {};
 	switch (io.body?.method) {
 		/** 连接自检：手机 → 电脑。 */
 		case 'ping':
 			return callRemote(config, 'ping', {});
+
+		/**
+		 * 确认「电脑侧的数据变化我已经拉过了」⇒ 让电脑清掉 dirty 标记。
+		 *
+		 * 见电脑端 `ackDirty` 的注释：清标记的时机必须是手机确认拉取成功之后，
+		 * 否则网络抖动一次，标记就永久丢了，手机再也不知道有变化。
+		 *
+		 * 失败**不抛错**：清标记失败最坏是下次 ping 又提示一遍（多同步一次），
+		 * 比让用户的同步流程报错好得多。
+		 */
+		case 'ackDirty': {
+			if (config.token === '') return { ok: false, reason: '未配对' };
+			try {
+				return await callRemote(config, 'ackDirty', {
+					domains: Array.isArray(params?.domains) ? params.domains : undefined,
+				});
+			} catch (error) {
+				ctx.logger?.info?.(
+					`[dsh-jiuling-remote-mobile] ackDirty 失败（忽略）: ${String(error?.message ?? error)}`,
+				);
+				return { ok: false, reason: '电脑未响应' };
+			}
+		}
+
+		/**
+		 * **在线状态探测**（侧边栏「电脑工作区」标题旁的那个小圆点）。
+		 *
+		 * ## 用户需求（2026-10-28）
+		 *
+		 * 「可以在我们电脑工作区的这个大分类标题旁边做一个状态，比如每多少秒就
+		 *   自动 ping 一下这个电脑，看一下隧道连不连通，连通的话就有对应的在线
+		 *   标识，不连通的话就给出对应的不连通标识。」
+		 *
+		 * ## 为什么不复用 `ping`
+		 *
+		 * `callRemote` 的超时是 15 秒（`REMOTE_FETCH_TIMEOUT_MS`），那是给
+		 * 「真的要拿数据」的请求用的。状态灯每 20 秒探一次，如果某次电脑正好
+		 * 离线，一个探针就要占住 15 秒才返回 ——
+		 *   · 状态灯在 15 秒里一直显示"上次的结论"，是错的；
+		 *   · 几个探针叠在一起，还可能把隧道的连接数堆起来。
+		 *
+		 * 所以这里用**独立的短超时（4 秒）**：快速失败，快速给出"离线"。
+		 *
+		 * ## 永不抛错
+		 *
+		 * 这个方法**永远 resolve**，用 `{ ok, latencyMs, reason }` 表达结果。
+		 * 理由：前端是每 20 秒无条件轮询一次，如果它会 throw，就会在控制台
+		 * 刷满未处理的 Promise 拒绝 —— 而"电脑离线"本来就是**正常状态**
+		 * （用户关电脑就是离线），不是异常。
+		 */
+		case 'pingStatus': {
+			if (config.token === '') {
+				return { ok: false, paired: false, latencyMs: null, reason: '未配对' };
+			}
+			const startedAt = Date.now();
+			try {
+				/*
+				 * 4 秒。为什么不是 2 秒：Cloudflare 隧道冷启动（手机刚从休眠醒来、
+				 * 隧道边缘节点换了）首包偶尔要 2.5–3 秒。定 2 秒会把"其实在线、
+				 * 只是慢"误判成离线，用户看到状态灯莫名变灰。
+				 */
+				const res = await withTimeout(
+					(signal) => remoteFetch(`${config.endpoint}/api/dsh-remote/rpc`, {
+						method: 'POST',
+						headers: {
+							'content-type': 'application/json',
+							'x-dsh-remote-token': config.token,
+						},
+						body: JSON.stringify({ id: randomUUID(), method: 'ping', params: {} }),
+						signal,
+					}),
+					PING_STATUS_TIMEOUT_MS,
+					'在线探测',
+				);
+				/*
+				 * **顺风车**：ping 响应里可能带着电脑侧的 `dirty` 标记
+				 *（需求 5，见电脑端 `dirtyDomains` 的注释）。
+				 *
+				 * 只把标记透传给前端，不在宿主侧自作主张同步 ——
+				 * 同步要建会话、写盘，是重活，该由 UI 决定时机。
+				 *
+				 * ⚠️ 解析失败不能影响在线判定：拿不到就当"没有变化"。
+				 */
+				let dirty = [];
+				try {
+					const body = (typeof res.clone === 'function')
+						? await res.clone().json()
+						: await res.json();
+					const rawDirty = Array.isArray(body && body.dirty)
+						? body.dirty
+						: (Array.isArray(body && body.result && body.result.dirty) ? body.result.dirty : []);
+					dirty = rawDirty.filter(function (d) { return typeof d === 'string'; });
+				} catch {
+					/* 老版本电脑插件没有这个字段 ⇒ 静默当作无变化 */
+				}
+				/*
+				 * **回填探测缓存**：这次 ping 的结果同时也是
+				 * `probeTunnelBeforeHeavyCall` 的依据 —— 不然读历史前还要再
+				 * ping 一次，白白多一个隧道往返（冷启动 2–3 秒）。
+				 */
+				rememberTunnelProbe(true, Date.now() - startedAt, '');
+				return { ok: true, paired: true, latencyMs: Date.now() - startedAt, reason: '', dirty };
+			} catch (error) {
+				const text = String((error && (error.code || error.message)) || error);
+				/*
+				 * ## ⚠️⚠️ 失败**不回填**缓存（2026-10-29 修，这是个隐患）
+				 *
+				 * 上一版这里写了 `rememberTunnelProbe(false, ...)`，想法是
+				 * 「探测失败就 30 秒内别再试，省得白等」。但那是错的：
+				 *
+				 * 状态灯的 ping 只等 **4 秒**（见 `PING_STATUS_TIMEOUT_MS`），
+				 * 而 60 秒的重活超时意味着"4 秒没回"完全可能是**电脑慢但活着**
+				 * （冷启动、机械盘、电脑侧扫盘）。这时把这个"失败"写进缓存，
+				 * 接下来 30 秒内 `probeTunnelBeforeHeavyCall` 会**立刻判定不通**
+				 * ⇒ 读历史、列目录全部直接报错，一秒机会都不给。
+				 *
+				 * 这正是用户截图里那个场景的放大版：
+				 * 「既然能配对成功，肯定说明是联通的呀」—— 对，配对成功就证明
+				 * 隧道通。状态灯探测慢不等于断了。**4 秒的结论不足以否定 60 秒的
+				 * 可能性。**
+				 *
+				 * 所以：只有**成功**才回填（那是确定的正面事实：隧道确实活着，
+				 * 30 秒内不必重复探）。失败不回填，让重活自己带着完整的
+				 * 超时窗口去试 —— 它等得起。
+				 */
+				void text;
+				return {
+					ok: false,
+					paired: true,
+					latencyMs: null,
+					// 说人话：这些是用户能理解/能行动的几类。
+					reason: /abort|超过|timeout|Timeout/i.test(text)
+						? '电脑没有响应'
+						: (/401|403|token|unauthor/i.test(text) ? '配对已失效' : '连不上电脑'),
+				};
+			}
+		}
+
+		/**
+		 * 读同步进度（**纯内存，零网络**）。
+		 *
+		 * 前端在 `autoSyncDesktop` 期间高频轮询它来画进度条。因为是同步
+		 * 内存读，一次往返只有微秒级开销，不会给隧道添任何压力。
+		 */
+		case 'syncProgress': {
+			return { ...syncProgress };
+		}
+
+		/**
+		 * 前端「回到前台」时调一次：补拉电脑上等着的 ask 弹窗。
+		 *
+		 * 见 `pullPendingAsks` 的注释（粉丝反馈：后打开 App 看不到弹窗）。
+		 *
+		 * 为什么前端还要单独触发一次：Node 侧没有 `visibilitychange`。
+		 * 用户可能**一直没断开过事件流**（App 切后台但连接还在），
+		 * 那种情况下「重连」这个时机根本不会发生，只能靠前端主动喊一声。
+		 *
+		 * ⚠️ 不做节流：`pulledAskIds` 已经保证同一条 ask 只弹一次，
+		 * 所以用户反复切前后台也不会重复弹窗，只是多一次轻量 RPC。
+		 */
+		case 'pullAsks': {
+			if (config.token === '') return { ok: false, reason: '未配对' };
+			pullPendingAsks(ctx, config);
+			return { ok: true };
+		}
 
 		/**
 		 * 列电脑上的目录。
@@ -5560,10 +8444,61 @@ async function handleBridge(ctx, config, io) {
 			// `syncedSessions` —— 新增闭包变量时**必须**同步加进 `io` 对象。）
 			const cache = io.desktopCache;
 			if (cache === undefined) return null;
-			if (cache.catalog !== null) return cache.catalog;
+			/*
+			 * ⚠️⚠️ **不能直接 `return cache.catalog`**（2026-10-29 修热更新）
+			 *
+			 * 原来这里是：
+			 *
+			 *     if (cache.catalog !== null) return cache.catalog;   // ← 错
+			 *     const fetched = await io.desktopCatalog?.();
+			 *
+			 * 问题在于它**绕过了 `desktopCatalog()` 的过期判断**。
+			 * 我上一轮在 `desktopCatalog` 里加了 TTL，但这个分支
+			 * 根本不走那函数 —— 只要 `catalog` 不是 `null`，
+			 * 就永远返回旧快照，**TTL 形同虚设**。
+			 *
+			 * 这就是用户说的「模型与预设还是没热更新」的另一半原因（另一半在前端
+			 * `forceRefreshPresets`）。
+			 *
+			 * 现在**始终**走 `desktopCatalog()`，让它自己判缓存是不是过期：
+			 *   · 未过期 ⇒ 它直接返回缓存（不联网，快）；
+			 *   · 已过期 ⇒ 它重拉一次；拉失败也保留旧值。
+			 */
 			const fetched = await io.desktopCatalog?.();
 			if (fetched !== null && fetched !== undefined) io.persistDesktopCache?.();
-			return fetched ?? null;
+			/*
+			 * 兜底：`desktopCatalog` 不可用（旧版本宿主 / 初始化未完成）时，
+			 * 至少返回手上的缓存 —— 总比菜单空着强。
+			 */
+			if (fetched !== null && fetched !== undefined) return fetched;
+			if (cache.catalog !== null) return cache.catalog;
+			/*
+			 * ## ⚠️⚠️ 绝**不能**返回 `null`（1.2.46 修）
+			 *
+			 * 官方 `ModelCatalogDirectory.load()` 的成功分支第一句就是
+			 *
+			 *     for (const group of response.value.groups) ...
+			 *
+			 * 只要 `value` 是 `null`，这里立刻抛
+			 * `TypeError: Cannot read properties of null (reading 'groups')`，
+			 * 被自己的 `.catch` 接住后把 `status` 置成 `"error"`。
+			 *
+			 * 后果：**模型菜单整个变空**（不是"只有手机的"，是空的），
+			 * 而且 `refresh()` 会因为 status=error 走另一条路，用户要等
+			 * 下次 `credentials/*` 事件才可能恢复。
+			 *
+			 * 触发条件很常见：手机第一次连电脑时电脑正忙/隧道抖一下，
+			 * `desktopCatalog()` 拉失败且手上没有旧缓存 ⇒ 返回 null。
+			 *
+			 * 所以这里给一份**形状合法但内容为空**的目录：
+			 * `{ groups: [], default: null }`。官方遍历空数组什么都不做，
+			 * `status` 正常变 `ready`，菜单显示手机本地模型 —— 可用，
+			 * 而不是"空菜单"。
+			 *
+			 * 这与本文件其它降级处同一条原则：
+			 * **宁可少给，绝不给一个会让上层崩的形状。**
+			 */
+			return { groups: [], default: null };
 		}
 
 		/**
@@ -5573,24 +8508,114 @@ async function handleBridge(ctx, config, io) {
 		 * 反复打失败的请求；用户切回手机工作区，读到的仍是这份本地快照，
 		 * 由前端按工作区筛选（见 `pickWorkspacePresets`）。
 		 */
+		/**
+		 * **给前端「主动刷新预设缓存」用的合并版 roster**（1.2.39 新增）。
+		 *
+		 * ## ⚠️⚠️ 为什么不能直接用 `presetList`
+		 *
+		 * 两者返回的**数据形状不一样**，混用会丢数据：
+		 *
+		 * | 路径 | 返回 |
+		 * |---|---|
+		 * | `patchPresets` 拦官方 `remoteExportList` | `mergePresets(local, desktop)`，每条打 `desktop: true` |
+		 * | `case 'presetList'` | 电脑预设**原文**，没合并、没标记 |
+		 *
+		 * 1.2.37 我让前端把 `presetList` 的结果直接写进 `rosterCache` ——
+		 * 那是**错的**：`pickWorkspacePresets` 看到"一条 desktop 标记都没有"，
+		 * 会走"没打标记就原样返回"的保护分支 ⇒ 电脑工作区菜单里
+		 * **同时出现电脑预设和手机预设**，而正确行为是只显示电脑的。
+		 *
+		 * ## 现在这个 RPC
+		 *
+		 * 走与官方完全相同的 `mergePresets`，返回同构数据。前端拿到就直接换缓存，
+		 * 不必关心内部细节。这也让「前端看缓存」的逻辑只有一种形状要处理。
+		 */
+		case 'mergedPresetList': {
+			const cache = io.desktopCache;
+			if (cache === undefined) return null;
+			// 先按 TTL 刷新电脑那份（与 `presetList` 分支同一套判据）。
+			const stale =
+				cache.presets === null ||
+				cache.at === 0 ||
+				Date.now() - cache.at > DESKTOP_CACHE_TTL_MS;
+			if (stale) {
+				try {
+					const fetched = await callRemote(config, 'presetList', {});
+					if (fetched !== null && fetched !== undefined && typeof fetched === 'object') {
+						cache.presets = fetched;
+						cache.presetsAt = Date.now();
+						cache.at = cache.presetsAt;
+						io.persistDesktopCache?.();
+					}
+				} catch (error) {
+					ctx.logger?.warn?.(
+						`[dsh-remote-mobile] 合并预设时拉电脑名单失败: ${String(error?.message ?? error)}`,
+					);
+				}
+			}
+			/*
+			 * 电脑那份拿不到 ⇒ 返回 `null` 让前端**不要**改缓存。
+			 *
+			 * 这与 `patchPresets` 里 `if (desktopCache.presets === null) return local`
+			 * 一致：没电脑数据时前端本来就该只看本地，不需要我们喂东西。
+			 */
+			if (cache.presets === null) return null;
+			/*
+			 * 本地那份由 `io.localPresetList()` 提供（`apply()` 闭包里那个
+			 * **未经 patch 的** `presets.remoteExportList`）。
+			 * 拿不到就用空数组 —— `mergePresets` 能处理。
+			 *
+			 * ⚠️ 名字是 `localPresetList`，不是 `localPresets`。
+			 * 旧注释写错了名字，容易让后来的人按注释去引用一个
+			 * 不存在的 `io.localPresets` —— 那会是又一个
+			 * "`xxx is not defined`"式的悬空引用。
+			 */
+			let local = null;
+			try {
+				local = await io.localPresetList?.();
+			} catch (error) {
+				local = null;
+			}
+			return mergePresets(local, cache.presets);
+		}
+
 		case 'presetList': {
 			const cache = io.desktopCache;
 			if (cache === undefined) return null;
-			if (cache.presets !== null) return cache.presets;
+			/*
+			 * ⚠️⚠️ 两个修正（2026-10-29，与 `modelCatalog` 同源）
+			 *
+			 * ① **不能直接 `return cache.presets`**。
+			 *    那会绕过过期判断，让预设菜单永远停在旧快照
+			 *    —— 就是用户报的「预设还是没热更新」。
+			 *
+			 * ② **失败不能 `return null`**。
+			 *    拉失败（电脑睡眠 / 隧道抖）时返回 `null` 会让
+			 *    前端把预设菜单整块清空（变成「没有预设」）。
+			 *    而用户手上明明有一份上次拉到的好数据 ——
+			 *    **用稍旧的列表永远好过没有列表**。
+			 */
+			const stale =
+				cache.presets === null ||
+				cache.at === 0 ||
+				Date.now() - cache.at > DESKTOP_CACHE_TTL_MS;
+			if (!stale) return cache.presets;
 			try {
 				const fetched = await callRemote(config, 'presetList', {});
 				if (fetched !== null && fetched !== undefined) {
 					cache.presets = fetched;
-					cache.at = Date.now();
+					cache.presetsAt = Date.now();
+					cache.at = cache.presetsAt;
 					io.persistDesktopCache?.();
+					return fetched;
 				}
-				return fetched;
 			} catch (error) {
 				ctx.logger?.warn?.(
 					`[dsh-remote-mobile] 取电脑预设列表失败: ${String(error?.message ?? error)}`,
 				);
-				return null;
 			}
+			/* 拉不到（或拉回来的形状不对）⇒ 用旧缓存顶着，不清空。 */
+			return cache.presets;
 		}
 
 		/**
@@ -5649,11 +8674,46 @@ async function handleBridge(ctx, config, io) {
 				) {
 					io.desktopCache.directory = result.directory.value;
 				}
-				io.desktopCache.at = Date.now();
+				/*
+				 * ⚠️⚠️ 时间戳只在**真的刷新到东西**后才推进（1.2.42 修）
+				 *
+				 * 原来这里是无条件 `io.desktopCache.at = Date.now()`。
+				 * 而 `at` 是全部 TTL 判据的唯一依据 —— 于是「点刷新，
+				 * 但三个请求全失败」（电脑正忙 / 隧道抖 / 电脑睡了）时：
+				 *
+				 *   · `at` 被刷新成"刚刚"⇒ 接下来 5 分钟内
+				 *     `modelCatalog` / `presetList` / `mergedPresetList`
+				 *     全部认为缓存新鲜，**一次都不重拉**；
+				 *   · 用户看到的就是「刷新了还是旧数据，得等一会儿或重启」。
+				 *
+				 * 这与 `prefetchDesktop` 里那个坑完全一样（那里已修）：
+				 * **失败不该获得"新鲜"资格**。
+				 *
+				 * 至少一样成功才推进 —— 那样"新鲜"是有依据的。
+				 * 全失败则保留原时间戳，让下一次读取仍判陈旧、继续尝试。
+				 */
+				const refreshedAny =
+					result.models?.ok === true ||
+					result.presets?.ok === true ||
+					result.directory?.ok === true;
+				/*
+				 * ⚠️ 两个时间戳**各自独立推进**（1.2.44）。
+				 *
+				 * 用户点刷新时如果只有模型成功、预设失败，必须只推进模型的
+				 * 时间戳 —— 否则预设也被标成新鲜，接下来 5 分钟不重拉，
+				 * 用户看到「点了刷新，预设还是旧的」。
+				 */
+				const refreshAt = Date.now();
+				if (result.models?.ok === true) io.desktopCache.catalogAt = refreshAt;
+				if (result.presets?.ok === true) io.desktopCache.presetsAt = refreshAt;
+				if (refreshedAny) io.desktopCache.at = refreshAt;
 				// ⚠️ 手动刷新是**唯一**会把新数据写进本地快照的路径 —— 平时读的都是
 				// 这份快照（见 `modelCatalog` / `presetList` 两个 case）。不落盘的话，
 				// 刷新只对本次运行有效，重开 App 又回到旧数据。
-				io.persistDesktopCache?.();
+				//
+				// ⚠️ 只在**真有进展**时落盘：全失败还写一遍纯属浪费 IO
+				//（每次 `stringify` 整棵树，见 `saveDesktopCache` 的注释）。
+				if (refreshedAny) io.persistDesktopCache?.();
 				// 刷新完顺手把这一层的下一层预取回来，用户点进去就不用等了。
 				if (result.directory?.ok === true) io.prefetchDirs?.(result.directory.value);
 			}
@@ -5863,6 +8923,71 @@ async function handleBridge(ctx, config, io) {
 			return { ids: [...io.remoteSessions] };
 
 		/**
+		 * 电脑侧的**展示元数据**：真实活动时间 + 置顶标记。
+		 *
+		 * ## 为什么需要这条桥（用户 2026-10-29 两个报障）
+		 *
+		 *   ① 「同步过来的对话，你没有按时间顺序进行一个排序」
+		 *   ② 「电脑的某些对话人家是置顶的状态，你也没有把置顶的状态同步过来」
+		 *
+		 * 这两件事在**手机本地都是不准的**：
+		 *
+		 *   · `updatedAt` 在本地取自日志时间戳，而 `session.append()` 写死
+		 *     `Date.now()` ⇒ 同步会话的「活动时间」全是**同步那一刻**；
+		 *   · `pinnedSessionIds` 在本地是空的 —— 同步会话从没在手机上 `pinSession`。
+		 *
+		 * 所以要由宿主把**电脑上的真实值**告诉前端，让前端在读快照时覆盖
+		 *（`wrapSessionListClock` / `applyPinFromDesktop`）。
+		 *
+		 * ## 为什么一次全量给
+		 *
+		 * 与 `remoteSessions` 同样的理由：前端要在**每帧同步读**快照时用到它，
+		 * 不可能每帧打桥。所以 `apply()` 时拉一次全量，之后宿主记账时
+		 * 顺手推一次（`desktopMeta` 事件），前端纯查内存。
+		 *
+		 * @returns `{{times: Record<sessionId, number>, pins: Record<sessionId, true>}}`。
+		 */
+		case 'desktopMeta':
+			return {
+				times: { ...(io.desktopTimes ?? {}) },
+				pins: { ...(io.desktopPins ?? {}) },
+				// 建壳时刻：前端靠它判断本地 updatedAt 是假值还是真值
+				//（见 `readDesktopMeta` 里 `syncedAt` 那段注释）。
+				syncedAt: { ...(io.desktopSyncedAt ?? {}) },
+			};
+
+		/**
+		 * **每个会话实际会用哪个模型**（落盘的真值表）。
+		 *
+		 * ## 为什么需要这条桥（用户 2026-10-29 报障：模型不对称）
+		 *
+		 * 用户原话：「电脑端与手机端显示的当前模型不一致；实际选用的模型与
+		 * 界面显示的模型不一致。」
+		 *
+		 * 这两句其实是**同一个** bug 的两面，根因是**两份数据各走各的**：
+		 *
+		 * | 用途 | 数据源 |
+		 * |---|---|
+		 * | 发消息时真正送出去的模型 | 宿主 `remoteModels[sessionId]`（落盘，权威） |
+		 * | 界面显示的「当前模型」 | 前端 `modelChoiceBus.selection`（**全局一个**） |
+		 *
+		 * `remoteModels` 按会话存、且只在本插件里维护；前端那份是**单例**，
+		 * 谁最后选谁覆盖。于是：
+		 *
+		 *   · 在会话 A 选了 M1 ⇒ 界面全局记住 M1；
+		 *   · 切到会话 B（电脑上是 M2）⇒ 界面仍显示 M1，而发消息用的是 M2；
+		 *   · 重启 App ⇒ 界面退回电脑的全局默认（`catalog.value.default`），
+		 *     而 `remoteModels` 里还是 M1 —— **又对不上**。
+		 *
+		 * 修法就是把这份**真值**交给前端，让显示按 `sessionId` 查，
+		 * 与发送用同一份数据，天然一致。
+		 *
+		 * @returns `{ models: Record<sessionId, {provider, model, reasoningEffort?}> }`。
+		 */
+		case 'remoteModels':
+			return { models: { ...(io.remoteModels ?? {}) } };
+
+		/**
 		 * 电脑镜像工作区的 slug 集合（`workspaceMap` 的 keys）。
 		 *
 		 * ⚠️⚠️ **这是「模型列表按工作区隔离」的第二代判据，用户 1.0.19 报障后的正解。**
@@ -5929,7 +9054,14 @@ async function handleBridge(ctx, config, io) {
 					slug,
 					desktopPath: map[slug],
 					path,
-					title: desktopTitle(map[slug]),
+					/*
+					 * ⚠️ 必须用 `desktopCategoryTitle`（带零宽前缀），不能再用
+					 * `desktopTitle` —— 侧边栏里显示的是加了前缀的名字，前端拿这个
+					 * title 去 DOM 里匹配工作区行（见 `findRowByTitle`）。
+					 * 两边不一致的话，「⋯ → 同步对话」就找不到那一行，
+					 * 表现为「菜单里有这一项但点了没反应」。
+					 */
+					title: desktopCategoryTitle(map[slug]),
 					workspaceId,
 				});
 			}
@@ -5959,6 +9091,43 @@ async function handleBridge(ctx, config, io) {
 		}
 
 		/**
+		 * 一次拉回**电脑上全部工作区及其未归档对话**（自动同步用）。
+		 *
+		 * 与 `listDesktopConversations` 的区别：那个按单个 `cwd` 查、由用户在
+		 * 弹窗里手动勾选；这个跨全部工作区、只回元数据，供启动时自动建镜像。
+		 *
+		 * 流量极小（几百字节到几 KB，取决于对话数量），历史仍按需分页拉，
+		 * 所以可以在每次启动/重连时安全调用。
+		 *
+		 * @returns `{ workspaces: [{ workspaceId, path, title, sessions }] }`
+		 */
+		case 'listDesktopWorkspaces': {
+			if (config.token === '') throw new Error('还没配对：请先在「电脑」页签里填配对码');
+			return await callRemote(config, 'listWorkspaces', {});
+		}
+
+		/**
+		 * **首次同步预估**（见电脑端 `estimateSync` 的注释）。
+		 *
+		 * 手机端用它给加载动画提供**真实的分母**：进度 = 已建会话数 / 总条数。
+		 *
+		 * 失败处理是刻意的：**抛错不抛给界面**，退化成 `null` 让前端显示
+		 * 「正在同步…」的不确定态。理由：预估只是"锦上添花"，它坏了不能让
+		 * 整个配对流程失败 —— 用户此时已经配对成功，只是少了进度刻度。
+		 */
+		case 'estimateSync': {
+			if (config.token === '') throw new Error('还没配对：请先在「电脑」页签里填配对码');
+			try {
+				return await callRemote(config, 'estimateSync', {});
+			} catch (error) {
+				ctx.logger?.warn?.(
+					`[dsh-jiuling-remote-mobile] 同步预估失败（退化为不确定进度）: ${String(error?.message ?? error)}`,
+				);
+				return { workspaces: 0, sessions: 0, bytes: 0, truncated: false, failed: true };
+			}
+		}
+
+		/**
 		 * 把用户勾选的电脑对话「同步」到手机侧边栏。
 		 *
 		 * ## 关键设计：不在手机落一份完整历史
@@ -5982,6 +9151,359 @@ async function handleBridge(ctx, config, io) {
 		 *
 		 * @returns `{ synced: [sessionId...] }`。
 		 */
+		/**
+		 * **自动同步**：一次把电脑上所有工作区的未归档对话建到手机侧边栏。
+		 *
+		 * ## 用户诉求（2026-10-27，多条反馈）
+		 *
+		 * 「每次打开软件都要自己同步工作区和对话，非常非常繁琐……希望作者可以
+		 * 实现自动识别所有工作区内未归档的对话，可以不加载历史对话，但要加载
+		 * 所有真正进行的当前对话记录，这样对带宽的压力也会很小，然后对话都保留
+		 * 在本地，不要每次开关软件就要重新加载。」
+		 *
+		 * ## 做法
+		 *
+		 * ① 调电脑的 `listWorkspaces` 拿「全部工作区 + 各自未归档对话」（纯元数据）；
+		 * ② 对每个工作区调 `ensureDesktopWorkspace` 建（或复用）镜像工作区；
+		 * ③ 对每个还没同步过的对话，走与 `syncConversations` **完全相同**的
+		 *    建壳 + 记账流程（因此天然幂等，重复调用不会重复建）。
+		 *
+		 * ## 为什么历史仍然按需拉
+		 *
+		 * 手机本地 seq 必须连续（见 `syncConversations` 的注释），所以不能在手机
+		 * 落完整历史。这里只建**空壳**（几百字节），用户点开时再由 `follow` /
+		 * `page` 按需拉最近 30 条。所以自动同步的流量是「对话数量 × 几百字节」，
+		 * 几十个对话也就几 KB —— 完全可以在每次启动时跑。
+		 *
+		 * @param params.limit - 每个工作区最多自动同步多少个对话（默认 20）。
+		 *   用户可能在某工作区里有几百个对话，全同步会让侧边栏爆炸；
+		 *   按 `updatedAt` 排序取最近的若干个即可。
+		 * @returns `{ workspaces: n, created: [sessionId...], skipped: n }`。
+		 */
+		case 'autoSyncDesktop': {
+			if (config.token === '') throw new Error('还没配对：请先在「电脑」页签里填配对码');
+			const limit = Number.isInteger(params?.limit) && params.limit > 0 ? params.limit : 20;
+			/*
+			 * 进度上报（见 `syncProgress` 的长注释）。
+			 *
+			 * 这段用 try/finally 保证**任何退出路径**（含抛错）都把 phase
+			 * 收到终态，否则前端的动画会永远转下去 —— 用户会以为卡死。
+			 */
+			syncProgress.phase = 'estimating';
+			syncProgress.done = 0;
+			syncProgress.total = 0;
+			syncProgress.workspaces = 0;
+			syncProgress.bytes = 0;
+			syncProgress.message = '';
+			/*
+			 * ⚠️ 必须一起重置（1.2.53）。
+			 *
+			 * 它与 message 是同一类残留：上一轮留下的 false 会让这一轮
+			 * 在还没走到收尾时就显示「模型未刷新」—— 误报。
+			 * 取 null 表示「本轮尚未尝试」。
+			 */
+			syncProgress.modelRefresh = null;
+			/*
+			 * ## ⚠️⚠️ 真正的 try/finally（2026-10-29 真机报错后补）
+			 *
+			 * 上面那段注释一直声称「这段用 try/finally 保证」，
+			 * 但实际代码**根本没有 try/finally** —— 注释与代码不符。
+			 *
+			 * 真机后果（用户截图）：同步完成后弹窗显示
+			 * 「同步未完成」+ 红色进度条，原因写着
+			 * `invalidateDesktopCache is not defined`。
+			 *
+			 * 为什么会显示「未完成」：那个异常发生在
+			 * `phase = 'done'` **之前**，于是 phase 永远停在 `running`
+			 * ⇒ 前端按「进行中」渲染，但进度已满、且没人再推它
+			 * ⇒ 看起来就是「卡在 100% 的红条」。
+			 *
+			 * 现在用**真正的** try/finally 包住主体：无论从哪条路径退出
+			 * （正常返回 / 抛错 / 中途 return），都会把 phase 收到终态。
+			 * 这是“无论如何都不会卡死”的保证，不是打补丁。
+			 */
+			try {
+			/*
+			 * ⚠️ 拉列表失败必须**自己**把 phase 收到 failed 再抛出。
+			 *
+			 * 这里不用 try/finally 包住整个函数：`autoSyncDesktop` 的循环体里
+			 * 每个会话都有自己的 try/catch（单条失败不该中断整批），所以只有
+			 * 「拉列表」这一步是整体失败点。漏掉这一处的话，电脑断连时
+			 * phase 会永远停在 `estimating`，前端动画一直转 —— 正是用户
+			 * 说的"以为是卡死了"。
+			 */
+			let listed;
+			try {
+				listed = await callRemote(config, 'listWorkspaces', {});
+			} catch (error) {
+				syncProgress.phase = 'failed';
+				syncProgress.message = String((error && error.message) || error);
+				throw error;
+			}
+			const workspaces = Array.isArray(listed?.workspaces) ? listed.workspaces : [];
+			const created = [];
+			let skipped = 0;
+			/*
+			 * 单条会话失败的条数。
+			 *
+			 * ⚠️⚠️ 必须统计（1.2.52 修）。循环体里的 catch 只 warn 就继续，
+			 * 而 `done` 在失败路径**不会递增**。原来收尾时直接 `done = total`
+			 * 把进度条补满 ⇒ 用户看到「100% 完成」，实际有会话没同步上，
+			 * 而且**一句提示都没有**。
+			 *
+			 * 现在失败也计数，收尾时如实写进 message：出现失败就不再
+			 * 报「已就绪」，而是明确告诉用户有几条没成功。
+			 */
+			let failedCount = 0;
+			/*
+			 * 分母：把所有工作区的对话条数先加起来。
+			 *
+			 * 这就是"真实进度"的来源 —— 不需要再问电脑一次（`estimateSync`），
+			 * 因为 `listWorkspaces` 的返回里已经带了全部待同步条目。
+			 * `estimateSync` 留给"还没开始、想先告诉用户要等多久"的场景。
+			 */
+			let totalPlanned = 0;
+			for (const ws of workspaces) {
+				if (typeof ws?.path !== 'string' || ws.path === '') continue;
+				const n = Array.isArray(ws.sessions) ? Math.min(ws.sessions.length, limit) : 0;
+				totalPlanned += n;
+			}
+			syncProgress.phase = 'running';
+			syncProgress.total = totalPlanned;
+			syncProgress.bytes = totalPlanned * 147;
+			for (const ws of workspaces) {
+				if (typeof ws?.path !== 'string' || ws.path === '') continue;
+				const sessions = Array.isArray(ws.sessions) ? ws.sessions.slice(0, limit) : [];
+				if (sessions.length === 0) continue;
+				// 镜像工作区：与手动同步走同一个函数，幂等。
+				let workspace;
+				try {
+					workspace = await ensureDesktopWorkspace(ctx, ws.path, io.workspaceMap);
+				} catch (error) {
+					ctx.logger?.warn?.(
+						`[dsh-remote-mobile] 自动同步建镜像失败 ${ws.path}: ${String(error?.message ?? error)}`,
+					);
+					continue;
+				}
+				const workspaceId = typeof workspace?.id === 'string' && workspace.id !== '' ? workspace.id : undefined;
+				for (const item of sessions) {
+					const sessionId = typeof item?.sessionId === 'string' ? item.sessionId : '';
+					if (sessionId === '') continue;
+					/*
+					 * ⚠️⚠️ **账本必须在「跳过」之前补**（2026-10-29 真机报障后修）
+					 *
+					 * 用户报障：「重新同步也没用，排序和置顶还是不对」。
+					 *
+					 * 原因就在这两个 `continue`：
+					 *
+					 *   · 用户手机上那批会话是**旧版本**同步出来的，
+					 *     当时还没有 `desktopTimes` / `desktopPins` 这两张表；
+					 *   · 而 `syncedSessions.has()` 对它们恒为 true
+					 *     ⇒ 每次都直接 `continue` ⇒ `rememberDesktopMeta` **永远不被调用**
+					 *     ⇒ 时间表永远是空的
+					 *     ⇒ 前端 `applyDesktopClock` 无数据可用 ⇒ 排序不变
+					 *     ⇒ 置顶表同样为空 ⇒ 不会去 pin。
+					 *
+					 * 也就是说：「重新同步一次就好了」这句话本身是假的。
+					 *
+					 * 现在把记账提到最前面 —— 它幂等、开销极小（只在变化时落盘），
+					 * 对新老会话都要跑。
+					 */
+					const desktopTitle = typeof item?.title === 'string' ? item.title : '';
+					if (desktopTitle !== '') io.rememberTitle?.(sessionId, desktopTitle);
+					// 电脑上的真实时间 / 置顶标记（见 `loadDesktopTimes` 的注释）。
+					io.rememberDesktopMeta?.(sessionId, item?.updatedAt, item?.pinned);
+					// 已经同步过 ⇒ 只补账本（工作区归属/标题可能变了），不重建。
+					if (io.syncedSessions.has(sessionId)) {
+						skipped += 1;
+						syncProgress.done += 1;
+						continue;
+					}
+					if (io.remoteSessions.has(sessionId)) {
+						// 在账本里但不在 synced：说明之前建过壳却没标成同步。
+						io.syncedSessions.add(sessionId);
+						io.rememberPath?.(sessionId, ws.path);
+						skipped += 1;
+						syncProgress.done += 1;
+						continue;
+					}
+					try {
+						// 与 syncConversations 同一套：create → 校验 id → markNonBlank。
+						const createdResult = await ctx.sessionController.create(
+							workspaceId !== undefined
+								? { sessionId, workspaceId }
+								: { sessionId, cwd: workspace?.path },
+						);
+						const createdId = typeof createdResult === 'string'
+							? createdResult
+							: (createdResult?.sessionId ?? createdResult?.id);
+						if (typeof createdId === 'string' && createdId !== '' && createdId !== sessionId) {
+							// 引擎读不出旧日志、改建了随机会话 —— 清掉野壳，跳过这条。
+							await io.removeCorruptMirror?.(createdId, '自动同步 create 返回了非预期 id')
+								?.catch?.(() => {});
+							continue;
+						}
+						await markSessionNonBlank(ctx, sessionId, desktopTitle, {
+							workspaceId,
+							cwd: workspace?.path,
+						}, undefined, io.rememberTurnOffset);
+						io.syncedSessions.add(sessionId);
+						io.remoteSessions.add(sessionId);
+						io.rememberPath?.(sessionId, ws.path);
+						created.push(sessionId);
+						syncProgress.done += 1;
+					} catch (error) {
+						failedCount += 1;
+						ctx.logger?.warn?.(
+							`[dsh-remote-mobile] 自动同步 ${sessionId} 失败: ${String(error?.message ?? error)}`,
+						);
+					}
+				}
+			}
+			if (created.length > 0) io.persist();
+			/*
+			 * ## 同步完成 ⇒ **立刻作废电脑侧数据缓存**（用户 2026-10-29 报障）
+			 *
+			 * 用户原话：「我重启之后再打开它就马上能显示出来了，所以我觉得
+			 * 数据肯定是已经到了手机这边的，肯定是你本地处理有问题」。
+			 *
+			 * 他判断对了 —— 数据早就在电脑上，是手机这边拿旧缓存顶着。
+			 *
+			 * 同步完成正是「用户期待看到最新模型/预设」的时刻：
+			 * 他刚把电脑的文件同步到手机，接着就点新建对话，
+			 * 这时菜单里必须是电脑**当前**的模型与预设，不能是几小时前的快照。
+			 *
+			 * 作废之后，下一次 `remoteExportList` / `modelCatalog` 会重拉一次
+			 * （见 `patchPresets` 与 `desktopCatalog` 的过期判断）。
+			 */
+			/* ⚠️ 必须走 `io.`：本函数是模块级，看不见 apply() 的闭包（见 io 构造处）*/
+			io.invalidateDesktopCache?.();
+			/*
+			 * ⚠️ 作废宿主缓存**还不够**，必须让官方模型选择器也重读（1.2.45）。
+			 *
+			 * 官方 `ModelCatalogDirectory` 有自己的内部缓存（`#reads`），
+			 * 且只在四个远程事件里 `refresh()` —— 同步完成不属于任何一个。
+			 *
+			 * 所以只作废宿主缓存的话：宿主下次被调时会给新数据，
+			 * 但**前端根本不会去调**（它以为自己手上的还是最新的）
+			 * ⇒ 模型菜单仍停在旧数据。这与预设侧 `seat.load()` 是同构的问题。
+			 *
+			 * 预设侧早有 `forceRefreshPresets`（前端）兜着，模型侧一直漏着。
+			 *
+			 * 失败不影响同步结果 —— 它只决定菜单是否立刻显示新数据。
+			 */
+			try {
+				/*
+				 * ⚠️ **接住返回值**（1.2.53）。
+				 *
+				 * 原来这里是裸调用、返回值直接丢掉。而它在下面这些情况下
+				 * 只 return false、不抛错、不打日志：
+				 *   · ctx.get('modelDirectories') 拿不到（官方没注册/改版）
+				 *   · 服务上没有 catalog
+				 *   · catalog 上没有 refresh
+				 * 三种情况用户看到的都是「同步完成但模型还是旧的」，
+				 * 而日志里一片安静 —— 这就是最难查的那种 bug。
+				 */
+				/*
+				 * 用 detail 版本，把「为什么没刷新」一并带出去（1.2.63）。
+				 *
+				 * 原来只存一个布尔，界面只能说「模型列表未刷新」。
+				 * 而服务没注册 / 没 catalog / 没 refresh 这三种情况，
+				 * 修法完全不同 —— 不告诉我是哪一种，等于白报。
+				 */
+				const modelDetail = (typeof io.refreshModelCatalogDetail === 'function')
+					? io.refreshModelCatalogDetail()
+					: { ok: false, reason: '无刷新接口' };
+				syncProgress.modelRefresh = (modelDetail && modelDetail.ok === true);
+				syncProgress.modelRefreshReason = (modelDetail && modelDetail.ok === true)
+					? ''
+					: String((modelDetail && modelDetail.reason) || '原因未知');
+			} catch (refreshModelError) {
+				syncProgress.modelRefresh = false;
+				/* 把异常原文带出去，而不是一个干净的 false */
+				syncProgress.modelRefreshReason = '刷新抛错：'
+					+ String((refreshModelError && refreshModelError.message) || refreshModelError);
+			}
+			/*
+			 * ⚠️⚠️ 下面几行都是**纯计算**，不接触外部状态；
+			 * 把 `phase = 'done'` 放到它们**之后**写（1.2.71 修）。
+			 *
+			 * 原来写的是：
+			 *
+			 *     syncProgress.phase = 'done';        ← 先宣布成功
+			 *     syncProgress.workspaces = workspaces.length;
+			 *     ... 30 行计算 ...
+			 *     return { ... };
+			 *
+			 * 而外面那个 catch 是这么写的：
+			 *
+			 *     catch (error) {
+			 *         syncProgress.phase = 'failed';    ← 把成功覆盖掉
+			 *     }
+			 *
+			 * 于是只要中间那 30 行里**任何一行**抛错（不管是不是真的
+			 * 同步失败），已经写下的 `done` 就被改成 `failed` ——
+			 * 用户看到的就是「**同步已经真的完成了，弹窗还说同步未完成**」。
+			 * 这正是用户报的 ③（图4）。
+			 *
+			 * 原则：**终态只能在「不再可能抛错」的位置写。**
+			 * 下面这段不调任何外部函数、不读可能为空的对象属性，
+			 * 只在一个已知非空的数组上取 `.length`，且结果存本地变量。
+			 */
+			const workspaceCount = workspaces.length;
+			const finalDone = (failedCount === 0)
+				? syncProgress.total
+				/* 不让假进度超过真实值；同时不因分母为 0 而倒退 */
+				: Math.min(syncProgress.done, syncProgress.total);
+			const finalMessage = (failedCount === 0)
+				? ''
+				: (failedCount + ' 条会话同步失败（其余已就绪）');
+			
+			/* 纯赋值：不可能抛错。终态在这里一次写完。 */
+			syncProgress.workspaces = workspaceCount;
+			syncProgress.done = finalDone;
+			syncProgress.message = finalMessage;
+			syncProgress.phase = 'done';
+			return { workspaces: workspaceCount, created, skipped, failed: failedCount };
+		} catch (error) {
+			/*
+			 * 任何未捕获的异常都必须把 phase 收到 `failed`。
+			 *
+			 * ⚠️ 这里**不吞掉**异常（继续 throw）：前端需要知道真实原因。
+			 * 但 phase 必须先收好，否则进度浮层会永远转下去。
+			 */
+			syncProgress.phase = 'failed';
+			syncProgress.message = String((error && (error.message || error)) || '未知错误');
+			throw error;
+		} finally {
+			/*
+			 * ## ⚠️⚠️ 本来没有这个 finally（1.2.71 补）
+			 *
+			 * 上面的注释一直声称「现在用**真正的** try/finally 包住主体」，
+			 * 但代码里**根本没有 finally** —— 注释与代码不符。
+			 * （这是本文件第三次出现「注释说有、代码没有」，前两次见
+			 * `phase='done'` 的位置、以及 `syncDiagRef` 的重置。）
+			 *
+			 * 后果：只要走到一条「**既没写终态、也没抛错**」的路径
+			 * （中途提前 return），phase 就永远停在 `running`。前端一直当「进行中」渲染，
+			 * 进度条已经满了却没人再推 —— 看起来就是「卡在 100% 的红条」。
+			 * 这正是用户报的 ③（图4）。
+			 *
+			 * finally 里只做一件事：**若还没有终态，就补一个**。
+			 * 不改已经写好的 done/failed，也不吞掉已抛出的异常。
+			 *
+			 * 为什么补 `failed` 而不是 `done`：能走到这里说明没走完正常流程，
+			 * 报「未完成」是诚实的；报「完成」会骗用户。
+			 */
+			if (syncProgress.phase !== 'done' && syncProgress.phase !== 'failed') {
+				syncProgress.phase = 'failed';
+				if (typeof syncProgress.message !== 'string' || syncProgress.message === '') {
+					syncProgress.message = '同步未走完，请在侧边栏重试';
+				}
+			}
+		}
+		}
+
 		case 'syncConversations': {
 			if (config.token === '') throw new Error('还没配对：请先在「电脑」页签里填配对码');
 			if (typeof params.path !== 'string' || params.path === '') throw new Error('path required');
@@ -6071,6 +9593,12 @@ async function handleBridge(ctx, config, io) {
 				//（同步会话不落盘、本地没有 title 事件，见 `desktopTitles` 的注释）。
 				// 空格串就跳过 —— 不要用空值覆盖掉已有的好标题。
 				if (desktopTitle !== '') io.rememberTitle?.(sessionId, desktopTitle);
+				// ⚠️ 电脑上的**真实时间**与**置顶标记**也要记（用户 2026-10-29 报障：
+				// 「同步过来的对话没有按时间顺序」「电脑上置顶的对话没同步过来」）。
+				// 必须放在「已存在就跳过」那个分支**之前**：老版本同步出来的会话
+				// 没有这两项，用户重新同步一次就得补上，不能因为"本地已经有了"
+				// 就跳过记账 —— 那正是「重新同步也修不好」的典型。
+				io.rememberDesktopMeta?.(sessionId, item?.updatedAt, item?.pinned);
 				// 已经在本地的跳过（用户重复同步同一批是常态）。
 				//
 				// ⚠️ **把查到的对象留着**（`liveSession`）：下面的
@@ -6159,13 +9687,39 @@ async function handleBridge(ctx, config, io) {
 				try {
 					// ⚠️ 有 `workspaceId` 就只传它（官方会自己 attach，见上）；
 					// 拿不到 id 的老环境才退回 `cwd` + 手动 attach。
-					if (workspaceId !== undefined) {
-						await ctx.sessionController.create({ sessionId, workspaceId });
-					} else {
-						await ctx.sessionController.create({ sessionId, cwd: workspace.path });
-						if (typeof workspace.attachSession === 'function') {
-							await workspace.attachSession(sessionId);
-						}
+					//
+					// ## ⚠️⚠️ 必须校验 `create` 的返回值
+					//
+					// 官方 `sessionController.create({ sessionId })` 在**读不出
+					// 旧日志**时（日志损坏 / 格式升级不兼容），会**静默地新建一个
+					// 随机 id 的空会话**并正常返回 —— 不抛错。
+					//
+					// 原来的写法直接 `await` 完就当成功了，于是：
+					//   ① 我们以为 `sessionId` 建好了，往 `syncedSessions` 里加；
+					//   ② 磁盘上其实多了个**随机 id 的 400 字节空壳**；
+					//   ③ 用户手机里就这样攒出 1500+ 个空会话（真机实测）。
+					//
+					// 判据很简单：返回的 id 和请求的不一致 ⇒ 这次 create 没按我们
+					// 的意思执行，算失败。同时把那个野会话清掉，别留着污染列表。
+					const created = await ctx.sessionController.create(
+						workspaceId !== undefined
+							? { sessionId, workspaceId }
+							: { sessionId, cwd: workspace.path },
+					);
+					const createdId = typeof created === 'string'
+						? created
+						: (created?.sessionId ?? created?.id);
+					if (typeof createdId === 'string' && createdId !== '' && createdId !== sessionId) {
+						// 引擎给了另一个 id ⇒ 我们那份日志它读不出来。清掉野壳，
+						// 把真实原因带回前端（这比「同步成功但什么都没有」有用得多）。
+						await io.removeCorruptMirror?.(createdId, 'create 返回了非预期的 sessionId')
+							?.catch?.(() => {});
+						throw new Error(
+							`本地会话日志无法读取，引擎改建了随机会话 ${createdId.slice(0, 12)}…（已清理）`,
+						);
+					}
+					if (workspaceId === undefined && typeof workspace.attachSession === 'function') {
+						await workspace.attachSession(sessionId);
 					}
 					// ⚠️ **必须紧跟 `create` 调用**（会话此时才活着，见函数注释）：
 					// 电脑上没消息的会话在本地是纯空壳，`blank: true` 会让
@@ -6187,6 +9741,18 @@ async function handleBridge(ctx, config, io) {
 					// 而落盘的这份要用来在重启后反解路径（见 `loadRemotePaths`）。
 					io.rememberPath?.(sessionId, params.path);
 					synced.push(sessionId);
+					// 增量清理：这条会话之前若被历史 bug 生成过随机 id 的空壳，
+					// 现在有真身了，把那个野壳删掉。判据用「随机 id」——
+					// 我们的会话 id 恒等于电脑的 `session-<uuid>`，而引擎自动
+					// 生成的是另一种形态，两者不会撞。
+					// ⚠️ 只删**明确不是本会话**的那些，绝不误伤用户数据。
+					try {
+						for (const orphanId of io.findOrphanShells?.(sessionId) ?? []) {
+							await io.removeCorruptMirror?.(orphanId, '存量野壳清理');
+						}
+					} catch {
+						/* 清理是尽力而为，失败不影响同步结果 */
+					}
 				} catch (error) {
 					// ## ⚠️⚠️ 失败原因**必须带回给前端**（用户 2026-10-22 报障）
 					//
@@ -6326,7 +9892,16 @@ async function handleBridge(ctx, config, io) {
 		 * @returns 清空后的 `{ endpoint, paired: false }`。
 		 */
 		case 'unpair': {
-			Object.assign(config, saveConfig(DEFAULT_ENDPOINT, EMPTY_TOKEN));
+			// ⚠️ 这里要**连 zone 一起清掉**，回到出厂状态。
+			//
+			// `saveConfig` 现在的语义是「没传就沿用旧值」，对普通保存是对的
+			// （否则手工配的 zone 会被一次配对抹掉，那是上一版修掉的 bug）。
+			// 但解绑不同：用户解绑往往就是要去换一台电脑 / 换一套服务，
+			// 留着上一套的 zone 会让下一次配对受旧域名牵制。
+			// 显式传空串，`saveConfig` 里 `!== ''` 的判断就会跳过写入。
+			Object.assign(config, saveConfig(DEFAULT_ENDPOINT, EMPTY_TOKEN, { zone: '', pairEndpoint: '' }));
+			activeZone = CF_ZONE_NAME;
+			activePairEndpoint = PAIR_ENDPOINT;
 			for (const controller of io.follows.values()) {
 				try {
 					controller.abort();

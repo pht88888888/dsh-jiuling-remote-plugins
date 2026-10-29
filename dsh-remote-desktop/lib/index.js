@@ -824,12 +824,305 @@ async function handleRpc(ctx, method, params, io) {
 	switch (method) {
 		/** 探测：手机端「测试连接」用。 */
 		case 'ping':
-			return { ok: true, platform: process.platform, home: homedir(), pid: process.pid };
+			/*
+			 * ⚠️ **ping 顺带把 dirty 标记捎回去**（需求 5）。
+			 *
+			 * 用户要求「下次手机发起连通性测试的时候告诉手机我这边有数据变化了」。
+			 * 手机每次探测在线状态本来就要发这个 ping，所以捎带一个数组
+			 * **几乎不增加流量**（典型情况是空数组 `[]`，2 字节）。
+			 *
+			 * 这就是整个方案的关键：不在电脑侧主动推送，而是搭手机的顺风车。
+			 */
+			return {
+				ok: true,
+				platform: process.platform,
+				home: homedir(),
+				pid: process.pid,
+				dirty: snapshotDirty(),
+			};
+
+		/**
+		 * 手机确认「我收到 dirty 标记并把数据拉过了」⇒ 清掉对应标记。
+		 *
+		 * ## 为什么必须由手机来 ack，而不是电脑自己清
+		 *
+		 * 如果电脑在 ping 之后就清标记，而手机那次拉取失败了（网络抖、隧道断），
+		 * 标记就永久丢了 —— 手机再也不会知道有变化。所以清标记的时机必须是
+		 * **手机确认拉成功之后**。
+		 *
+		 * @param params.domains - 要清的域列表；不传就清全部。
+		 */
+		case 'ackDirty': {
+			const list = Array.isArray(params?.domains) ? params.domains : null;
+			if (list === null) {
+				dirtyDomains.clear();
+			} else {
+				for (const d of list) {
+					if (typeof d === 'string') dirtyDomains.delete(d);
+				}
+			}
+			return { ok: true, dirty: snapshotDirty() };
+		}
 
 		/** 列电脑上的会话（只给元数据）。 */
 		case 'listSessions': {
 			const result = await controller.list({});
 			return { sessions: result?.items ?? [] };
+		}
+
+		/**
+		 * 一次返回**电脑上全部工作区及其未归档对话**，供手机端自动同步。
+		 *
+		 * ## 为什么需要这个 RPC（用户 2026-10-27 反馈，多条）
+		 *
+		 * 用户原话：「每次打开软件都要自己同步工作区和对话，非常非常繁琐，
+		 * 安装这个本地化 dsh 本身就是为了省事……希望作者可以实现自动识别所有
+		 * 工作区内未归档的对话，可以不加载历史对话，但要加载所有真正进行的
+		 * 当前对话记录，这样对带宽的压力也会很小。」
+		 *
+		 * 原来的流程是纯手动的：用户得在工作区行上点「⋯ → 同步对话」，再在
+		 * 弹窗里逐条勾选。一次只能同步一个工作区，重启后还要重来。
+		 *
+		 * 这个 RPC 把「有什么可同步的」一次问清，手机端据此自动建镜像。
+		 * **只回元数据，不回历史** —— 历史仍由 `readHistory` 按需分页拉，
+		 * 所以这个调用的流量是几百字节量级，可以放心在启动时跑。
+		 *
+		 * ## 只列「真正有内容的」对话
+		 *
+		 * 与 `listWorkspaceSessions` 同样的三重过滤（`blank` / `origin` /
+		 * `parentSessionId`），理由见那里的注释。区别只在于这里**跨全部工作区**
+		 * 一次返回，而不是按单个 cwd 查。
+		 *
+		 * @returns `{ workspaces: [{ workspaceId, path, title, sessions: [...] }] }`
+		 */
+		case 'listWorkspaces': {
+			// 每个工作区返回的会话条数上限（默认 50，见下面截断处的注释）。
+			// 允许调用方覆盖，但**夹在 1..200**：再大就失去「轻量 RPC」的意义了。
+			const rawLimit = Number(params?.limit);
+			const limit = Number.isFinite(rawLimit) && rawLimit > 0
+				? Math.min(200, Math.floor(rawLimit))
+				: 50;
+			const registry = ctx.workspaceRegistry;
+			if (registry === undefined || typeof registry.list !== 'function') {
+				return { workspaces: [] };
+			}
+			// 先拿一份会话摘要索引：registry 只给 id，标题要从 controller 拿。
+			// 一次 `controller.list({})` 比按 id 逐个问便宜得多。
+			let summaries = [];
+			try {
+				const listed = await controller.list({});
+				summaries = Array.isArray(listed?.items) ? listed.items : [];
+			} catch {
+				// 拿不到摘要就只回工作和路径，不阻塞自动同步（标题可由后续路径补）。
+			}
+			const byId = new Map();
+			for (const item of summaries) {
+				if (typeof item?.sessionId === 'string') byId.set(item.sessionId, item);
+			}
+			/*
+			 * 电脑上的**置顶集合**（`workspaceRegistry` 的全局 `pinnedSessionIds`）。
+			 *
+			 * 与工作区归属无关 —— 置顶是整个 registry 一份的（见
+			 * `dsh-workspace/lib/index.js` 的 `get pinnedSessionIds()`），所以
+			 * 循环外取一次就够，不用每个工作区重取。
+			 *
+			 * 取不到就当空集合：最坏是手机端同步过来的对话不置顶，
+			 * 不会影响其它任何字段。
+			 */
+			let pinnedList = [];
+			try {
+				const value = registry.pinnedSessionIds;
+				if (Array.isArray(value)) pinnedList = value.map(String);
+			} catch {
+				pinnedList = [];
+			}
+			const pinnedSet = new Set(pinnedList);
+			const out = [];
+			for (const entity of registry.list()) {
+				if (typeof entity?.path !== 'string' || entity.path === '') continue;
+				const ids = typeof entity.sessionIds === 'object' && entity.sessionIds !== null
+					? Array.from(entity.sessionIds)
+					: [];
+				const sessions = [];
+				for (const sessionId of ids) {
+					const item = byId.get(sessionId);
+					if (item === undefined) continue;
+					if (item.blank === true) continue;
+					if (item.origin === 'subagent') continue;
+					if (typeof item.parentSessionId === 'string' && item.parentSessionId !== '') continue;
+					const title = item?.projections?.values?.title;
+					sessions.push({
+						sessionId,
+						title: typeof title === 'string' && title !== '' ? title : '（未命名对话）',
+						/*
+						 * ## ⚠️⚠️ `updatedAt` 是 **number**，不是字符串（2026-10-29 修）
+						 *
+						 * 官方 `updatedAt()` 的实现是
+						 *（`dsh-api-session-controller/lib/index.js:2124`）：
+						 *
+						 *     function updatedAt(header, metadata) {
+						 *         return Math.max(header.createdAt, metadata?.lastPromptAt ?? 0);
+						 *     }
+						 *
+						 * 也就是**毫秒时间戳（数字）**。而这里原来写的是
+						 * `typeof item.updatedAt === 'string' ? item.updatedAt : null`
+						 * —— 判据与真实类型完全相反 ⇒ **恒为 `null`**。
+						 *
+						 * 后果一路传下去：手机端 `autoSyncDesktop` 把 `null` 当标题/
+						 * 时间什么都不做，`markSessionNonBlank` 补写事件时也没有真实
+						 * 时间可用 ⇒ 手机本地会话的 `updatedAt` 变成**建壳时刻**
+						 * （也就是同步那一刻），于是**所有同步过来的对话时间戳几乎
+						 * 相同** ⇒ 侧边栏「按时间排序」等于没排 —— 用户报的
+						 * 「同步过来的对话没有按时间顺序」就是这个。
+						 *
+						 * 现在原样透传数字；读不到才 `null`。
+						 */
+						updatedAt: typeof item.updatedAt === 'number' && Number.isFinite(item.updatedAt)
+							? item.updatedAt
+							: null,
+						/*
+						 * 是否在电脑上被**置顶**。
+						 *
+						 * 置顶是 `workspaceRegistry` 的**全局**集合
+						 *（`pinnedSessionIds`，与工作区归属无关），由官方
+						 * `pinSession` / `unpinSession` 维护。手机端拿它去
+						 * 调自己的 `pinSession`，用户的置顶就会跟着过来。
+						 *
+						 * 用户 2026-10-29 报障原文：「电脑的某些对话人家是置顶的
+						 * 状态，你也没有把置顶的状态同步过来」。
+						 */
+						pinned: pinnedSet.has(sessionId),
+					});
+				}
+				// ⚠️ **先排序，再截断**。
+				//
+				// 顺序反了的话，截断保留的是「`sessionIds` 集合的遍历顺序」，
+				// 而那是无序的 —— 可能把最近在用的对话切掉、留下几个陈年老会话。
+				// 用户看到的现象是「自动同步过来的全是旧对话」。
+				//
+				// ⚠️ 比较方式也要对：`updatedAt` 是**数字**（见上面那段注释），
+				// 原来用 `localeCompare` 比字符串是错的 —— 它按字典序比，
+				// `'999'` 会排在 `'1000'` 后面。数字直接相减才是时间序。
+				sessions.sort((a, b) => {
+					const left = typeof a.updatedAt === 'number' ? a.updatedAt : -1;
+					const right = typeof b.updatedAt === 'number' ? b.updatedAt : -1;
+					return right - left;
+				});
+				out.push({
+					workspaceId: typeof entity.id === 'string' ? entity.id : null,
+					path: entity.path,
+					// `basename` 已在本文件导入（第 72 行）；desktop 包没有 mobile 那个
+					// `desktopTitle()` 助手，这里直接用 node:path 的。
+					title: basename(entity.path),
+					// ⚠️ **每个工作区最多回 50 条**。
+					//
+					// 这是跨公网隧道的 RPC：用户可能有一百多个对话，全量返回会让
+					// 响应体膨胀到几十 KB，而手机端只是要「把侧边栏填出来」。
+					// 50 条足够覆盖「真的在用的」，更早的本来也要用户主动去找。
+					//
+					// 需要更多时前端可以带 `limit` 参数单独要（这里读 params）。
+					sessions: sessions.slice(0, limit > 0 ? limit : 50),
+				});
+			}
+			return { workspaces: out };
+		}
+
+		/**
+		 * **同步预估**：告诉手机「这次首次同步要做多少事」。
+		 *
+		 * ## 为什么需要它（用户诉求 2026-10-28）
+		 *
+		 * 「首次配对它的带宽压力会比较大，希望你做一个配对成功之后的加载动画……
+		 *   最好就是电脑那边提前统计好需要传输的内容有多大，先提前告知手机，
+		 *   然后手机的加载动画就有一个具体的进度了……一定要有真实的进度提示，
+		 *   而不是那种假的循环动画，那样用户就会以为是卡死了。」
+		 *
+		 * ## 为什么计量单位是「条数」而不是「字节」
+		 *
+		 * 实测（见 `listWorkspaces` 的注释）：全部工作区+对话的**元数据**
+		 * 只有几十 KB（单条 147 B、100 条约 14 KB），一个 RPC 就传完了，
+		 * 用字节做进度条会「瞬间 100%」，反而更假。
+		 *
+		 * 真正的耗时在手机端：每个对话都要在本地**建一个空壳会话**
+		 *（`ctx.sessionController.create()`，与 `syncConversations` 同一套），
+		 * 这是几次磁盘 IO + 日志初始化。100 个对话就要建 100 次 ——
+		 * 这才是用户等待的那几秒。
+		 *
+		 * 所以进度按「条数」报，再加上真实的元数据字节数供界面显示。
+		 *
+		 * @returns {{
+		 *   workspaces: number,      // 有对话的工作区个数
+		 *   sessions: number,        // 需要同步的对话总条数（= 进度分母）
+		 *   bytes: number,           // 元数据体积（仅供参考展示）
+		 *   truncated: boolean,      // 是否触发了每工作区 limit 截断
+		 * }}
+		 */
+		case 'estimateSync': {
+			/*
+			 * ⚠️ 这里**把筛选逻辑抄一遍**，而不是去调 `listWorkspaces`。
+			 *
+			 * `handleRpc` 是 `switch (method)` 语句块，没有 dispatch 方法，
+			 * 内部不能自调（我第一版写成 `this.dispatch(...)` 是错的）。
+			 *
+			 * 抄写的风险是「两处过滤条件漂移」。所以两处必须保持以下三条完全一致
+			 *（与 `listWorkspaces` / `listWorkspaceSessions` 相同）：
+			 *   · `blank === true` 跳过（没内容的空壳）
+			 *   · `origin === 'subagent'` 跳过（子代理会话不单独显示）
+			 *   · 有 `parentSessionId` 跳过（属于某个父会话的分支）
+			 * 任何一处改动必须同步另一处，否则「预估说 100 条、实际同步 80 条」，
+			 * 进度条永远走不满 —— 那比没有进度条更糟。
+			 */
+			const rawLimitEst = Number(params?.limit);
+			const estLimit = Number.isFinite(rawLimitEst) && rawLimitEst > 0
+				? Math.min(200, Math.floor(rawLimitEst))
+				: 50;
+			const estRegistry = ctx.workspaceRegistry;
+			if (estRegistry === undefined || typeof estRegistry.list !== 'function') {
+				return { workspaces: 0, sessions: 0, bytes: 0, truncated: false };
+			}
+			let estSummaries = [];
+			try {
+				const listedEst = await controller.list({});
+				estSummaries = Array.isArray(listedEst?.items) ? listedEst.items : [];
+			} catch (error) {
+				ctx.logger?.warn?.(`[dsh-jiuling-remote-desktop] 预估同步量失败: ${String(error?.message ?? error)}`);
+				return { workspaces: 0, sessions: 0, bytes: 0, truncated: false, failed: true };
+			}
+			const estById = new Map();
+			for (const item of estSummaries) {
+				if (typeof item?.sessionId === 'string') estById.set(item.sessionId, item);
+			}
+			let estWorkspaces = 0;
+			let estSessions = 0;
+			let estTruncated = false;
+			for (const entity of estRegistry.list()) {
+				if (typeof entity?.path !== 'string' || entity.path === '') continue;
+				const estIds = typeof entity.sessionIds === 'object' && entity.sessionIds !== null
+					? Array.from(entity.sessionIds)
+					: [];
+				let n = 0;
+				for (const sessionId of estIds) {
+					const item = estById.get(sessionId);
+					if (item === undefined) continue;
+					if (item.blank === true) continue;
+					if (item.origin === 'subagent') continue;
+					if (typeof item.parentSessionId === 'string' && item.parentSessionId !== '') continue;
+					n += 1;
+				}
+				if (n === 0) continue;
+				estWorkspaces += 1;
+				// 与 listWorkspaces 同样按 limit 截断，否则预估会大于实际下发量。
+				if (n > estLimit) estTruncated = true;
+				estSessions += Math.min(n, estLimit);
+			}
+			/*
+			 * 体积按实测单条约 147 B 估算，不 JSON.stringify 全量 ——
+			 * 后者要真的把几百个工作区的结构拼出来，在会话很多的机器上
+			 *（实测 578 个会话）反而给电脑加了不必要的内存/CPU 压力。
+			 * 这个数字只用来给用户看"约 XX KB"，不需要精确到字节。
+			 */
+			const estBytes = estSessions * 147;
+			return { workspaces: estWorkspaces, sessions: estSessions, bytes: estBytes, truncated: estTruncated };
 		}
 
 		/**
@@ -1126,6 +1419,138 @@ async function handleRpc(ctx, method, params, io) {
 			return io.answerAsk(requestId, params.answer);
 		}
 
+		/**
+		 * **列出当前所有等手机回答的交互**（ask 补拉通道）。
+		 *
+		 * ## 为什么需要它 —— 这是粉丝反馈那个 bug 的正解
+		 *
+		 * 用户原话（2026-10-28）：
+		 *
+		 * 「他电脑上面已经有一个会话了，但此时他是没有在手机 APP 内的，
+		 *   它已经发起了一个 ask 弹窗，然后此时用户去打开我们的 APP，
+		 *   它虽然消息同步过来了，但是弹窗没有同步过来，也就是说它如果是
+		 *   后打开的话，它的弹窗是无法显示的，用户就无法审批。」
+		 *
+		 * ask 本质是**推送**（电脑 → 手机 SSE），手机没连着就收不到。
+		 * 而原来的实现在「手机没连着」时直接 fallback、**连请求都不登记**，
+		 * 所以后来打开手机时电脑上根本没东西可补 —— 请求从不存在。
+		 *
+		 * 现在改成：无论手机在不在都登记，手机**连上来那一刻**调这个方法
+		 * 把所有还活着的请求取走，自己重建成弹窗。
+		 *
+		 * ## 只回「还没过期」的
+		 *
+		 * `pendingAsks` 里的条目都有 5 分钟定时器（`ASK_TIMEOUT_MS`），
+		 * 到点会自己 `cleanup()` 移除。所以这里不需要额外判过期 ——
+		 * 还在表里就是还有效。但以防定时器被意外清掉，这里再按 `at` 兜一层。
+		 *
+		 * @returns `{ requests: [{ requestId, kind, sessionId, payload, at, ageMs }] }`
+		 */
+		case 'pendingAsks': {
+			if (io?.pendingAsks === undefined) return { requests: [] };
+			return { requests: io.pendingAsks() };
+		}
+
+		/**
+		 * **低成本的「有没有新事件」探测**（1.0.50 加，配手机端 3 秒轮询）。
+		 *
+		 * ## 为什么需要它（用户 2026-10-29 的原话，一针见血）
+		 *
+		 *   「我就是有一点搞不懂，既然我们点添加工作群的时候会触发刷新，
+		 *     那我们为什么不能实时刷新呢？」
+		 *
+		 * 这句问得对，而且直接指出了正确的方向：
+		 *
+		 * · 点「添加工作区」能刷新 ⇒ **HTTP 短连接（RPC）完全通畅**；
+		 * · 可是 SSE 长连接在 App 退后台后会被 Android 冻结/掐断，
+		 *   回到前台也不保证能自愈。
+		 *
+		 * 也就是说：**能用的通道是短连接，而我们之前把所有实时性都压在长连接上。**
+		 * 那就用短连接做心跳轮询 —— 每 3 秒问一次「你的末尾序号是多少」，
+		 * 落后就把缺的事件补拉回来。这样即使长连接彻底死掉，
+		 * 手机上最多晚 3 秒也能看到内容。
+		 *
+		 * ## 为什么用 `projections.asOfSeq` 当探针
+		 *
+		 * 它随每条事件推进（`dsh-session-projections` 里
+		 * `asOfSeq` 就是最后一条已投影事件的 seq），而且是
+		 * `controller.list()` **本来就返回**的字段 —— 一次调用能覆盖全部会话，
+		 * 不需要按 id 逐个问，更不需要物化任何日志（那可能上百 MB）。
+		 * 流量是几百字节量级，3 秒一次完全可以承受。
+		 *
+		 * ## 只回「变了的」
+		 *
+		 * 调用方会把结果和本地 seq 对比，只补落后的那些。这里把全部会话的
+		 * `asOfSeq` 都带上（不做服务端 diff），因为：
+		 *   · 手机端本来就知道自己每个会话的 seq（本地 `session.seq`，O(1)）；
+		 *   · 让服务端算 diff 就要维护状态，反而更容易出错。
+		 *
+		 * @returns `{ cursors: { [sessionId]: asOfSeq } }`
+		 */
+		case 'sessionCursors': {
+			/*
+			 * 冷会话最多读这么多个（见下面 ②）。这个接口每 3 秒被调一次，
+			 * 不能让它在几十个冷会话上逐个读盘物化 —— 那是 O(磁盘) 的操作。
+			 */
+			let coldBudget = 8;
+			const result = await controller.list({});
+			const items = Array.isArray(result?.items) ? result.items : [];
+			const cursors = {};
+			for (const item of items) {
+				if (item === null || typeof item !== 'object') continue;
+				const sessionId = item.sessionId;
+				if (typeof sessionId !== 'string' || sessionId === '') continue;
+				// 空壳会话（官方侧边栏都不显示）没有同步价值，别占带宽。
+				if (item.blank === true) continue;
+				if (item.origin === 'subagent') continue;
+				/*
+				 * ## ⚠️⚠️ 不能用 `item.projections.asOfSeq`（1.0.51 修，这是个真 bug）
+				 *
+				 * 上一版就是这么写的，结果**一个 seq 都拿不到** ——
+				 * 因为官方 `listFields()`（`dsh-api-session-controller/lib/index.js:2127`）
+				 * 只返回 `parentSessionId` / `origin` / `cwd`：
+				 *
+				 *     function listFields(header) {
+				 *         return { 只含 parentSessionId / origin / cwd }
+				 *     }
+				 *
+				 * `projections` 是**另一条**链路（`readProjections` RPC）单独取的，
+				 * 不在 list 的 item 上。所以那版探测在真机上恒定返回空对象，
+				 * 手机端永远认为"没有落后" ⇒ 轮询形同虚设（用户报障：
+				 * 「还是不行，你的那个自动同步还是没有出现」）。
+				 *
+				 * ## 现在怎么拿
+				 *
+				 * ① 活会话（在内存里）：`session.seq` 是 O(1)，直接读；
+				 * ② 冷会话：`sessionQuery.observeSession()` 返回的 `cursor`
+				 *    （它是"最后一条的 seq"，`seq===0` 时为 -1）。
+				 *
+				 * 冷会话要读盘，所以**加一个数量上限**：这个接口每 3 秒被调一次，
+				 * 不能让它在几十个冷会话上逐个物化。
+				 */
+				let seq = -1;
+				try {
+					const live = ctx.sessions?.get?.(sessionId);
+					if (live !== undefined && live !== null && typeof live.seq === 'number') {
+						seq = live.seq - 1;
+					}
+				} catch { /* 忽略，当冷会话处理 */ }
+				if (seq < 0 && coldBudget > 0) {
+					coldBudget -= 1;
+					try {
+						const query = ctx.get?.('sessionQuery');
+						if (query !== undefined && query !== null && typeof query.observeSession === 'function') {
+							const observation = await query.observeSession(sessionId, { projectionMode: 'none' });
+							const cursor = observation?.cursor;
+							if (typeof cursor === 'number' && Number.isSafeInteger(cursor)) seq = cursor;
+						}
+					} catch { /* 单个会话失败不影响其余 */ }
+				}
+				if (seq >= 0) cursors[sessionId] = seq;
+			}
+			return { cursors };
+		}
+
 		/** 列电脑上的目录（手机的「电脑」页签用）。 */
 		case 'listDirectory':
 			return listDirectory(params.path);
@@ -1222,21 +1647,74 @@ async function handleRpc(ctx, method, params, io) {
 			}
 			const norm = (value) => (process.platform === 'win32' ? value.toLowerCase() : value);
 			const want = norm(canonical);
+			/*
+			 * 电脑上的置顶集合 —— 供每条会话标 `pinned`（理由见
+			 * `listWorkspaces` 里同一段注释）。取不到就当空集合。
+			 */
+			let pinnedSet = new Set();
+			try {
+				const value = ctx.workspaceRegistry?.pinnedSessionIds;
+				if (Array.isArray(value)) pinnedSet = new Set(value.map(String));
+			} catch {
+				pinnedSet = new Set();
+			}
+			const pinnedOf = (sessionId) => pinnedSet.has(String(sessionId));
 			const result = await controller.list({});
 			const items = result?.items ?? [];
 			const sessions = [];
 			for (const item of items) {
 				if (typeof item?.cwd !== 'string') continue;
 				if (norm(item.cwd) !== want) continue;
+
+				// ## ⚠️ 必须过滤「空会话」和「子代理会话」
+				//
+				// 原来只按 cwd 筛，于是同步框里会冒出两类用户根本不该看见的东西
+				//（真机实测：用户看到一堆「（未命名对话）」，还在电脑上找不到）：
+				//
+				// ① **blank 空会话** —— 官方 `list()` 里 `blank: true` 的那些，
+				//    是引擎为「预建复用」留的 400 字节空壳，官方 UI 的侧边栏
+				//    **完全不渲染**它们。我们列出来，用户点同步 → 手机上也生成
+				//    一个空会话 → 越攒越多（真机实测 1500+ 个）。
+				//
+				// ② **子代理会话** —— 电脑上 agent 派生出来的子会话
+				//   （`header.origin === 'subagent'`，同时带 `parentSessionId`）。
+				//    它们属于父会话的执行细节，不是用户的「对话」。官方 UI 同样
+				//    不列。若被当成普通会话同步，会整批涌进「未分组」工作区
+				//   （用户报障：「子代理会话涌进未分组」）。
+				//
+				// 判据用官方自己的字段，不靠猜（`listFields()` 与
+				// `summarizeCold()` 都会给出 `blank` / `origin` / `parentSessionId`）。
+				if (item?.blank === true) continue;
+				if (item?.origin === 'subagent') continue;
+				if (typeof item?.parentSessionId === 'string' && item.parentSessionId !== '') continue;
+
 				const title = item?.projections?.values?.title;
 				sessions.push({
 					sessionId: item.sessionId,
 					title: typeof title === 'string' && title !== '' ? title : '（未命名对话）',
-					updatedAt: typeof item.updatedAt === 'string' ? item.updatedAt : null,
+					// ⚠️ `updatedAt` 是 **number**（毫秒时间戳），不是字符串 ——
+					// 详见 `listWorkspaces` 里的长注释。这一处原来也是同样的类型错误。
+					updatedAt: typeof item.updatedAt === 'number' && Number.isFinite(item.updatedAt)
+						? item.updatedAt
+						: null,
+					pinned: pinnedOf(item.sessionId),
 				});
 			}
-			// 新的排前面 —— 用户要同步的多半是最近聊过的。
-			sessions.sort((a, b) => String(b.updatedAt ?? '').localeCompare(String(a.updatedAt ?? '')));
+			/*
+			 * 新的排前面 —— 用户要同步的多半是最近聊过的。
+			 *
+			 * ⚠️ 原来是 `String(b.updatedAt ?? '').localeCompare(...)`。
+			 * 配合上面那个"永远 null"的类型错误，两者一起造成同一个后果：
+			 * 排序**根本没生效**（全 `null` ⇒ 比较结果恒 0 ⇒ 保持插入顺序，
+			 * 而插入顺序是 `controller.list` 的顺序，不是用户期望的顺序）。
+			 *
+			 * 现在 `updatedAt` 是数字，直接相减；缺值的排最后。
+			 */
+			sessions.sort((a, b) => {
+				const left = typeof a.updatedAt === 'number' ? a.updatedAt : -1;
+				const right = typeof b.updatedAt === 'number' ? b.updatedAt : -1;
+				return right - left;
+			});
 			return { sessions };
 		}
 
@@ -1710,6 +2188,35 @@ function startRelay(ctx, token) {
 	const followers = new Map();
 
 	/**
+	 * **全局订阅者**：不带 `session` 参数连上来的 SSE 连接。
+	 *
+	 * ## 为什么必须有（用户 2026-10-29 报障：ask 弹窗收不到）
+	 *
+	 * 用户原话：
+	 *   「场景一：在手机的电脑工作区输入『发起一个ask询问，测试功能』，此时
+	 *    电脑能正常弹出，但手机不显示。场景二：在使用电脑的过程中 AI 发起了
+	 *    弹窗，但此时用户不在这个对话，属于后进入对话，此时手机不仅收不到
+	 *    弹窗，甚至连新消息都看不到。」
+	 *
+	 * 根因：`push()` 只发给 `followers.get(sessionId)` —— **只有正在跟随那个
+	 * 会话的连接**。而手机同一时刻只跟随**一个**会话（用户打开的那个）。
+	 * 电脑在会话 B 里弹 ask，手机在会话 A ⇒ 一个都收不到。
+	 *
+	 * 而 ask / approval 是**进程内 waterfall，不落盘、不进 `session/event`**，
+	 * 所以用户后来打开会话 B 时也不会被重放 —— 这就是"后进入对话看不到"。
+	 *
+	 * ## 做法
+	 *
+	 * ask/approval 这类「会话小、但必须立刻知道」的事件，除推给该会话的
+	 * 跟随者外，也推给全局订阅者。手机那条全局 SSE 一直连着，所以不管用户
+	 * 当前在哪个会话，弹窗都能到。
+	 *
+	 * ⚠️ **只有 ask 类走全局**，durable 事件（正文）不能 —— 那会把所有会话的
+	 * 流量塞进一条连接，流量和内存都不可接受。
+	 */
+	const globals = new Set();
+
+	/**
 	 * 当前有效的访问令牌。
 	 *
 	 * ⚠️ **必须是可变的**：配对是**运行中**发生的，配完要立刻生效。
@@ -1718,11 +2225,32 @@ function startRelay(ctx, token) {
 	 */
 	const auth = { token };
 
-	/** 往某会话的所有跟随者推一条 SSE。 */
-	const push = (sessionId, eventName, payload) => {
+	/**
+	 * 推一条 SSE。
+	 *
+	 * @param sessionId - 事件所属会话。
+	 * @param eventName - SSE 事件名（`event` / `frame` / `ask` / …）。
+	 * @param payload - 载荷。
+	 * @param global - 是否**同时**发给全局订阅者（ask 类必开）。
+	 */
+	const push = (sessionId, eventName, payload, global = false) => {
+		const chunk = sse(eventName, payload);
+		if (global === true) {
+			for (const res of globals) {
+				if (res === null || res === undefined || res.writableEnded === true || res.destroyed === true) {
+					globals.delete(res);
+					continue;
+				}
+				try {
+					res.write(chunk);
+				} catch (error) {
+					ctx.logger?.warn?.(`[dsh-remote] 全局推送失败: ${String(error?.message ?? error)}`);
+					globals.delete(res);
+				}
+			}
+		}
 		const set = followers.get(sessionId);
 		if (set === undefined || set.size === 0) return;
-		const chunk = sse(eventName, payload);
 		for (const res of set) {
 			// 死连接先清掉：`writableEnded` / `destroyed` 说明这条 SSE 早就断了，
 			// 只是 `req.on('close')` 没来得及跑（手机切后台、隧道被掐）。
@@ -1795,6 +2323,28 @@ function startRelay(ctx, token) {
 	/** 待手机回答的交互：`requestId → { resolve, reject, timer }`。 */
 	const pendingAsks = new Map();
 
+	/*
+	 * ## ⚠️ `ghostAsks` 已移除（1.0.52）
+	 *
+	 * 原来这里有一个「幽灵记录」表：手机不在线时，请求不登记进
+	 * `pendingAsks`，而是塞进 `ghostAsks` —— 只保证「手机后来能看到」，
+	 * 但**答了也不算数**。
+	 *
+	 * 用户实测推翻了它的前提假设：
+	 *
+	 *   「我刚实测了一下 根本不存在你说的电脑自动提交，
+	 *     我看电脑那边一直是等待回答」
+	 *
+	 * 电脑那边确实一直在等（`fallback` 只是 `NO_TAKEOVER`，GUI 照常弹窗
+	 * 照常等），所以「已经交给 GUI、手机改不了」这个说法根本不成立。
+	 * 真正发生的是：请求进了 `ghostAsks` ⇒ `answerAsk` 查不到
+	 * ⇒ 手机点了返回 `expired` ⇒ **点了没反应**。
+	 *
+	 * 现在手机不在线也照样登记进 `pendingAsks` 并等待，`ghostAsks`
+	 * 整个概念被删掉 —— 一条待答题只有一种状态：**还在等，谁先答算谁的**。
+	 */
+
+
 	/**
 	 * 把一个交互请求推给手机并等它回答。
 	 *
@@ -1828,23 +2378,94 @@ function startRelay(ctx, token) {
 			}
 			if (set.size === 0) followers.delete(sessionId);
 		}
+		/*
+		 * **全局订阅者也算「有手机在线」**（1.0.49 修，用户 2026-10-29 报障）。
+		 *
+		 * 判据原来只看 `followers.get(sessionId)` —— 即「手机正在跟随这个
+		 * 会话」。但手机同一时刻只跟随**一个**会话，用户在电脑上跑会话 B、
+		 * 手机停在会话 A 时，这里 `live.length === 0` ⇒ 判成「手机不在线」
+		 * ⇒ **立刻 fallback 给本地 GUI**，请求只进 `ghostAsks`（幽灵记录）。
+		 *
+		 * 后果有两个，正好对应用户报的两个场景：
+		 *   · 弹窗不出现（那一刻没人推给手机，后面补拉时已经 ghost）；
+		 *   · 用户点了也不算数 —— ghost 记录只解决"可见性"，不参与
+		 *     waterfall 的返回值，所以手机上作答改不了电脑那一轮。
+		 *
+		 * 而手机端那条**全局 SSE 一直连着**（前端 `subscribe()` 用
+		 * `new EventSource(ROUTE_STREAM)`，不带 session）。所以只要它活着，
+		 * 手机就是"能收到弹窗"的状态，应该按「有手机在线」处理：
+		 * 正常推送、**等它回答**，而不是立刻放弃。
+		 *
+		 * 这也正是用户要的语义：不管他在电脑上跑哪个会话，手机都该能审批。
+		 */
+		let hasGlobal = false;
+		for (const res of globals) {
+			if (res === null || res === undefined || res.writableEnded === true || res.destroyed === true) {
+				globals.delete(res);
+				continue;
+			}
+			hasGlobal = true;
+		}
 		// 诊断：把「有没有手机在跟」记下来，真机排查时一眼能看出是没进这里、
 		// 还是进来了但没有**活着的**订阅者。
 		void debugLog(
-			`askPhone kind=${kind} session=${sessionId} followers=${set === undefined ? 'none' : `${live.length}/${set.size}`} all=[${[...followers.keys()].join(',')}]`,
+			`askPhone kind=${kind} session=${sessionId} followers=${set === undefined ? 'none' : `${live.length}/${set.size}`} global=${globals.size} all=[${[...followers.keys()].join(',')}]`,
 		);
-		// 没有**活着的**手机在跟这个会话 ⇒ 立刻返回 fallback（调用方据此放行给官方 GUI）。
-		if (live.length === 0) return fallback;
-
 		const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 		const settled = Promise.withResolvers();
 
+		/*
+		 * ⚠️⚠️ **手机没连着时，也要把请求登记进 `pendingAsks` 等它回来。**
+		 *
+		 * ## 这里原来直接 `return fallback`，正是粉丝反馈的那个 bug
+		 *
+		 * 用户原话（2026-10-28 转述粉丝反馈）：
+		 *
+		 * 「他电脑上面已经有一个会话了，但此时他是没有在手机 APP 内的，
+		 *   它已经发起了一个 ask 弹窗，然后此时用户去打开我们的 APP，
+		 *   它虽然消息同步过来了，但是弹窗没有同步过来，也就是说它如果是
+		 *   后打开的话，它的弹窗是无法显示的，用户就无法审批。」
+		 *
+		 * 根因就在这一行：手机没连着 ⇒ `live.length === 0` ⇒ 直接 fallback
+		 * ⇒ **这个 ask 在电脑侧压根没有被登记**，只是一个瞬时的函数调用。
+		 * 用户之后再打开手机，电脑上没有任何东西可供"补拉" —— 请求已经不存在了。
+		 *
+		 * ## 现在的做法
+		 *
+		 * 无论有没有手机在线，都先把请求登记进 `pendingAsks`，然后：
+		 *   · 有活着的手机 ⇒ 照旧推过去（行为完全不变）；
+		 *   · 没有手机 ⇒ **不推**，但仍然登记，并等手机重连后来取
+		 *     （见 `pendingAsks` 的 `case 'pendingAsks'`）。
+		 *
+		 * ## 为什么这不会让电脑干等
+		 *
+		 * ① 有 `ASK_TIMEOUT_MS`（5 分钟）兜底，到点 resolve fallback；
+		 * ② 手机重连后如果用户没在 5 分钟内回来，请求自己过期，行为与改造前一致；
+		 * ③ 官方 GUI 那边**不受影响**：fallback 仍会在这个 waterfall 的后继里
+		 *    正常放行（`askPhone` 只是多了等待，不改变最终返回的值）。
+		 *
+		 * 换句话说：改造前是"手机不在就直接放弃"，现在是"等一等，超时再放弃"。
+		 * 对已经在电脑前操作的用户**没有任何行为变化**（GUI 卡片照常弹，
+		 * 因为 fallback 仍然会到达），只是额外给了手机一个补救窗口。
+		 */
+		void debugLog(`askPhone pending requestId=${requestId} live=${live.length}`);
 		const cleanup = () => {
 			const entry = pendingAsks.get(requestId);
 			if (entry !== undefined) {
 				clearTimeout(entry.timer);
 				pendingAsks.delete(requestId);
 			}
+			/*
+			 * 最后一条 ask 收尾了 ⇒ 把脏标记也清掉。
+			 *
+			 * 不清的话，手机下次 ping 还会看到 `ask`，去补拉一个**已经不存在**
+			 * 的请求（`pendingAsks` 已空，补拉返回空数组），然后 ack —— 空转一次，
+			 * 而且每 3 秒重复一次。忙等本身无害，但会让日志和执行流噪音很大。
+			 *
+			 * ⚠️ 判据是 `pendingAsks.size === 0`（**所有** ask 都结束了）：
+			 * 同时有两个 ask 时，结束一个不能把另一个的标记抹掉。
+			 */
+			if (pendingAsks.size === 0) clearDirty('ask');
 		};
 
 		// 超时兜底：手机可能在锁屏 / 隧道断了 / 用户压根没看。
@@ -1854,7 +2475,36 @@ function startRelay(ctx, token) {
 			settled.resolve(fallback);
 		}, ASK_TIMEOUT_MS);
 
-		pendingAsks.set(requestId, { resolve: settled.resolve, reject: settled.reject, timer, kind, sessionId });
+		/*
+		 * ⚠️ **payload 必须一起存**：手机后连上来时，要靠它把弹窗原样重建成
+		 * 与实时推送完全一致的样子（见 `case 'pendingAsks'`）。
+		 *
+		 * `at` 用于手机端按时间排序 + 显示"这个请求等了多久"。
+		 */
+		pendingAsks.set(requestId, {
+			resolve: settled.resolve,
+			reject: settled.reject,
+			timer,
+			kind,
+			sessionId,
+			payload,
+			at: Date.now(),
+		});
+		/*
+		 * **打上 `ask` 脏标记**（用户 2026-10-29 报障：弹窗收不到）。
+		 *
+		 * 手机端每 3 秒 ping 一次，ping 响应顺路带回 `dirty`。有了这个标记，
+		 * 它最迟 3 秒就知道"电脑上有待审批"并去补拉 —— 即使那一刻手机正停在
+		 * **另一个会话**（那种情况下 `push()` 推不到它，ask 又不落盘，
+		 * 用户永远等不到）。
+		 *
+		 * 清标记发生在手机 `ackDirty` 之后（见手机端 dirty 分支）：
+		 * 补拉成功才清，所以断线重连也不会漏。
+		 *
+		 * 收尾时要主动清掉（见 `cleanup`）：请求已结束还亮着标记，会让手机
+		 * 反复补拉一个已经不存在的 ask。
+		 */
+		markDirty('ask');
 
 		// 用户中断这一轮（点停止生成 / 会话被删）时立刻收尾，别等超时。
 		const onAbort = () => {
@@ -1870,7 +2520,42 @@ function startRelay(ctx, token) {
 			void settled.promise.finally(() => signal.removeEventListener('abort', onAbort));
 		}
 
-		push(sessionId, 'ask', { requestId, kind, ...payload });
+		/*
+		 * ## 有手机在线 ⇒ 正常推送并等它回答（行为与改造前完全一致）
+		 *
+		 * ⚠️ **`global = true`**：同时发给全局订阅者（用户 2026-10-29 报障）。
+		 *
+		 * 原来只推给「正在跟随这个会话」的连接 —— 而手机同一时刻只跟随一个
+		 * 会话。用户在电脑上跑会话 B、手机停在会话 A 时，这条 ask **一条都
+		 * 收不到**，且因为 ask 是进程内 waterfall（不落盘、不进
+		 * `session/event`），后来打开 B 也不会被重放。
+		 *
+		 * 手机端那条全局 SSE 一直连着，所以走全局就与"用户在哪个会话"无关了。
+		 */
+		/*
+		 * ## 有手机在线 ⇒ 推送。没在线 ⇒ **不推送，但照样等**（1.0.52 修）
+		 *
+		 * 这里原来是 if/else 两条完全不同的路：在线就等，不在线就立刻
+		 * `return fallback` + 只留幽灵记录。那个 else 分支是错的 ——
+		 * 用户实测推翻了我的假设：
+		 *
+		 *   「我刚实测了一下 根本不存在你说的电脑自动提交，
+		 *     我看电脑那边一直是等待回答」
+		 *
+		 * 事实：`fallback` 就是 `NO_TAKEOVER`，它只告诉官方「手机没接手」，
+		 * GUI **照常弹窗、照常等着**。而那条请求进了 `ghostAsks`，
+		 * `answerAsk` 只查 `pendingAsks` ⇒ 手机后来点它拿到 `expired`
+		 * ⇒ 「点击之后电脑那边收不到」。
+		 *
+		 * 现在两条路合一：**永远登记进 `pendingAsks` 并等待**，
+		 * 区别只是「推不推给手机」。手机回来时轮询会把它补出来（1.2.95
+		 * 起轮询每轮顺路拉 `pendingAsks`），用户作答就能真正生效。
+		 */
+		if (live.length > 0 || hasGlobal === true) {
+			push(sessionId, 'ask', { requestId, kind, ...payload }, true);
+		} else {
+			void debugLog(`askPhone 手机此刻不在线，仍登记等待（回来可作答）${requestId}`);
+		}
 
 		try {
 			return await settled.promise;
@@ -2080,8 +2765,24 @@ function startRelay(ctx, token) {
 
 	// ---- user-questions/request：ask_user_question ----
 	//
-	// 返回值形状是 `{ answers: [{ questionId, selected: [label…], custom?: string }] }`
-	// （见 dsh-client-ui-user-questions 的 QuestionAnswer 组装）。手机端原样回传，
+	// ⚠️ 返回值形状必须是 `{ answers: [{ id, selected: [label…], custom?: string }] }`
+	// —— 注意是 **`id`**，不是 `questionId`。
+	//
+	// 依据 `dsh-tool-ask-user/lib/index.js:53` 的 `answerResult()`：
+	//
+	//     { answers: result.answers.map((answer) => ({
+	//         id: answer.id,
+	//         selected: [...answer.selected],
+	//         ...answer.custom !== void 0 ? { custom: answer.custom } : {}
+	//     })) }
+	//
+	// 手机端原来发 `questionId`，于是官方读 `answer.id` 得到 `undefined`，
+	// 再把 `undefined` 塞进工具输出 ⇒ 宿主校验失败：
+	//
+	//     tool "ask_user_question" returned invalid output: value is not lossless JSON
+	//
+	// 同时 `[...undefined]` 本身就会抛。这是用户截图里那个红字报错的根因。
+	// 手机端已改成官方字段名（见 `showAskCard` 的 `commit`）。
 	// 这里只做形状校验 —— 形状不对就当没答，放行给下一环。
 	ctx.on(
 		'user-questions/request',
@@ -2146,6 +2847,33 @@ function startRelay(ctx, token) {
 						!Array.isArray(first.value.answers)
 					) {
 						void debugLog(`user-questions/request 手机答案形状不对，退回电脑那条`);
+						return desktop;
+					}
+					/*
+					 * ⚠️ **逐条校验 `id` 与 `selected`**（1.0.52）。
+					 *
+					 * 光看「answers 是数组」不够：官方 `answerResult()` 会做
+					 * `selected: [...answer.selected]`，只要某条的 `selected`
+					 * 不是可迭代对象就当场抛；`id` 为 undefined 则会把 undefined
+					 * 带进工具输出，宿主校验「无损 JSON」时失败：
+					 *
+					 *     tool "ask_user_question" returned invalid output:
+					 *            value is not lossless JSON
+					 *
+					 * 这正是用户截图里那个红字报错。把它挡在这里，坏答案就当没答
+					 * 放行给电脑 GUI —— 比让整个工具调用崩掉好得多。
+					 */
+					const wellFormed = first.value.answers.every((item) =>
+						item !== null
+						&& typeof item === 'object'
+						&& typeof item.id === 'string'
+						&& item.id !== ''
+						&& Array.isArray(item.selected)
+						&& (item.custom === undefined || typeof item.custom === 'string'));
+					if (!wellFormed) {
+						void debugLog(
+							`user-questions/request 手机答案字段不合规（需要 id:string + selected:string[]），退回电脑那条: ${JSON.stringify(first.value)?.slice(0, 200)}`,
+						);
 						return desktop;
 					}
 					void debugLog(`user-questions/request 由手机作答，丢弃电脑那条`);
@@ -2219,7 +2947,54 @@ function startRelay(ctx, token) {
 	 * （`answerAsk`）必须落回这个闭包里的 `pendingAsks`，所以显式传进去 ——
 	 * 与手机端插件里 `pendingPlans` / `workspaceMap` 的处理方式一致。
 	 */
-	const io = { answerAsk };
+	/*
+	 * ⚠️ `pendingAsks` 方法名和闭包里的 `pendingAsks` Map **同名**。
+	 *
+	 * 这是刻意保留的语义对应（一个列出、一个存储），但正因为同名，
+	 * 这里必须写成方法简写 `pendingAsks() {...}` —— 写成
+	 * `pendingAsks: pendingAsks` 会直接引用到 Map 本身（不是函数），
+	 * `handleRpc` 调它就会 `io.pendingAsks is not a function`。
+	 *
+	 * 返回值形状与 `case 'pendingAsks'` 的注释一致；这里再按 `at` + 超时
+	 * 兜一层过期判断，防止极端情况下定时器未触发而残留。
+	 */
+	const io = {
+		answerAsk,
+		pendingAsks() {
+			const now = Date.now();
+			const out = [];
+			const collect = (map, isGhost) => {
+				for (const [requestId, entry] of map) {
+					if (entry === null || entry === undefined) continue;
+					const age = now - (typeof entry.at === 'number' ? entry.at : now);
+					// 超过超时窗口的视为已过期（正常应已被 timer 清掉，这里是兜底）。
+					if (age > ASK_TIMEOUT_MS) continue;
+					out.push({
+						requestId,
+						kind: entry.kind,
+						sessionId: entry.sessionId,
+						payload: entry.payload ?? {},
+						at: entry.at ?? now,
+						ageMs: age,
+						/*
+						 * `ghost: true` = 这条已经 fallback 给电脑 GUI 了，
+						 * 手机现在答也改不了那一轮的结果。
+						 *
+						 * 手机端据此可以：
+						 *   · 仍然弹出来让用户知道"电脑上有个审批在等"；
+						 *   · 但按钮文案/提示写明"电脑端可能已处理"，
+						 *     避免用户以为自己没点成功而反复重试。
+						 */
+						ghost: isGhost,
+					});
+				}
+			};
+			collect(pendingAsks, false);
+			// 先来的先显示（用户最该先处理等得最久的那个）。
+			out.sort((a, b) => a.at - b.at);
+			return out;
+		},
+	};
 
 	const server = createServer((req, res) => {
 		const url = new URL(req.url ?? '/', `http://127.0.0.1:${RELAY_PORT}`);
@@ -2235,9 +3010,51 @@ function startRelay(ctx, token) {
 		// ---- SSE：跟随一个会话的事件流 ----
 		if (url.pathname === '/api/dsh-remote/stream' && req.method === 'GET') {
 			const sessionId = url.searchParams.get('session');
+			/*
+			 * **不带 `session` ⇒ 全局订阅**（1.0.49，用户 2026-10-29 报障）。
+			 *
+			 * 这条连接只收 ask 类事件（弹窗），**不收**任何会话正文 —— 所以
+			 * 它轻（一条心跳 + 偶尔一个弹窗），可以一直连着。
+			 *
+			 * 为什么需要：手机同一时刻只能跟随一个会话，而 ask 是进程内
+			 * waterfall、不落盘，用户不在那个会话时永远收不到。有了全局连接，
+			 * 弹窗就与"用户当前看哪个会话"无关了。
+			 *
+			 * ⚠️ 老版本手机端**不会**连这条（它总是带 `session`），所以这个
+			 * 改动对老客户端完全无感，行为与改动前一致。
+			 */
 			if (sessionId === null) {
-				res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' });
-				res.end(JSON.stringify({ error: 'session query required' }));
+				res.writeHead(200, {
+					'content-type': 'text/event-stream; charset=utf-8',
+					'cache-control': 'no-store, no-transform',
+					connection: 'keep-alive',
+					'x-accel-buffering': 'no',
+				});
+				res.write(': connected\n\n');
+				globals.add(res);
+				void debugLog(`SSE 全局订阅（ask 通道）已建立，当前 ${globals.size} 条`);
+				/*
+				 * 心跳：隧道会掐空闲连接。30 秒一次，注释行不触发任何前端逻辑。
+				 *
+				 * ⚠️ 必须 `unref`：否则手机断开后这个定时器会拖住 Node 退出
+				 *（桌面端会被反复启停，见 `ghostTimer` 的同类处理）。
+				 */
+				const beat = setInterval(() => {
+					if (res.writableEnded === true || res.destroyed === true) return;
+					try {
+						res.write(': ping\n\n');
+					} catch {
+						/* 写失败交给 close 清理 */
+					}
+				}, 30000);
+				beat.unref?.();
+				const cleanupGlobal = () => {
+					clearInterval(beat);
+					globals.delete(res);
+					void debugLog(`SSE 全局订阅断开，剩 ${globals.size} 条`);
+				};
+				req.on('close', cleanupGlobal);
+				res.on('close', cleanupGlobal);
 				return;
 			}
 			res.writeHead(200, {
@@ -2529,8 +3346,40 @@ function startTunnel(ctx, token) {
 	let timer;
 	let child;
 
+	// ## ⚠️⚠️ 隧道传输协议：默认走 **http2**，不要用 cloudflared 的默认值
+	//
+	// 用户反馈（20261028-161358-a74170，iQOO 15u，附完整电脑端日志）：
+	//
+	//   「插件启动隧道用的命令是 `cloudflared tunnel --no-autoupdate run`，
+	//     未指定协议，即默认 QUIC。该网络会丢 UDP 7844：
+	//     INF Registered tunnel connection ... protocol=quic 之后立即
+	//     WRN datagram manager error: timeout: no recent network activity
+	//     WRN Connection terminated error=failed to dial to edge with quic
+	//     手动改为 --protocol http2（走 TCP）后能稳定注册。」
+	//
+	// 也就是说：原实现（不指定 `--protocol`）在**丢 UDP 的网络**里
+	// （酒店/校园/部分运营商，UDP 7844 被丢或被 QoS）**隧道根本起不来**，
+	// 而 cloudflared 会一直「Registered → Connection terminated」循环，
+	// 电脑侧看着像正常、手机侧永远连不上。
+	//
+	// 而 QUIC 唯一的好处是延迟略低，代价却是这类网络下**完全不可用**。
+	// 所以默认改成 http2（TCP，几乎不会被拦），并把 QUIC 保留为可选项：
+	//   · 环境变量 `DSH_REMOTE_TUNNEL_PROTOCOL=quic|http2` 可强制指定；
+	//   · 不指定时用 http2。
+	//
+	// 另外做**自动降级**：若 http2 也被显式指成了 quic 且连续建不起来，
+	// 见 `downgradeToHttp2` —— 但默认路径不需要它，因为默认就是 http2。
+	const requestedProtocol = (() => {
+		const raw = String(process.env.DSH_REMOTE_TUNNEL_PROTOCOL ?? '').trim().toLowerCase();
+		if (raw === 'quic') return 'quic';
+		return 'http2';
+	})();
+	let protocol = requestedProtocol;
+	/** QUIC 连续失败次数（见 relay 里的自动降级）。 */
+	let quicStrikes = 0;
+
 	const launch = () => {
-		child = spawn(bin, ['tunnel', '--no-autoupdate', 'run'], {
+		child = spawn(bin, ['tunnel', '--no-autoupdate', '--protocol', protocol, 'run'], {
 			stdio: ['ignore', 'pipe', 'pipe'],
 			windowsHide: true,
 			env: { ...process.env, TUNNEL_TOKEN: token },
@@ -2547,6 +3396,43 @@ function startTunnel(ctx, token) {
 			// cloudflared 建连成功时一定会打含 `Registered tunnel connection`
 			// 的那一行（真机日志核对过）。见到它就说明这次起来了。
 			if (line.indexOf('Registered tunnel connection') >= 0) attempt = 0;
+
+			// ## QUIC 连不上时自动降级到 http2
+			//
+			// 只有在**用户显式要求 quic**（`DSH_REMOTE_TUNNEL_PROTOCOL=quic`）
+			// 的情况下才需要这段：默认路径已经是 http2，不会进这里。
+			//
+			// 判据取 cloudflared 在 UDP 被丢/被 QoS 时的固定特征串（用户日志里
+			// 的原话，逐字核对过）：
+			//
+			//     failed to dial to edge with quic: timeout: no recent network activity
+			//     datagram manager error: timeout: no recent network activity
+			//
+			// 连续 3 次就认定这条网络不给 UDP 走，切 http2 并立刻重启隧道。
+			// 只降一次（降完 `protocol` 就是 http2，条件不再成立），不会来回抖。
+			if (protocol === 'quic') {
+				const quicFailed =
+					line.indexOf('failed to dial to edge with quic') >= 0 ||
+					line.indexOf('datagram manager error') >= 0;
+				if (quicFailed) {
+					quicStrikes += 1;
+					if (quicStrikes >= 3) {
+						protocol = 'http2';
+						quicStrikes = 0;
+						attempt = 0;
+						ctx.logger?.warn?.(
+							'[dsh-remote][tunnel] QUIC 连续 3 次连不上（该网络大概率丢弃 UDP 7844），' +
+								'已自动降级到 http2/TCP 并重启隧道',
+						);
+						// 立刻重建：不等 exit 的退避，这条隧道此刻已经是死的。
+						try {
+							child?.kill();
+						} catch {
+							/* 已退出 */
+						}
+					}
+				}
+			}
 		};
 		child.stdout?.on('data', relay);
 		child.stderr?.on('data', relay);
@@ -2980,7 +3866,12 @@ function handlePairRoute(ctx, pairing, state, req, res) {
 				 * 用户想点几次点几次。
 				 */
 				case '/environment': {
-					const result = await pairing.ensureCloudflared();
+					/*
+					 * `body.channel` 允许前端指定渠道（需求 4）：
+					 * `'github'`（官方，默认）/ `'mirror'`（作者中转）。
+					 * 不传就让 `ensureCloudflared` 按默认顺序自动试。
+					 */
+					const result = await pairing.ensureCloudflared({ channel: body?.channel });
 					reply(200, { ok: result.ok === true, ...result, ...pairing.status() });
 					return;
 				}
@@ -2994,7 +3885,7 @@ function handlePairRoute(ctx, pairing, state, req, res) {
 
 				/** 确保 cloudflared 在位（需要时自动下载）。 */
 				case '/cloudflared': {
-					const result = await pairing.ensureCloudflared();
+					const result = await pairing.ensureCloudflared({ channel: body?.channel });
 					reply(200, result);
 					return;
 				}
@@ -3047,11 +3938,114 @@ function handlePairRoute(ctx, pairing, state, req, res) {
  * @param ctx - Cordis 上下文。
  * @param config - 插件配置：`{ tunnelToken?, autoTunnel? }`。
  */
+/**
+ * **数据变更标记（dirty flag）** —— 需求 5 的核心。
+ *
+ * ## 用户需求（2026-10-28）
+ *
+ * 「我希望两端的插件都可以实时收集它对应那边的 DSH 的状态……随时监听一下
+ *   他那边的工作区呀、模型列表呀、预设的列表，这些都可以监听一下，没有变化的
+ *   话就不做任何动作，有变化的话那就下次手机发起连通性测试的时候告诉手机
+ *   我这边有数据变化了你同步一下，然后再进行一个同步，这样子的话就可以把
+ *   性能压力分摊到两端，而不是实时的网络请求。」
+ *
+ * ## 做法
+ *
+ * 电脑侧**只在内存里记"什么东西变了"**，一个 bit 都不用发出去：
+ *
+ *   · 收到 `domain/changed`（工作区/模型/预设任一）⇒ 打上对应标记；
+ *   · 手机下一次 ping（`pingStatus` 或 `ping`）⇒ 把标记附带在响应里；
+ *   · 手机看到标记就去拉对应数据，然后**调 `ackDirty` 清标记**；
+ *   · 没有变化 ⇒ ping 响应里 `dirty` 为空数组，手机什么都不做。
+ *
+ * 这样：
+ *   · 零额外网络请求（监听是本地的，上报搭在本来就要发的 ping 上）；
+ *   · 压力在两端分摊（电脑只做内存标记，手机只在自己主动问时才知道）；
+ *   · 不会漏（内存标记只在被 ack 后才清，手机没收到就一直亮着）。
+ *
+ * ## 为什么用 `Set` 而不是时间戳
+ *
+ * 标记只有「脏/干净」两态。用时间戳会引入"多久算过期"的判断，
+ * 而实际上只要手机没确认过，就应该一直告诉它"有变化"——
+ * 用 `Set` 的增删最直接，也便于 `ackDirty` 精确清除。
+ */
+const dirtyDomains = new Set();
+
+/** 标记某个域的数据变了（同一次变更重复打标记是幂等的）。 */
+function markDirty(domain) {
+	if (typeof domain !== 'string' || domain === '') return;
+	dirtyDomains.add(domain);
+}
+
+/** 取出当前全部脏标记（不清除 —— 由手机 ack 才清）。 */
+function snapshotDirty() {
+	return [...dirtyDomains];
+}
+
+/**
+ * 清掉某个脏标记（服务端主动清，与手机 `ackDirty` 是两条路）。
+ *
+ * 用途：`ask` 这个标记由**服务端自己**根据「还有没有待审批」决定生死 ——
+ * 最后一条 ask 收尾后必须清掉，否则手机每 3 秒都会去补拉一个已经不存在的
+ * 请求（见 `askPhone` 的 `cleanup`）。
+ *
+ * 其余三类（workspace/model/preset）**只能由手机 ack 清**：
+ * 服务端不知道手机有没有真的拉到数据，主动清就会漏。
+ */
+function clearDirty(domain) {
+	if (typeof domain !== 'string' || domain === '') return;
+	dirtyDomains.delete(domain);
+}
+
 export function apply(ctx, config = {}) {
 	const pairing = createPairing({ stateDir: STATE_DIR, logger: ctx.logger });
 	const paired = pairing.read();
 	const token = ensureToken(ctx, paired);
 	const state = { relay: undefined, tunnel: undefined };
+
+	/*
+	 * ---- 状态变更监听（需求 5，见 `dirtyDomains` 的长注释） ----
+	 *
+	 * 只监听、只打内存标记，**不发任何网络请求**。
+	 *
+	 * ## 为什么监听三类
+	 *
+	 * 用户点名的就是这三样：「工作区呀、以及模型列表呀、以及预设的列表」。
+	 * 它们在官方事件里都走 `domain/changed`，靠 `change.domain` 区分。
+	 *
+	 * ## ⚠️ 必须包 try/catch 且不能抛
+	 *
+	 * 这是挂在引擎事件总线上的监听器。它抛错会污染整条派发链
+	 *（官方 `domain/changed` 是并发派发给所有订阅者的），
+	 * 表现可能是「改个工作区名字，整个 GUI 卡一下」。
+	 */
+	ctx.effect(() => {
+		const off = ctx.on('domain/changed', function (change) {
+			try {
+				if (change === null || typeof change !== 'object') return;
+				const domain = typeof change.domain === 'string' ? change.domain : '';
+				const table = typeof change.table === 'string' ? change.table : '';
+				/*
+				 * 映射到手机端认识的三类（与 `case 'dirty'` 的返回一致）：
+				 *   · workspace —— 工作区增删/改名
+				 *   · model     —— 模型目录变化
+				 *   · preset    —— 预设列表变化
+				 *
+				 * 判据同时看 `domain` 与 `table`：不同版本的字段不一致
+				 *（工作区那条实测是 `domain: 'workspace'` 或
+				 * `table: 'workspaces'`，见手机端 `subscribe` 那段注释）。
+				 */
+				if (domain === 'workspace' || table === 'workspaces') markDirty('workspace');
+				else if (domain === 'model' || table === 'models') markDirty('model');
+				else if (domain === 'preset' || table === 'presets') markDirty('preset');
+			} catch {
+				/* 监听器自身绝不能让引擎的事件派发崩掉 */
+			}
+		});
+		return () => {
+			if (typeof off === 'function') off();
+		};
+	});
 
 	ctx.effect(() => {
 		try {

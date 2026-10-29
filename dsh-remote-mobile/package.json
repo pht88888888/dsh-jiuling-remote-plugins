@@ -1,6 +1,6 @@
 {
   "name": "dsh-jiuling-remote-mobile",
-  "version": "1.2.18",
+  "version": "1.2.97",
   "description": "DSH 远程目录（手机端）：在选文件夹流程里多出「电脑」页签，进入电脑目录、在电脑上发起对话，并把电脑的实时消息流同步到手机本地界面（只传文本，不映射桌面）。",
   "type": "module",
   "main": "./lib/index.js",
@@ -35,14 +35,11 @@
     "node": ">=20"
   },
   "license": "MIT",
-  "author": "dsh-jiuling-remote-plugins contributors",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/pht88888888/dsh-jiuling-remote-plugins.git",
-    "directory": "dsh-remote-mobile"
+  "scripts": {
+    "test": "node test/smoke.mjs && node test/sidebar.mjs && node test/sync.mjs && node test/splice.mjs && node test/ask.mjs && node test/askhost.mjs && node test/browser-ask.mjs && node test/resume.mjs && node test/poll.mjs",
+    "smoke": "node test/smoke.mjs"
   },
-  "homepage": "https://github.com/pht88888888/dsh-jiuling-remote-plugins#readme",
-  "bugs": {
-    "url": "https://github.com/pht88888888/dsh-jiuling-remote-plugins/issues"
+  "devDependencies": {
+    "jsdom": "^25.0.0"
   }
 }

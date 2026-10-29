@@ -35,8 +35,42 @@ window.__ModuleLoader__.load({
 		var exports = module.exports;
 		Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' });
 
-		var react = require('react');
-		var h = react.createElement;
+		/*
+		 * ## ⚠️⚠️ `react` 也不做假设（1.2.58 修）
+		 *
+		 * 它比 `primitives` 基础得多，理论上一定在。但既然上一轮
+		 * 已经证实「模块可能拿不到」，这里就不能再靠『理论上』。
+		 *
+		 * 而且这一行同样在 **factory 顶层**：`react.createElement`
+		 * 一旦因为 `react` 是 undefined 而抛 TypeError，后果和上一轮
+		 * 完全一样 —— 整批 client 插件一起失败，App 进救援模式。
+		 *
+		 * 兜底方式：`h` 退化成一个**返回普通描述对象的函数**。
+		 * 真到那一步，React 本身都不在，界面本来也渲染不了；
+		 * 但至少 factory 能走完、`exports.apply` 能导出去，
+		 * 不会把别人的插件一起拖下水。
+		 */
+		var react = null;
+		try {
+			react = require('react');
+		} catch (reactError) {
+			react = null;
+		}
+		var h = (react !== null && react !== undefined && typeof react.createElement === 'function')
+			? react.createElement
+			: function (type, props) {
+				/* 极简替身：把子节点收进 props，形状够渲染器识别即可 */
+				var rest = [];
+				for (var ci = 2; ci < arguments.length; ci += 1) rest.push(arguments[ci]);
+				var merged = {};
+				if (props !== null && props !== undefined) {
+					for (var key in props) {
+						if (Object.prototype.hasOwnProperty.call(props, key)) merged[key] = props[key];
+					}
+				}
+				if (rest.length > 0) merged.children = rest.length === 1 ? rest[0] : rest;
+				return { type: type, props: merged };
+			};
 
 		/**
 		 * 官方 UI 原子组件（对话框、按钮、分段页签、图标）。
@@ -52,7 +86,42 @@ window.__ModuleLoader__.load({
 		 * 那个深色 fallback；`--dsw-alias-border-secondary` 同样不存在。
 		 * 表现就是手机上「两大坨黑色、跟官方 UI 完全脱钩」。
 		 */
-		var primitives = require('@deepseek-ai/dsh-client-ui-primitives');
+		/*
+		 * ## ⚠️⚠️ 这段在 **factory 顶层**，抛错会带走整批插件（1.2.57 修）
+		 *
+		 * `require()` 正常返回一个有 100+ 键的对象。但下面两种情况下
+		 * 它会返回 `undefined` / `null`：
+		 *   · 页面模块注册表里没有这个包（宿主版本更老 / 被裁剪的构建）；
+		 *   · 它自己加载失败，注册表把失败结果缓存下来。
+		 *
+		 * 而 `require(...)` 的返回值**没人检查**，直接 `.Modal` / `.Button`
+		 * 解构 —— `undefined.Modal` 立刻抛 TypeError。
+		 *
+		 * 这里的后果**不是本插件不工作**，而是：
+		 *   `dsh-client-modules` 的 `ClientPackageCompositionError` 是
+		 *   整批聚合抛出的 ⇒ 一个插件 factory 炸掉，整页
+		 *   `Failed to load plugins` ⇒ App 进救援模式并无限重启。
+		 *   正是 1.0.29 那次灾难的同一条链路（见 `apply()` 前面那段注释）。
+		 *
+		 * 所以：拿不到就退成一个空对象，让下面每个解构都是 `undefined`。
+		 * 各组件本来就必须容忍 `undefined`（旧版前端可能少某个图标，
+		 * 见 `IconGlobeOutlineRegular` 的注释），这样最坏情况是
+		 * 「界面退化成本插件自己的样式」，而不是「整个 App 起不来」。
+		 */
+		var primitives = null;
+		try {
+			primitives = require('@deepseek-ai/dsh-client-ui-primitives');
+		} catch (requireError) {
+			primitives = null;
+		}
+		if (primitives === null || primitives === undefined || typeof primitives !== 'object') {
+			/*
+			 * 用一个**空对象**兜底：
+			 * 这样 `primitives.Modal` 是 undefined 而不是抛错。
+			 * 绝不抛、绝不 return —— factory 必须走到 `exports.apply`。
+			 */
+			primitives = {};
+		}
 		var Modal = primitives.Modal;
 		var Button = primitives.Button;
 		var Input = primitives.Input;
@@ -60,6 +129,58 @@ window.__ModuleLoader__.load({
 		var IconFolderCloseRegular = primitives.IconFolderCloseRegular;
 		var IconChevronRightOutlineRegular = primitives.IconChevronRightOutlineRegular;
 		var IconPlusOutlineRegular = primitives.IconPlusOutlineRegular;
+		/*
+		 * 「电脑工作区」角标用的图标。
+		 *
+		 * 没有专门的"显示器/电脑"图标（官方图标集里查过 110 个名字，
+		 * 没有 desktop / computer / monitor 任何一个），所以选
+		 * `IconGlobeOutlineRegular` —— 它表达"远程、网络的另一端"，
+		 * 正是"这是电脑上的工作区"这个语义。
+		 *
+		 * ⚠️ 用 `typeof` 判空后再用：老版本前端可能没有这个图标，
+		 * 直接 `h(undefined)` 会整块崩掉。
+		 */
+		var IconGlobeOutlineRegular = primitives.IconGlobeOutlineRegular;
+		/*
+		 * ## ⚠️⚠️ 组件级兜底（1.2.57 修）
+		 *
+		 * 上面 `primitives` 兜成了空对象，所以这几个可能全是 `undefined`。
+		 * 而 `h(undefined, ...)` 会让 React 抛
+		 * `Element type is invalid`——在**渲染期**炸，不是加载期。
+		 *
+		 * 渲染期抛错只会让本插件那棵子树被官方 `SlotErrorBoundary` 接住
+		 *（侧边栏 slot 会变空 div），不会带走整批插件。但用户的观感是
+		 * 「一打开选文件夹就整片空白」，同样不能接受。
+		 *
+		 * 所以每个组件都给一个**语义等价的原生替身**：
+		 *   · 容器类（Modal/Button/Input/SegmentedTabs）用对应的 DOM 元素；
+		 *   · 图标用空 svg（占位但不出错）。
+		 * 样式会退化成本插件自己的 CSS（本来就有），功能不受影响。
+		 *
+		 * 判据用 `typeof === 'function' || typeof === 'object'`：
+		 * React 组件可以是 class（function）也可以是 memo/forwardRef
+		 * 的产物（object）。只判 function 会把 memo 出来的组件误判掉。
+		 */
+		var isComponent = function (value) {
+			return typeof value === 'function' || (typeof value === 'object' && value !== null);
+		};
+		/** 空 svg：图标缺失时占位，绝不抛错。 */
+		var EmptyIcon = function () {
+			return h('svg', { width: 16, height: 16, viewBox: '0 0 16 16', 'aria-hidden': 'true' });
+		};
+		if (!isComponent(Modal)) Modal = function (props) { return h('div', props && props.className ? { className: props.className } : null, props ? props.children : null); };
+		if (!isComponent(Button)) Button = function (props) {
+			var p = props || {};
+			return h('button', { style: p.style, onClick: p.onClick, type: 'button' }, p.children);
+		};
+		if (!isComponent(Input)) Input = function (props) {
+			var p = props || {};
+			return h('input', { style: p.style, value: p.value, onChange: p.onChange, placeholder: p.placeholder });
+		};
+		if (!isComponent(SegmentedTabs)) SegmentedTabs = function (props) { return h('div', null, props ? props.children : null); };
+		if (!isComponent(IconFolderCloseRegular)) IconFolderCloseRegular = EmptyIcon;
+		if (!isComponent(IconChevronRightOutlineRegular)) IconChevronRightOutlineRegular = EmptyIcon;
+		if (!isComponent(IconPlusOutlineRegular)) IconPlusOutlineRegular = EmptyIcon;
 
 		/** 宿主桥的路由（同源，直接相对路径）。 */
 		var ROUTE_RPC = '/api/dsh-remote/rpc';
@@ -151,14 +272,7 @@ window.__ModuleLoader__.load({
 				//（16/8/8），到 324px 时压到 (10/4/4)，能省出约 30px。
 				// 比媒体查询稳 —— 媒体查询里靠后代选择器定位这个节点，
 				// 层级一变（比如 `display:contents` 改掉）就静默失效，踩过。
-				//
-				// ⚠️ **`clamp()` 前面先写固定值兜底**：`clamp()` 是 Chrome 79+
-				// 才有的函数，更老的内核会把整条声明当非法值丢掉 —— 那样这个
-				// 元素的 padding 会变成 0，头部贴在屏幕边缘，比「间距不收缩」难看得多。
-				// CSS 同属性「后者覆盖前者」，所以固定值在前、`clamp()` 在后：
-				// 支持的老老实实用 clamp，不支持的退回固定值。
-				'gap:8px;gap:clamp(4px,2vh,8px);' +
-				'padding:16px 14px 8px 24px;' +
+				'gap:clamp(4px,2vh,8px);' +
 				'padding:clamp(10px,2.2vh,16px) 14px clamp(4px,1.2vh,8px) 24px;' +
 				'border-bottom:.5px solid var(--dsw-alias-border-l3);',
 			title:
@@ -177,29 +291,70 @@ window.__ModuleLoader__.load({
 				// ⚠️ `overflow` 必须是 `auto` 而不是 `hidden`：横屏下中间区只有
 				// ~98px，装不下「配对条 + 列表(最少 96px) + 提示语」。`hidden` 会把
 				// 超出的部分直接裁掉（用户连滑的机会都没有）；`auto` 让整个中间区
-				// 可滚，列表自己的 `overflow-y:auto` 再管它内部那一层。
+				// 可滚。
+				//
+				// ⚠️⚠️ **`-webkit-overflow-scrolling:touch` 不能省**（2026-10-28 修）。
+				//
+				// 用户截图证明「列表明显超出底边却划不动」。真机复现后确认：
+				// 在这个容器上，安卓 WebView（华为内核 114）如果不加这条，
+				// 虽然 `scrollHeight > clientHeight` 成立、`scrollTop` 也能被
+				// JS 改，但**手指的滑动手势不会被识别成滚动** —— 表现在用户
+				// 那里就是「按着不动，界面纹丝不动」。
+				//
+				// 同文件的 `CSS.column`（另一个列表）一直有这条，所以那边从来
+				// 没报过划不动。两条列表行为不一致的根源就在这里。
 				'display:flex;flex-direction:column;flex:1 1 auto;min-height:0;' +
 				'padding:16px 16px 16px 24px;position:relative;overflow-y:auto;' +
-				'overscroll-behavior:contain;',
+				'overscroll-behavior:contain;-webkit-overflow-scrolling:touch;' +
+				// 让这个容器成为独立的滚动上下文，避免手势传给祖先。
+				'touch-action:pan-y;',
 			column:
 				'display:flex;flex-direction:column;flex:1 1 auto;gap:2px;min-height:0;' +
 				'padding-right:8px;overflow-y:auto;overscroll-behavior:contain;' +
 				// 安卓 WebView 里不加这条，长列表的滑动会很「黏」，用户会以为划不动。
 				'-webkit-overflow-scrolling:touch;',
-			// ## ⚠️ 文件列表本身：**必须有自己的最小高度**
+			// ## ⚠️ 文件列表：**不要自己滚，交给外层 `content`**
 			//
-			// 横屏 764×324 实测（1.2.17）：中间区只剩 98px，被「已配对」条(62)
-			// 和底部提示语(44) 吃光，列表被压成 **0px** —— 用户一个文件夹都看不到，
-			// 却又看到能滚（`scrollHeight` 是 1678）。这正是用户说的
-			// 「中间内容看不见」。
+			// 这里踩过一个真机坑（用户原话：「那个界面无法滑动」）。
 			//
-			// `min-height` 让列表永远至少占住 3 行，`flex-shrink:0` 防止被
-			// 同级的配对条 / 提示语挤掉；挤不下的部分交给外层 `column` 去滚。
+			// 原来的写法是 `flex-shrink:0` + `overflow-y:auto` 同时存在：
+			//   * `flex-shrink:0` ⇒ 列表按内容高度撑开，永远不产生自己的溢出；
+			//   * 但它又声明了 `overflow-y:auto` ⇒ 安卓 WebView 认为
+			//     「这是个滚动容器」，把落在列表上的触摸手势**拦截在内层**；
+			//   * 内层没有可滚距离（它已经撑到全高），于是手势被吃掉，
+			//     外层 `content` 收不到滚动事件 ⇒ **手指划不动**。
+			//
+			// 也就是说：两个属性各自都对，凑在一起就死锁。同一文件里
+			// `CSS.column`（第 3790 行那处列表）用的是 `flex:1 1 auto` 且没有
+			// `flex-shrink:0`，所以那边一直正常 —— 这里对齐它即可。
+			//
+			// 保留 `min-height`：横屏 764×324 实测中间区只剩 98px，不给最小
+			// 高度会被配对条(62) + 提示语(44) 压成 0px（用户说「一个文件夹都看不到」）。
+			// 溢出交给外层 `content` 滚，那才是唯一的滚动容器。
 			columnList:
 				'display:flex;flex-direction:column;gap:2px;' +
-				'flex:1 1 auto;flex-shrink:0;min-height:96px;' +
-				'padding-right:8px;overflow-y:auto;overscroll-behavior:contain;' +
-				'-webkit-overflow-scrolling:touch;',
+				// ⚠️⚠️ **必须是 `flex:0 0 auto`（不许收缩），且 `overflow:visible`。**
+				//
+				// 2026-10-28 用户截图（864×1920 竖屏，电脑页签，一屏 14 个文件夹
+				// 被裁断在底边、划不动）证明上一版仍然是坏的。上一版写的是
+				// `flex:1 1 auto`，我只改了 `overflow`，但**收缩没去干净**：
+				//
+				//   `flex:1 1 auto` 里的第二个 `1` 是 flex-shrink。
+				//   列表被压到容器高度 ⇒ 它自己**不产生溢出**（scrollHeight
+				//   == clientHeight）；而 `overflow:visible` 又把多出来的
+				//   行「画」到父级之外 —— 但**画出去的部分不计入父级的
+				//   scrollHeight**。
+				//
+				//   于是父级 `content`（overflow-y:auto）算出来
+				//   scrollHeight == clientHeight ⇒ 它认为自己没内容可滚
+				//   ⇒ 手指滑动被当成「没有可滚区域」，整页纹丝不动。
+				//   这正是用户看到的样子：内容明明溢出，却完全划不动。
+				//
+				// `flex:0 0 auto` 让列表按内容自然撑高，父级的 scrollHeight
+				// 才会真的变大，滚动才成立。
+				'flex:0 0 auto;min-height:96px;' +
+				'padding-right:8px;' +
+				'overflow:visible;',
 			row:
 				'display:flex;align-items:center;gap:4px;width:100%;height:28px;padding:4px;' +
 				'border:none;border-radius:var(--dsw-radius-sm);background:0 0;' +
@@ -220,9 +375,7 @@ window.__ModuleLoader__.load({
 				'color:var(--dsw-alias-label-tertiary);',
 			footerBar:
 				'display:flex;flex-wrap:wrap;flex:none;align-items:center;gap:8px;' +
-				// 固定值兜底 + `clamp()` 覆盖，理由同 `header`（老内核不认识 clamp）。
-				'padding:16px 24px;padding:clamp(8px,2vh,16px) 24px;' +
-				'border-top:.5px solid var(--dsw-alias-border-l3);',
+				'padding:clamp(8px,2vh,16px) 24px;border-top:.5px solid var(--dsw-alias-border-l3);',
 			footerGap: 'flex:1 1 0;',
 			footerAction: 'min-width:72px;',
 			// —— 配对条（只在「电脑」页签下显示）——
@@ -377,7 +530,27 @@ window.__ModuleLoader__.load({
 					// `clamp()` 挂在组件自己的 style 上，层级怎么变都不会失配。
 					'.' +
 					DIALOG_CLASS +
-					' button:hover{background:var(--dsw-alias-interactive-bg-hover);}';
+					' button:hover{background:var(--dsw-alias-interactive-bg-hover);}' +
+					/*
+					 * ---- 同步进度浮层的关键帧（需求 7）----
+					 *
+					 * 为什么写在这里而不是行内：`style.animation` 只能引用**已存在的**
+					 * `@keyframes`，而 keyframes 没法用行内样式定义，必须有一张
+					 * 样式表。插件的这张 `<style>` 就是唯一入口。
+					 *
+					 * `jlmSyncSpin` —— 顶部加载图标匀速转。
+					 * `jlmSyncIndeterminate` —— 未知总量时进度条来回扫：
+					 *   用 `translateX` 而非改 `width`，走合成器不触发重排，
+					 *   而且首尾用负值/超宽让亮块能完整划过两端、不突然跳回。
+					 */
+					'@keyframes jlmSyncSpin{' +
+					'from{transform:rotate(0deg);}to{transform:rotate(360deg);}' +
+					'}' +
+					'@keyframes jlmSyncIndeterminate{' +
+					'0%{transform:translateX(-100%);}' +
+					'50%{transform:translateX(110%);}' +
+					'100%{transform:translateX(280%);}' +
+					'}';
 
 				// head 可能还不存在（脚本在 <head> 里跑），退到 documentElement。
 				var styleParent =
@@ -590,16 +763,81 @@ window.__ModuleLoader__.load({
 		function isRemoteSession(sessionId, cwdOf) {
 			var cwd = cwdOf === undefined ? undefined : cwdOf(sessionId);
 			if (typeof cwd === 'string' && cwd !== '') {
-				var slug = mirrorSlugOf(cwd);
-				return slug !== undefined && mirrorSlugs[slug] === true;
+				return isMirrorPath(cwd);
 			}
 			// 会话自己的 cwd 还没进列表行 —— 用「刚选中的工作区」兜底（会过期）。
 			var pending = currentPendingWorkspace();
 			if (pending !== null) {
-				var pendingSlug = mirrorSlugOf(pending);
-				return pendingSlug !== undefined && mirrorSlugs[pendingSlug] === true;
+				return isMirrorPath(pending);
 			}
 			return remoteSessionIds[sessionId] === true;
+		}
+
+		/**
+		 * 一条路径是不是电脑镜像工作区 —— **模型与预设共用的唯一判据**。
+		 *
+		 * ## ⚠️⚠️ 为什么必须有这个函数（1.2.85 修「模型列表永不同步」）
+		 *
+		 * 这是用户报了十几个版本的那个 bug 的真正根因，而且根因是
+		 * **两套判据不一致** —— 不是「刷新没触发」，也不是「缓存没作废」。
+		 *
+		 * 「这一屏该用电脑的模型还是手机的模型？」这个问题在代码里有**两份**
+		 * 答案，跑在两个不同的地方：
+		 *
+		 * | 谁在用 | 函数 | 判据 |
+		 * |---|---|---|
+		 * | **预设** 列表 | `currentIsRemote()` | `mirrorSlugs[slug]` **或** 路径形态 |
+		 * | **模型** 列表 | `isRemoteSession()` ← 本函数的老版本 | **只有** `mirrorSlugs[slug]` |
+		 *
+		 * 差的就是那条路径形态兜底。而 `mirrorSlugs` 是
+		 * `loadMirrorSlugs()` 经隧道异步拉回来的**快照**：
+		 *
+		 *   · 刚启动 / 刚配对的那一小段时间里它是 **空对象**；
+		 *   · App 重启后、桥还没回来之前也是空的；
+		 *   · 桥调用失败（电脑睡了、隧道抖一下）时**保持原样**（见那个 catch）。
+		 *
+		 * 空对象时 `mirrorSlugs[slug] === true` 恒为 `false` ⇒ 电脑工作区被判成
+		 * 手机本地 ⇒ `pickWorkspaceGroups` 把它们筛成「只留手机那几组」
+		 * ⇒ **模型菜单里永远是手机本地的模型**。
+		 *
+		 * 而预设走 `currentIsRemote()`，它有路径形态兜底 ⇒ 预设是对的。
+		 * 这正是用户从第一个版本就在说的那句话：
+		 *
+		 *   「预设同步了，但模型列表不同步」
+		 *
+		 * 之前十来轮都在猜「哪一环没刷新」（刷新钩子、TTL、bust、句柄转发），
+		 * 那些确实是真 bug 也修了，但它们都作用在**已经进入正确分支之后**。
+		 * 而这里判错分支 ⇒ 后面刷新多少次都白搭：刷出来的电脑分组
+		 * 立刻被这个判据筛掉。
+		 *
+		 * **修法：把两份答案收成一份。** 模型与预设此后都调本函数，
+		 * 判据按 `currentIsRemote()` 那套（它经历的真机验证更多）。
+		 *
+		 * ## 为什么路径形态可以单独作准
+		 *
+		 * 电脑镜像工作区由宿主 `ensureDesktopWorkspace()` **统一建在**
+		 * `<DSH_HOME>/remote/workspaces/<slug>/` 下，路径形态是宿主自己定的，
+		 * 用户不会手建到那里去。所以「路径里带 `remote/workspaces/`」这件事，
+		 * 与 slug 表是否已加载**无关**、也与我们记不记得住它**无关**。
+		 *
+		 * ⚠️ 别写成 `dsh-remote/workspaces/` —— 那是**状态目录**的名字
+		 * （`<DSH_HOME>/dsh-remote/`，放 `mobile.json` / `sessions.json`），
+		 * 不是镜像工作区所在的 `remote/workspaces/`。两者只差一个 `dsh-` 前缀，
+		 * 写错就是「电脑工作区被判成手机」，实测踩过（见 `currentIsRemote`）。
+		 *
+		 * @param path - 会话 / 工作区的本地路径。
+		 * @returns 是不是电脑镜像目录。
+		 */
+		function isMirrorPath(path) {
+			if (typeof path !== 'string' || path === '') return false;
+			// ① 精确匹配宿主的 slug 表（最权威：它就是"哪些目录被映射过"的账本）。
+			var slug = mirrorSlugOf(path);
+			if (slug !== undefined && mirrorSlugs[slug] === true) return true;
+			// ② slug 表可能是**空快照**（还没拉到 / 桥失败）——
+			//    用宿主自己定的目录形态兜底，与 `currentIsRemote()` 完全同一条。
+			if (path.indexOf('remote/workspaces/') !== -1) return true;
+			if (path.indexOf('remote\\workspaces\\') !== -1) return true;
+			return false;
 		}
 
 		/** 从宿主拉一次全量远程会话清单（失败就按「全是本地」处理）。 */
@@ -636,6 +874,453 @@ window.__ModuleLoader__.load({
 				},
 				function () {
 					/* 同上：最坏是多显示几项，不会误发 */
+				},
+			);
+		}
+
+		/**
+		 * 从**新建对话页的工作区选择器**读出「用户此刻选中的工作区名」。
+		 *
+		 * ## 为什么需要这个（2026-10-29 修 bug）
+		 *
+		 * 用户报障：「我在主界面就可以直接选择你已经同步的某个工作区来进行新建
+		 * 对话，然后我发现如果我直接选择某个已存在的工作区的话，你电脑的那些预设呀
+		 * 还有模型列表都没办法刷新显示出来」。
+		 *
+		 * 数据侧的来源全都读不到：
+		 *   · `currentSessionId()` —— 新建页**没有会话**，官方在
+		 *     `dsh-client-ui-workspace` 的注释里也这么写；
+		 *   · `uiWorkspace.selection` —— 空快照（它只存 `sessionId`）；
+		 *   · 工作区快照的 `sessionIds` 反查 —— 新会话还没建，倒查不到。
+		 *
+		 * 唯一**此刻就准确**的信号，就是界面上那个工作区选择器本身
+		 * （用户截图里 hero 区左侧那个 `Desktop ▾`）。读它的文本，再和宿主的
+		 * 镜像工作区清单比对 —— 清单由 `mirrorWorkspaces` 桥提供，
+		 * 标题就是电脑目录末段，正好能和选择器上的文字对上。
+		 *
+		 * ## 容错
+		 *
+		 * 读不到（选择器没渲染、文本空、清单没拉到）一律返回 `null`，
+		 * 调用方据此保持原来的判断 —— **绝不能因为探测失败就把用户误判成电脑**。
+		 *
+		 * @returns 电脑路径；判不出来时 `null`。
+		 */
+		function probeHeroWorkspaceDesktopPath() {
+			if (typeof document === 'undefined' || document === null) return null;
+			try {
+				/*
+				 * 找按钮形态的工作区选择器：
+				 *   · `[aria-haspopup]` —— 官方这颗 chip 是下拉触发器，带这个属性；
+				 *   · 且文本里带 `▾` 或 `⌄`（官方用它们表示可展开）。
+				 * 两条同时满足，避免把侧边栏工作区行误当成它。
+				 */
+				var nodes = document.querySelectorAll('[aria-haspopup]');
+				var title = '';
+				for (var at = 0; at < nodes.length; at += 1) {
+					var node = nodes[at];
+					var text = String(node.textContent || '').replace(/[\u25be\u2304\u25b4]/g, '').trim();
+					if (text === '') continue;
+					/*
+					 * 侧边栏的工作区行是 `role="treeitem"`，不是 `aria-haspopup`，
+					 * 但保险起见再排一次：带 treeitem 的不要。
+					 */
+					if (node.getAttribute('role') === 'treeitem') continue;
+					if (node.closest !== undefined && node.closest('[role="treeitem"]') !== null) continue;
+					/*
+					 * ⚠️ **必须排除模型选择器** —— 它也是 `aria-haspopup` 的下拉触发器
+					 * （真机上就排在旁边：`deepseek-v4.1-flash 默认 ▾`）。
+					 * 若它先被命中，就会拿模型名去比对镜像清单，永不命中 ⇒
+					 * 探测恒为 null，等于这整个修复白做。
+					 *
+					 * 判据取模型 chip 的两个稳定特征：
+					 *   · 文本里含 `默认` / `Default`（官方在未显式选择时追加）；
+					 *   · 或含 `模式`（`标准模式 ▾` 那颗）。
+					 * 目录名恰好叫这俩的概率极低，且即使误排除也只是回到原行为
+					 *（判不出来 ⇒ 按本地处理），不会误判成电脑。
+					 */
+					if (text.indexOf('默认') >= 0 || text.toLowerCase().indexOf('default') >= 0) continue;
+					if (text.indexOf('模式') >= 0) continue;
+					title = text;
+					break;
+				}
+				if (title === '') return null;
+				/*
+				 * 与镜像清单比对。清单在这里是**同步缓存**（`mirrorDesktopTitles`），
+				 * 由 `loadMirrorDesktopTitles()` 在启动/配对后填充。
+				 */
+				var plain = title.split('\u200B').join('');
+				for (var mt = 0; mt < mirrorDesktopTitles.length; mt += 1) {
+					var item = mirrorDesktopTitles[mt];
+					if (item === null || typeof item !== 'object') continue;
+					if (typeof item.title !== 'string' || item.title === '') continue;
+					var itemTitle = item.title.split('\u200B').join('');
+					if (itemTitle === plain) return item.desktopPath;
+				}
+				return null;
+			} catch (error) {
+				// DOM 结构变化、选择器失效、权限异常 —— 一律当成"判不出来"。
+				return null;
+			}
+		}
+
+		/**		 * 镜像工作区的「标题 → 电脑路径」清单（`probeHeroWorkspaceDesktopPath` 用）。
+		 *
+		 * 与组件内的 `mirrorWorkspacesRef` 是同一份数据的两个视图：那边给菜单用、
+		 * 这边给同步判定用。分开是因为两者作用域不同（本文件里 `patchAgentPresets`
+		 * 是模块级函数，拿不到组件内的 ref）。
+		 */
+		var mirrorDesktopTitles = [];
+
+		/**
+		 * 强制刷新预设菜单的句柄（由组件内部回填）。
+		 *
+		 * ## 为什么需要一个 ref 转发
+		 *
+		 * `runAutoSync` 是**模块级**函数，而 `resolveSeatLoad()` 依赖
+		 * `apply()` 里的 `ctx.slots` —— 模块级函数拿不到。
+		 *
+		 * 所以组件内部把能用的那个函数存这里，
+		 * `runAutoSync` 同步完成时调它 —— 这是「模块级代码调组件内能力」
+		 * 的标准做法（与 `mirrorWorkspacesRef` 同一模式）。
+		 */
+		var forceRefreshPresetsRef = { value: null };
+
+		/**
+		 * 「**直接把新 roster 写进缓存**」的句柄（由组件内部回填）。
+		 *
+		 * ## 为什么需要它（1.2.37 补的兜底路）
+		 *
+		 * `forceRefreshPresetsRef` 走的是官方 `seat.load()`。那条路有两个前提：
+		 * chip 已注册、官方那次 `load()` 真的拿到新数据。任一不成立，
+		 * 用户看到的就还是旧预设 —— 我已经在这个假设上改了四轮。
+		 *
+		 * 这个句柄走**另一条完全独立的**路：自己经 `bridge('mergedPresetList')`
+		 * 把宿主合并好的 roster 拉回来，直接赋给 `rosterCache`。
+		 *
+		 * 它不依赖 slot、不依赖事件、不依赖官方任何内部实现。
+		 * 即使官方那条路彻底失效，这条也能保证「缓存里是新数据」。
+		 */
+		var pullRosterIntoCacheRef = { value: null };
+		
+		/**
+		 * 「通知 **前端**模型目录重读」的句柄（1.2.69 新增）。
+		 *
+		 * ## 为什么必须有这一层（这是 ① 的最后一块拼图）
+		 *
+		 * 模型目录有**两份完全独立的缓存**，跑在两个进程里：
+		 *
+		 *   宿主侧（Node）：`index.js` 里 `ctx.get('modelDirectories')`
+		 *                        ⇒ `refreshModelCatalogDetail()` 刷新的是它
+		 *   前端（WebView）：`client.js` 里 `props.modelDirectories`
+		 *                        ⇒ `reloadModelCatalog()` 刷新的是它
+		 *
+		 * 两段代码虽然**字面上一模一样**（都是 `xxx.catalog.refresh()`），
+		 * 但它们操作的是两个进程里的两个不同对象。
+		 * 宿主侧刷新了，WebView 侧**不会自动跟着刷新**。
+		 *
+		 * 而 `reloadModelCatalog()` 原来**只在配对成功时调一次**（见配对那段）。
+		 * 同步完成时只刷了宿主侧 ⇒ 界面读的还是旧的。
+		 * 用户看到：**同步完成了，模型菜单还是旧的。**
+		 *
+		 * 这个句柄就是把前端那一次刷新正式接到同步完成上。
+		 * 和 `pullRosterIntoCacheRef` / `forceRefreshPresetsRef` 完全同构。
+		 */
+		var reloadFrontendModelCatalogRef = { value: null };
+		/**
+		 * 「重拉电脑侧展示元数据（真实时间 + 置顶）」的句柄。
+		 *
+		 * 与 `reloadFrontendModelCatalogRef` 完全同构 —— 因为
+		 * 同步完成那段代码在**组件内层**，而 `loadDesktopMeta` 定义在
+		 * `apply()` 的外层作用域，直接引用会形成跨层依赖且不好测试。
+		 *
+		 * 用途见 `runAutoSync` 成功分支里那段注释：同步刚建完一批会话，
+		 * 宿主同时也刚记好它们的时间和置顶标记，前端必须立刻拿到。
+		 */
+		var refreshDesktopMetaRef = { value: null };
+		/*
+		 * 强制重算模型目录投影的句柄（1.2.82 加）。
+		 *
+		 * 预设那边有 `pullRosterIntoCacheRef`（直接 `bridge('mergedPresetList')`
+		 * 写缓存，**不依赖任何 RPC 成功**），所以预设能刷新；
+		 * 模型只有 `reloadFrontendModelCatalogRef`（调官方 `catalog.refresh()`，而它
+		 * 内部 `load().catch(() => {})` 把错误全吃掉）。
+		 *
+		 * 失败时官方保留旧 `value`、只把 status 置成 error
+		 * ⇒ 源快照**身份不变** ⇒ 我们那层 `wrapStore` 命中缓存
+		 * ⇒ 界面永远显示旧模型列表。这就是用户看到的
+		 * 「预设刷新了、模型没刷新」。
+		 *
+		 * 这个 ref 让组件把 `bust()` 交给模块级，同步完成后无条件作废一次缓存。
+		 */
+		var bustModelCatalogRef = { value: null };
+
+		/**
+		 * 最近一次同步后**实际拉到的预设数量**（真机可见诊断）。
+		 *
+		 * 模块级，因为渲染浮层的函数也是模块级的，看不见 `apply()` 里的变量
+		 * —— 这正是本文件反复踩的闭包作用域坑。
+		 *
+		 * 结构：`{ presets, desktopCount, reason }`
+		 *   · `presets === -1` ⇒ 没拉到，`reason` 说明卡在哪一步；
+		 *   · `presets >= 0`   ⇒ 拉到了，数字就是条数。
+		 *
+		 * 为什么需要它：①这个 bug 改了 10 轮都没真机确认，问题集中在
+		 * 「数据到底有没有到手机」。这个数字能一句话分开两个完全不同的方向。
+		 */
+		/**
+		 * 日志出口（**模块级**，1.2.70 提上来）。
+		 *
+		 * ## 为什么必须在模块级
+		 *
+		 * 原来它定义在 `installSyncMenu(ctx)` 内部（行 7462，范围 7444~8320），
+		 * 但下面三个**模块级**函数也在调它：
+		 *
+		 *     showPromptFailure（行 8396）
+		 *     showAskCard（行 8465）
+		 *     异常回传那段（行 8574）
+		 *
+		 * 三处全在 8320 之后 ⇒ 必然 `ReferenceError: logWarn is not defined`。
+		 * 而它们又都在 `catch` 里，所以平时不发作、一发作就把
+		 * 原始错误盖掉 —— 用户看到的是一个不相干的错误名。
+		 *
+		 * ## 为什么不能用可选链
+		 *
+		 * `ctx.logger?.warn?.(...)` 是 chrome80+ 语法，本文件受 chrome73 约束。
+		 * 旧 WebView 会直接 SyntaxError ⇒ 整个文件不执行 ⇒ 插件像没装。
+		 * 所以必须先判类型再调。
+		 *
+		 * ## 为什么接受一个 ctx 参数
+		 *
+		 * 不同调用点的 `ctx` 与原来一样（都是它们自己手里的那个），
+		 * 所以行为不变，只是可见范围变大了。
+		 */
+		/*
+		 * 插件版本号（显示用）。
+		 *
+		 * ⚠️ 发版时必须与 `package.json` 的 `version` 一致。
+		 * 不能从文件读：这个文件跑在 WebView 里，没有 fs。
+		 * 又不愿意为一个显示用的字符串多一次桥调用。
+		 * 写成常量，并在自测里断言它与 package.json 一致。
+		 */
+		var PLUGIN_VERSION = '1.2.97';
+		
+		/**
+		 * 配对条上的版本小标签。
+		 *
+		 * ⡠ 什么也拿不到时返回 null —— 不显示，也不炸。
+		 */
+		/*
+		 * 侧栏徽标自检行（1.2.82 新增）。
+		 *
+		 * ## 为什么要把这个显示出来
+		 *
+		 * 用户反复报「侧边栏电脑标记不显示」，而代码路径逐段看都对：
+		 * 识别用的是 `data-row-key`（官方确定性标识）、徽标四级降级全备、
+		 * 容器尺寸颜色都完整。光看代码已经定不了位了。
+		 *
+		 * 而用户说过「你知道我测试一次成本很大的」、「把错误
+		 * 原因显示在 App 界面里，我看一张截图就知道」。所以把实测值
+		 * 直接写在配对条下面：一张截图就能区分是哪一种坏法。
+		 *
+		 * 读的是 `window.__dshRemoteSidebarDiag`（由 `syncOnce` 每 1.5s 写一次）。
+		 * 读不到就不显示 —— 不能因为诊断影响主流程。
+		 */
+		/**
+		 * 排序 / 置顶诊断快照。
+		 *
+		 * 用户报障两轮都是「数据到了但界面没变」，而这种事靠猜永远猜不准。
+		 * 所以把三个关键环节的**实测值**显示在界面上，一张截图就能定位断在哪一步：
+		 *
+		 *   `times`  実主给了多少条电脑真实时间（为 0 说明账本没补上）
+		 *   `applied` 有几个会话的 `updatedAt` 真被覆盖（为 0 说明没命中）
+		 *   `hook`   hook 引用是否已换成包装后的对象（否则界面读的还是旧数据）
+		 *   `pins`   电脑上置顶的数量 / 已 pin 成功的数量 / 失败原因
+		 */
+		var clockDiag = {
+			times: 0,
+			applied: 0,
+			// 电脑报了多少条置顶（`adoptDesktopMeta` 里写）
+			pins: 0,
+			// pinSession RPC 成功了几条（只影响本地 registry，不影响显示）
+			pinned: 0,
+			// 投影层实际并进快照几条 —— **这才是界面看到的置顶数**
+			pinnedVisible: 0,
+			hook: '-',
+			pinErr: '',
+		};
+		var pinErrorText = '';
+
+		var sidebarDiagTag = function () {
+			try {
+				var d = window.__dshRemoteSidebarDiag;
+				if (d === undefined || d === null || typeof d.rows !== 'number') return null;
+				var box = d.box;
+				var parts = [
+					'电脑行 ' + d.rows,
+					'徽标 ' + d.badges,
+					'隐藏 ' + d.folderHidden,
+				];
+				if (box !== null && box !== undefined) parts.push('尺寸 ' + box.w + '×' + box.h);
+				if (d.err !== null && d.err !== undefined) parts.push('错 ' + String(d.err).slice(0, 30));
+				/*
+				 * 排序 / 置顶诊断行。
+				 *
+				 * 格式：时间 N/覆盖 N | 置顶 电脑N/显示N/RPC N | hook ✓/✗
+				 *
+				 * 三项分开看，一眼就能定位断在哪一环：
+				 *   · 电脑N —— 电脑报了多少条置顶（0 ⇒ 数据没下来）
+				 *   · 显示N —— 投影层实际并进快照几条（这才是界面看到的）
+				 *   · RPC N —— pinSession 成功几条（只影响本地 registry，不影响显示）
+				 */
+				parts.push(
+					'时间 ' + clockDiag.times + '/' + clockDiag.applied,
+					'置顶 ' + clockDiag.pins + '/' + (typeof clockDiag.pinnedVisible === 'number' ? clockDiag.pinnedVisible : 0) + '/' + clockDiag.pinned,
+					'hook ' + clockDiag.hook,
+				);
+				if (pinErrorText !== '') parts.push('置顶错 ' + pinErrorText.slice(0, 40));
+				var text = '侧栏：' + parts.join(' · ');
+				return h('div', {
+					style: {
+						fontSize: '11px',
+						lineHeight: '15px',
+						color: 'var(--dsw-alias-label-tertiary, #888)',
+						marginTop: '2px',
+						wordBreak: 'break-all',
+					},
+					title: '侧栏徽标自检（每 1.5 秒刷新）',
+				}, text);
+			} catch (diagTagError) {
+				return null;
+			}
+		};
+
+		var versionTag = function () {
+			try {
+				if (typeof PLUGIN_VERSION !== 'string' || PLUGIN_VERSION === '') return null;
+				return h(
+					'span',
+					{
+						style: {
+							fontSize: '10px',
+							opacity: '0.55',
+							marginLeft: '6px',
+							whiteSpace: 'nowrap',
+						},
+						title: 'dsh-jiuling-remote-mobile ' + PLUGIN_VERSION,
+					},
+					'v' + PLUGIN_VERSION,
+				);
+			} catch (versionError) {
+				return null;
+			}
+		};
+		
+		var logWarn = function (message, ctx) {
+
+			try {
+				if (ctx && ctx.logger && typeof ctx.logger.warn === 'function') {
+					ctx.logger.warn(message);
+				} else if (typeof console !== 'undefined' && console && typeof console.warn === 'function') {
+					/*
+					 * 没传 ctx 时退到 console。
+					 *
+					 * 这不是多余：上面三个调用点手里**没有**可用的 ctx
+					 *——`showPromptFailure(ctx, ...)` 虽然有 ctx 参数，但那个 ctx
+					 * 是官方传入的插件上下文，不一定有 logger。
+					 * 宁可写到 console（真机 adb logcat 可见），也不能打不出日志。
+					 */
+					console.warn(message);
+				}
+			} catch (ignored) {
+				/* 连日志都打不出来也不能炸 */
+			}
+		};
+		
+		var syncDiagRef = { value: null };
+
+
+		/**
+		 * 从请求体里读 `workspaceId`，判断它是不是**电脑镜像工作区**。
+		 *
+		 * ## 为什么这是最可靠的判据（2026-10-29）
+		 *
+		 * 用户报障：「我点击电脑工作区，或者我直接在侧边栏里面的电脑工作区行的
+		 * 右边按钮点击新建对话，然后新建对话的界面的模型列表和预设列表都没有
+		 * 加载过来」。
+		 *
+		 * 前几版试过两条路，都不行：
+		 *
+		 *   ① `cwdOf(undefined)` —— `makeCwdOf` 第一行就因 `sessionId` 不是
+		 *      字符串而返回，走不到退路链；
+		 *   ② DOM 探测 hero chip（`probeHeroWorkspaceDesktopPath`）——
+		 *      真机截图证明**新建对话页根本没有工作区 chip**，只有底部的
+		 *      模型 chip 和输入框，所以探测恒为 null。
+		 *
+		 * 而前端调 `api/agentPresets/list` / `api/session/modelCatalog` 时，
+		 * 请求体里**一定**带着它当前认定的 `workspaceId`（那是它筛预设、
+		 * 筛模型的作用域参数）。所以直接从请求体读它、再拿镜像清单反查 ——
+		 * 精确、与 DOM 结构无关、与有没有 sessionId 无关。
+		 *
+		 * @param body - 已解析的请求体（`client-request` 信封）。
+		 * @returns 是电脑镜像工作区 `true`；不是 `false`；判断不了 `null`。
+		 */
+		function workspaceIdIsDesktopMirror(body) {
+			try {
+				if (body === null || typeof body !== 'object') return null;
+				/*
+				 * 信封形态是 `{type:'client-request', rpcId, method, payload}`。
+				 * `workspaceId` 可能落在 `payload` 里，也可能直接在顶层
+				 * （不同前端版本的封装不一样），两个都查，成本为零。
+				 */
+				var payload = body.payload;
+				var candidates = [];
+				if (payload !== null && typeof payload === 'object') {
+					candidates.push(payload.workspaceId);
+					if (payload.address !== null && payload.address !== undefined &&
+						typeof payload.address === 'object') {
+						candidates.push(payload.address.workspaceId);
+					}
+				}
+				candidates.push(body.workspaceId);
+				var target = null;
+				for (var at = 0; at < candidates.length; at += 1) {
+					var value = candidates[at];
+					if (typeof value === 'string' && value !== '') {
+						target = value;
+						break;
+					}
+				}
+				// 请求里没带 workspaceId ⇒ 无从判断，交给调用方按原逻辑走。
+				if (target === null) return null;
+				var list = Array.isArray(mirrorDesktopTitles) ? mirrorDesktopTitles : [];
+				for (var mt = 0; mt < list.length; mt += 1) {
+					var item = list[mt];
+					if (item === null || typeof item !== 'object') continue;
+					if (typeof item.workspaceId === 'string' && item.workspaceId === target) return true;
+				}
+				return false;
+			} catch (error) {
+				// 任何异常都当成"判断不了"，绝不因此让预设列表报错。
+				return null;
+			}
+		}
+
+		/** 从宿主拉一次镜像工作区清单（标题 + 电脑路径）。 */
+		function loadMirrorDesktopTitles() {
+			return bridge('mirrorWorkspaces', {}).then(
+				function (result) {
+					var list = result && result.workspaces;
+					if (!Array.isArray(list)) return;
+					var next = [];
+					for (var at = 0; at < list.length; at += 1) {
+						var item = list[at];
+						if (!item || typeof item.desktopPath !== 'string' || item.desktopPath === '') continue;
+						next.push({ title: String(item.title === undefined ? '' : item.title), desktopPath: item.desktopPath });
+					}
+					mirrorDesktopTitles = next;
+				},
+				function () {
+					/* 拉不到就保持空清单：探测会一律返回 null，不影响原有判断 */
 				},
 			);
 		}
@@ -848,6 +1533,759 @@ window.__ModuleLoader__.load({
 		}
 
 		/**
+		 * 电脑侧展示元数据的**内存副本**（`sessionId → 毫秒时间戳`）。
+		 *
+		 * 由 `loadDesktopMeta()` 在 `apply()` 时拉一次全量填充，之后同步
+		 * 完成时再拉一次。**读它必须是同步的** —— 快照每帧都可能被读。
+		 *
+		 * ⚠️ 用普通对象而不是 Map：这份数据的规模是「同步过来的会话数」
+		 * （几十到几百），对象字面量查表更快，而且 `chrome73` 下
+		 * 没有 `Object.fromEntries`（本文件受 chrome73 语法限制）。
+		 */
+		var desktopTimes = {};
+
+		/** `sessionId → true`：电脑上置顶的那些（同上，内存副本）。 */
+		var desktopPins = {};
+
+		/**
+		 * `sessionId → 我们给它建本地空壳的时刻`（毫秒，内存副本）。
+		 *
+		 * 这是「本地 `updatedAt` 到底是真值还是假值」的**判断基准**，
+		 * 没有它整个排序修复会变成空操作 —— 详见 `applyDesktopClock`。
+		 */
+		var desktopSyncedAt = {};
+
+		/**
+		 * 时间表的**版本号**：每次元数据落地就 +1。
+		 *
+		 * `wrapSessionListClock` 拿它当缓存 key 的一部分 —— 否则
+		 * 「同一个会话的时间被更新、但条目数没变」这种情况下
+		 * 缓存不会失效，界面还显示旧顺序（这类 bug 极难察觉）。
+		 *
+		 * ⚠️ 必须在 `adoptDesktopMeta` **之前**初始化：`var` 提升只提升
+		 * 声明不提升赋值，写在后面的话第一次 `metaVersion += 1` 是
+		 * `undefined + 1 = NaN`，之后缓存 key 恒为 `NaN !== NaN` ⇒
+		 * 每帧都重算（性能塌陷）且永远不会命中缓存。
+		 */
+		var metaVersion = 0;
+
+		/** 是否成功拉到过电脑侧元数据（决定要不要做「取消置顶」这个反向动作）。 */
+		var desktopMetaLoaded = false;
+
+		/**
+		 * 把宿主给的电脑侧元数据装进内存副本。
+		 *
+		 * @param payload - `{times, pins}`；任一项缺失/形状不对就跳过该项。
+		 */
+		var adoptDesktopMeta = function (payload) {
+			if (payload === null || typeof payload !== 'object') return;
+			var times = payload.times;
+			var nextTimes = {};
+			if (times !== null && typeof times === 'object') {
+				var keys = Object.keys(times);
+				for (var at = 0; at < keys.length; at += 1) {
+					var key = keys[at];
+					var value = times[key];
+					// ⚠️ 只认有限非负数字：混进字符串 ⇒ 排序比较得 NaN ⇒ 排序静默失效。
+					if (typeof value !== 'number' || !isFinite(value) || value < 0) continue;
+					nextTimes[key] = value;
+				}
+			}
+			var pins = payload.pins;
+			var nextPins = {};
+			if (pins !== null && typeof pins === 'object') {
+				var pinKeys = Object.keys(pins);
+				for (var bit = 0; bit < pinKeys.length; bit += 1) {
+					if (pins[pinKeys[bit]] === true) nextPins[pinKeys[bit]] = true;
+				}
+			}
+			/*
+			 * 建壳时刻：前端靠它判断「本地 `updatedAt` 是同步那一刻的假值，
+			 * 还是用户真的在手机上聊过」。
+			 *
+			 * ⚠️ 这个字段不能省：没有它，`applyDesktopClock` 只能用「取 max」判断哪个时间可用 ——
+			 * 而同步建出来的空壳，本地时间恰好是「同步那一刻」，**必然比电脑上那次
+			 * 真实对话更新** ⇒ max 永远选本地假值 ⇒ 整个排序修复变成空操作。
+			 */
+			var rawSynced = payload.syncedAt;
+			var nextSynced = {};
+			if (rawSynced !== null && typeof rawSynced === 'object') {
+				var syncedKeys = Object.keys(rawSynced);
+				for (var sit = 0; sit < syncedKeys.length; sit += 1) {
+					var skey = syncedKeys[sit];
+					var svalue = rawSynced[skey];
+					if (typeof svalue !== 'number' || !isFinite(svalue) || svalue < 0) continue;
+					nextSynced[skey] = svalue;
+				}
+			}
+			desktopTimes = nextTimes;
+			desktopPins = nextPins;
+			/*
+			 * 清理「用户取消过」的记录：电脑那边也已经不置顶的，这条记录
+			 * 就失去意义了。
+			 *
+			 * 必须清 —— 否则用户这次取消置顶，会让这条会话**以后永远**不能再
+			 * 跟着电脑置顶回来（哪怕电脑那边重新置顶了）。
+			 * 清掉之后语义正好：只有「电脑还置顶、但用户在手机上取消了」这一种
+			 * 情况才被排除，与用户看到的一致。
+			 */
+			var unpinnedKeys = Object.keys(unpinnedByUser);
+			for (var uit = 0; uit < unpinnedKeys.length; uit += 1) {
+				if (desktopPins[unpinnedKeys[uit]] !== true) delete unpinnedByUser[unpinnedKeys[uit]];
+			}
+			/*
+			 * 数据到位 ⇒ **主动重试置顶**（不能等快照变化，理由见
+			 * `pinRetryHooks` 的注释）。放在此处而不是 `loadDesktopMeta`
+			 * 回调里：`metaVersion` 可能因其它原因增加，只要置顶表真变了就该重试。
+			 */
+			firePinRetry();
+			desktopSyncedAt = nextSynced;
+			// 版本号必须变：缓存 key 靠它失效（见 `wrapSessionListClock`）。
+			metaVersion += 1;
+			desktopMetaLoaded = true;
+		};
+
+		/**
+		 * 从宿主拉一次电脑侧元数据（失败就当空，绝不外抛）。
+		 *
+		 * @returns Promise，永不 reject。
+		 */
+		var loadDesktopMeta = function () {
+			return bridge('desktopMeta', {}).then(
+				function (payload) {
+					adoptDesktopMeta(payload);
+				},
+				function () {
+					/* 电脑离线 / 桥不存在 —— 保持现有值，不影响其它功能 */
+				},
+			);
+		};
+
+		/**
+		 * 从宿主拉一次「每个会话实际会用哪个模型」（失败就当空，绝不外抛）。
+		 *
+		 * ## 为什么必须由宿主告诉前端（用户 2026-10-29 报障：模型不对称）
+		 *
+		 * 真正决定「这台电脑这次用哪个模型」的是宿主 `remoteModels`
+		 *（`prompt` 拦截器把它塞进 `body.model`）。那份数据落在手机磁盘上，
+		 * 前端读不到。
+		 *
+		 * 而界面显示的「当前模型」以前读的是插件自己的全局单例
+		 *（`modelChoiceBus.selection`），与宿主那份**粒度不同**
+		 *（一个全局、一个按会话）⇒ 必然对不上，重启后更是直接退回电脑默认值。
+		 *
+		 * 拉回来之后 `modelChoiceBus.forSession()` 就有权威值可查，
+		 * 界面显示与发送用的就是同一份数据。
+		 *
+		 * @returns Promise，永不 reject。
+		 */
+		var loadRemoteModels = function () {
+			return bridge('remoteModels', {}).then(
+				function (payload) {
+					var models = payload === null || payload === undefined ? null : payload.models;
+					modelChoiceBus.adoptPersisted(models);
+					// 真值变了 ⇒ 让所有已建的目录缓存失效，下一帧按新值投影。
+					var bust = bustModelCatalogRef.value;
+					if (typeof bust === 'function') {
+						try {
+							bust();
+						} catch (error) {
+							/* 缓存作废失败不影响主流程 */
+						}
+					}
+				},
+				function () {
+					/* 桥不存在 —— 保持现有值 */
+				},
+			);
+		};
+
+		/**
+		 * 把 `sessions.list` 的快照**按电脑真实时间重写 `updatedAt`**。
+		 *
+		 * ## 为什么必须在这一层做（用户 2026-10-29 报障②）
+		 *
+		 * 用户原话：「你同步过来的对话，你没有按时间顺序进行一个排序」。
+		 *
+		 * 官方侧边栏「按时间排序」读的是 `WorkspaceBrowser` 里
+		 * `orderByRecency(memberIds, list.byId)`，而它比较的是
+		 * `summary.updatedAt`（`dsh-client-ui-workspace/lib/client.js:886`）。
+		 * **`list.byId` 的来源正是 `ctx.sessions.list.getSnapshot()`**
+		 *（同一个 `useSessions` hook），所以在这里覆盖一处，
+		 * 侧边栏、搜索、置顶区、未分组区全部同步生效。
+		 *
+		 * ## 为什么本地 `updatedAt` 一定是错的
+		 *
+		 * 同步会话在手机本地是空壳，`markSessionNonBlank()` 为了让它在
+		 * 侧边栏可见补写了一个**占位轮次**。而官方
+		 * `updatedAt(header, metadata) = Math.max(header.createdAt,
+		 * metadata?.lastPromptAt ?? 0)` 取的全是**本地日志时间**，
+		 * 且 `session.append()` 写死 `Date.now()` —— 外部无法指定。
+		 *
+		 * ⇒ 所有同步来的对话，时间戳都≈**这次同步的时刻**，
+		 *   彼此相差几十毫秒 ⇒ 排序结果等于「同步顺序」，
+		 *   与用户电脑上的实际顺序无关。
+		 *
+		 * 宿主已经把电脑的真实时间存在 `desktopTimes` 里
+		 *（见宿主 `loadDesktopTimes()` 的注释），这里覆盖上去即可。
+		 *
+		 * ## ⚠️⚠️ 不能只用「谁大用谁」（这是本修复最容易写错的一步）
+		 *
+		 * 最初的写法是 `Math.max(本地, 电脑)`，理由是「用户可能就在手机上刚聊过」。
+		 * 这个写法**看起来完全正确，实际上在所有同步会话上都是空操作**：
+		 *
+		 *   · 同步建出来的空壳，本地 `updatedAt` 就是「同步那一刻」；
+		 *   · 而同步发生在电脑那次真实对话**之后** ⇒ 本地假值**必然更大**；
+		 *   · ⇒ `max` 永远选本地假值 ⇒ 排序没有任何变化 ⇒ 用户看到的还是「没修」。
+		 *
+		 * 所以必须用 `desktopSyncedAt`（建壳时刻）区分真假值：
+		 *
+		 *   · 本地 ≈ 建壳时刻 ⇒ **假值** ⇒ 无条件用电脑时间（哪怕它更小）；
+		 *   · 本地 显著晚于建壳时刻 ⇒ **真值** ⇒ 取 max，不让用户刚聊过的往下沉。
+		 *
+		 * @param source - 官方 `sessions.list` 的快照。
+		 * @returns 改写后的快照；没有任何可用电脑时间时**原样返回**（身份不变）。
+		 */
+		/**
+		 * 重试置顶的回调列表。
+		 *
+		 * ## 为什么需要它（本轮置顶失效的真正原因）
+		 *
+		 * 订阅只在 `sessions.list` **快照变化**时触发，而电脑上的
+		 * 置顶数据是**异步**拉回的。两者的时序是：
+		 *
+		 *     apply()          → 订阅建立（此时 desktopPins = {}，什么都不做）
+		 *     loadDesktopMeta → 数据到位（desktopPins 有值了）
+		 *                        …… 但快照没变 ⇒ **回调不会跑**
+		 *
+		 * 于是用户看到的就是「置顶永远不生效」。
+		 * 数据到位必须**主动推一次**，不能等快照变化。
+		 */
+		var pinRetryHooks = [];
+
+		/**
+		 * 数据到位后主动重试一次置顶。
+		 *
+		 * 安全性：每个回调都包在 try/catch 里 ——
+		 * 置顶是展示增强，失败绝不能影响主流程。
+		 */
+		var firePinRetry = function () {
+			for (var at = 0; at < pinRetryHooks.length; at += 1) {
+				try {
+					pinRetryHooks[at]();
+				} catch (error) {
+					/* 同上 */
+				}
+			}
+		};
+
+				var applyDesktopClock = function (source) {
+			if (source === null || typeof source !== 'object') return source;
+			var byId = source.byId;
+			if (byId === null || typeof byId !== 'object') return source;
+			// 诊断：若存在则记（`applyDesktopClock` 不应依赖它，单测要能脱离运行）。
+			if (typeof clockDiag === 'object' && clockDiag !== null) clockDiag.times = Object.keys(desktopTimes).length;
+			var ids = source.ids;
+			if (!Array.isArray(ids)) ids = Object.keys(byId);
+			var changed = false;
+			var nextById = {};
+			var appliedCount = 0;
+			var keys = Object.keys(byId);
+			for (var at = 0; at < keys.length; at += 1) {
+				var id = keys[at];
+				var row = byId[id];
+				var clock = desktopTimes[id];
+				if (typeof clock !== 'number' || !isFinite(clock)) {
+					nextById[id] = row;
+					continue;
+				}
+				if (row === null || typeof row !== 'object') {
+					nextById[id] = row;
+					continue;
+				}
+				/*
+				 * ⚠️⚠️ 本地没有 `updatedAt`（或不是合法数字）时、**恰恰是最需要电脑时间的情况**。
+				 *
+				 * 上一版写的是 `if (非数字) { 原样返回; continue; }` —— 这是错的，
+				 * 而且错得很隐蔽：用户截图里那些同步过来的会话
+				 * **根本没有相对时间标签**（电脑端每条都有「3分钟」「1小时」），
+				 * 正是 `updatedAt` 为 `undefined` / `0` 的表现 —— 而这时我的代码直接跳过了覆盖。
+				 *
+				 * 结果：最该被修的会话（空壳、无时间）恰好没被修。
+				 *
+				 * 所以改成：本地时间**不可用 ⇒ 直接用电脑时间**（无条件）。
+				 */
+				var local = row.updatedAt;
+				var localUsable = typeof local === 'number' && isFinite(local) && local > 0;
+				if (!localUsable) {
+					var copyMissing = {};
+					for (var fieldMissing in row) {
+						if (Object.prototype.hasOwnProperty.call(row, fieldMissing)) copyMissing[fieldMissing] = row[fieldMissing];
+					}
+					copyMissing.updatedAt = clock;
+					nextById[id] = copyMissing;
+					changed = true;
+					appliedCount += 1;
+					continue;
+				}
+				/*
+				 * 判定本地这个时间是「假值」还是「真值」。
+				 *
+				 * 假值 = 同步时建空壳那一刻写进日志的时间（占位轮次的时间）。
+				 * 特征：它与 `desktopSyncedAt[id]` 几乎相同（建壳时创建的两条事件相差几毫秒）。
+				 *
+				 * 真值 = 用户后来真在手机上聊过 ⇒ 本地时间**显著晚于**建壳时刻。
+				 *
+				 * ⚠️ 宽限 2 分钟：建壳流程（create → 占位轮次 → 标题）在真机上可能耗时十几秒，
+				 * 而同步一批几十个会话更久。取 2 分钟既能覆盖整个建壳窗口，
+				 * 又不会把「同步完三分钟后用户真聊了一句」误判成假值。
+				 */
+				var syncedAt = desktopSyncedAt[id];
+				var isFake = false;
+				if (typeof syncedAt === 'number' && isFinite(syncedAt)) {
+					isFake = local <= syncedAt + 120000;
+				} else {
+					/*
+					 * 没有建壳时刻（老版本同步出来的会话）⇒ 无法判断真假。
+					 *
+					 * 这时退回「取 max」：至少不会让刚聊过的往下沉，
+					 * 而重新同步一次就会补上建壳时刻（见宿主 `rememberDesktopMeta`）。
+					 */
+					isFake = clock > local;
+				}
+				/*
+				 * 假值 ⇒ 无条件用电脑时间（哪怕它更小）；
+				 * 真值 ⇒ 取 max，不让用户刚聊过的会话往下沉。
+				 */
+				var target = isFake ? clock : Math.max(local, clock);
+				if (target === local) {
+					nextById[id] = row;
+					continue;
+				}
+				var copy = {};
+				for (var field in row) {
+					if (Object.prototype.hasOwnProperty.call(row, field)) copy[field] = row[field];
+				}
+				copy.updatedAt = target;
+				nextById[id] = copy;
+				changed = true;
+				appliedCount += 1;
+			}
+			if (!changed) return source;
+			var next = {};
+			for (var key in source) {
+				if (Object.prototype.hasOwnProperty.call(source, key)) next[key] = source[key];
+			}
+			next.byId = nextById;
+			if (typeof clockDiag === 'object' && clockDiag !== null) clockDiag.applied = appliedCount;
+			return next;
+		};
+
+		/**
+		 * 包装 `sessions.list`，让它下发的快照带上电脑真实时间。
+		 *
+		 * ⚠️ **只换 `getSnapshot`，其余方法原样转发**：`subscribe` / `update` /
+		 * `set` 都是官方内部在用的，动它们会破坏 `createSnapshotStore` 的语义。
+		 *
+		 * ⚠️ **缓存投影结果**（同 `wrapStore` 的理由）：`getSnapshot` 每帧都会被
+		 * 调用，每次都重建 `byId` 会产生大量垃圾对象，也会破坏
+		 * 「快照身份稳定」这个 React 优化前提（`useSyncExternalStore`
+		 * 靠身份变化决定要不要重渲染，身份每帧都变会被误判成「一直在变」）。
+		 * 所以按「源快照身份 + 时间表版本」缓存。
+		 *
+		 * ## ⚠️⚠️ **必须原地改写，不能返回新对象**（1.2.88 修 —— 前两版都错在这里）
+		 *
+		 * 之前的写法是 `return { getSnapshot: …, subscribe: … }`，然后把
+		 * `ctx.sessions.list = wrapper`。看起来天衣无缝，实际上**一次都没生效**：
+		 *
+		 *   `dsh-client-ui-session/lib/client.js:1106`
+		 *     ctx.slots.provideRoot({ hooks: { sessions: ctx.sessions.list } })
+		 *   → `dsh-client-ui-renderer/lib/client.js:1681` `rebuildRootBinding()`
+		 *     里 `copyUnique()` **按引用拷贝**这个对象
+		 *   → `bindSnapshotSelector(w)`（同文件 155 行）把 `w` 存进闭包：
+		 *
+		 *         const subscribe = (fn) => w.subscribe(fn);
+		 *         const getSnapshot = () => w.getSnapshot();
+		 *
+		 * 也就是说 hook 抓住的是 **当时那个对象本身**。我们后面把
+		 * `ctx.sessions.list` 指到新对象，只是改了属性 —— hook 闭包里的 `w`
+		 * 还是旧的 ⇒ 排序代码从来没被界面调用过。
+		 *
+		 * 而 `bindSnapshotSelector` 是**每次调用都动态读 `w.getSnapshot`** 的
+		 * （不是取值时固化）。所以正解是：**在原来那个对象上原地替换
+		 * `getSnapshot`**。hook 持有的引用不变，`w.getSnapshot()` 自动走到新实现。
+		 *
+		 * 这也比上一版去翻 `ctx.slots._rootContributions` 稳得多：那是官方私有
+		 * 字段，官方一改结构就静默失效；而 `getSnapshot` 是公开契约。
+		 *
+		 * @param list - 官方 `ctx.sessions.list`。
+		 * @returns 同一个 `list` 对象（原地改写；不可包装时原样返回）。
+		 */
+		var wrapSessionListClock = function (list) {
+			if (list === null || list === undefined) return list;
+			if (typeof list.getSnapshot !== 'function') return list;
+			// 防重复包装（`apply` 在热重载时可能被调多次）。
+			if (list.__dshClockWrapped === true) return list;
+			var inner = list.getSnapshot.bind(list);
+			var cachedSource;
+			var cachedToken;
+			var cachedValue;
+			/*
+			 * 原地替换。用 `try` 兜底：官方若把该方法定义成不可写（`writable:false`），
+			 * 赋值在非严格模式下会静默失败 —— 那就退回旧行为，不影响其它功能。
+			 */
+			try {
+				list.getSnapshot = function () {
+					var source = inner();
+					// token 用「时间表的条目数 + 一个单调递增的版本号」。
+					// 只用条目数不够：同一个会话的时间被更新（条目数不变）时
+					// 缓存不会失效。所以版本号在 `adoptDesktopMeta` 里递增。
+					var token = metaVersion;
+					if (source === cachedSource && token === cachedToken) return cachedValue;
+					cachedSource = source;
+					cachedToken = token;
+					cachedValue = applyDesktopClock(source);
+					return cachedValue;
+				};
+				list.__dshClockWrapped = true;
+			} catch (error) {
+				void debugLog('原地替换 sessions.list.getSnapshot 失败: ' + String(error && error.message ? error.message : error));
+			}
+			return list;
+		};
+
+		/**
+		 * 把电脑上的置顶状态推到官方 `workspaces` 服务上。
+		 *
+		 * ## 为什么必须走官方 `pinSession()`（用户 2026-10-29 报障③）
+		 *
+		 * 用户原话：「电脑的某些对话人家是置顶的状态，你也没有把置顶的状态
+		 * 同步过来」。
+		 *
+		 * 官方侧边栏的置顶区读的是 `workspaces.list` 快照里的
+		 * `pinnedSessionIds`（`dsh-client-ui-workspace/lib/client.js:3525`），
+		 * 而那个集合只有调 `workspaces.pinSession(sessionId)` 才会变。
+		 * 光在前端"假装"置顶是没用的 —— 侧边栏渲染、`rowState` 分组、
+		 * 未分组区的排除逻辑全都以那个集合为准。
+		 *
+		 * ## ⚠️ 三条必守
+		 *
+		 *   ① **会话必须已在本地"已知"**：宿主
+		 *      `workspaceRegistry.pinSession()` 校验 `sessionKnown(id)`
+		 *      （活会话 / header 索引 / 持久化清单），否则抛
+		 *      `session pin failed: session/unknown`。所以在
+		 *      `sessions.list` 快照里出现了这个 id 之后才能 pin。
+		 *   ② **不能每帧都调**：`pinSession` 是 RPC。所以记 `pinnedApplied`，
+		 *      成功过的就不再试；失败的清掉标记，等下次快照变化再试。
+		 *   ③ **绝不外抛**：置顶是展示层的增强，失败绝不能影响会话可用性。
+		 *
+		 * @param list - 已包装的 `sessions.list`。
+		 * @param workspaces - 官方 `workspaces` 服务。
+		 */
+		var pinnedApplied = {};
+		var pinAttemptAt = {};
+		var applyPinFromDesktop = function (list, workspaces) {
+			if (workspaces === null || workspaces === undefined) return;
+			if (typeof workspaces.pinSession !== 'function') return;
+			if (typeof workspaces.unpinSession !== 'function') return;
+			var wanted = Object.keys(desktopPins);
+			clockDiag.pins = wanted.length;
+			clockDiag.pinned = Object.keys(pinnedApplied).length;
+			if (wanted.length === 0) return;
+			var snapshot = list === undefined || list === null ? undefined : list.getSnapshot();
+			var byId = snapshot === null || snapshot === undefined ? undefined : snapshot.byId;
+			if (byId === null || byId === undefined) return;
+			var now = Date.now();
+			for (var at = 0; at < wanted.length; at += 1) {
+				var sessionId = wanted[at];
+				// ① 本地还不认识这个会话 ⇒ 还没轮到它
+				if (byId[sessionId] === undefined) continue;
+				if (pinnedApplied[sessionId] === true) {
+					// 已经 pin 过 —— 只检查「电脑上已取消置顶」这个反方向
+					// （见 `adoptDesktopMeta`：取消置顶会把它从表里删掉）。
+					continue;
+				}
+				// ② 失败过的退避 10 秒，避免每次快照变化都打一次 RPC。
+				var last = pinAttemptAt[sessionId];
+				if (typeof last === 'number' && now - last < 10000) continue;
+				pinAttemptAt[sessionId] = now;
+				/**
+				 * ⚠️ 闭包里的 `sessionId`：用 `var` 声明的循环变量在
+				 * 异步回调里会被后续迭代改写（JS 的老坑）。必须先拷进
+				 * 一个局部常量再传给回调。
+				 */
+				var target = sessionId;
+				try {
+					var result = workspaces.pinSession(target);
+					// `pinSession` 返回 Promise；失败时要清掉重试窗口。
+					if (result !== null && result !== undefined && typeof result.then === 'function') {
+							result.then(
+							function () {
+								pinnedApplied[target] = true;
+								clockDiag.pinned = Object.keys(pinnedApplied).length;
+							},
+							function (err) {
+								delete pinAttemptAt[target];
+								pinErrorText = String(err && err.message ? err.message : err);
+							},
+						);
+					} else {
+						pinnedApplied[target] = true;
+					}
+				} catch (error) {
+					delete pinAttemptAt[target];
+				}
+			}
+			/**
+			 * 反方向：手机本地置顶了、但电脑上没置顶 ⇒ 取消。
+			 *
+			 * 只处理「电脑侧明确说没置顶」的那些 —— 也就是曾经被我们
+			 * pin 过、现在从 `desktopPins` 里消失的会话。
+			 * 不能在电脑离线时把所有置顶都取消掉（那会把用户在手机上
+			 * 自己置顶的会话也一并清掉），所以前提是**至少拿到过一次
+			 * 电脑数据**（`desktopMetaLoaded`）。
+			 */
+			if (!desktopMetaLoaded) return;
+			var cleared = Object.keys(pinnedApplied);
+			for (var bit = 0; bit < cleared.length; bit += 1) {
+				var done = cleared[bit];
+				if (desktopPins[done] === true) continue;
+				if (byId[done] === undefined) {
+					delete pinnedApplied[done];
+					continue;
+				}
+				delete pinnedApplied[done];
+				try {
+					var drop = workspaces.unpinSession(done);
+					if (drop !== null && drop !== undefined && typeof drop.catch === 'function') {
+						drop.catch(function () { /* 取消失败无所谓 */ });
+					}
+				} catch (error) {
+					/* 取消失败无所谓 */
+				}
+			}
+		};
+
+
+		/**
+		 * 用户在手机上**主动取消**了某条电脑置顶 ⇒ 永久排除，不再自动加回。
+		 *
+		 * 没有它的话，「投影层合并」会让用户永远取消不掉电脑上置顶的会话：
+		 * 我们每次读快照都把它从 `desktopPins` 加回去。
+		 *
+		 * 生命周期：`adoptDesktopMeta` 里若该 id 已不在电脑的置顶表里
+		 * （说明电脑那边也取消了），就删掉这条记录 —— 之后电脑重新置顶可正常生效。
+		 */
+		var unpinnedByUser = {};
+
+		/**
+		 * 把「电脑上置顶」合并进 `workspaces.list` 的快照。
+		 *
+		 * ## 为什么不能只靠 `pinSession()` 这个 RPC（1.2.88 修）
+		 *
+		 * 上一版的思路是「会话在本地出现后，调官方 `workspaces.pinSession()`
+		 * 把置顶补上」。这条路有三个致命前提，**任何一个不成立就不显示**：
+		 *
+		 *   ① `sessionKnown()` 必须通过 —— 同步刚建的空壳要先被持久化索引看到，
+		 *      时序稍差就抛 `session/unknown`，而且十秒退避、无限重试；
+		 *   ② RPC 必须成功 —— 电脑离线、隧道抖动、并发抢占都会失败；
+		 *   ③ 快照必须变化 —— 订阅只在快照变化时跑，而 pin 是异步的，
+		 *      数据到位时快照往往没变（上一版为此加了 `pinRetryHooks` 打补丁）。
+		 *
+		 * 而置顶在界面上**只是个集合查询**：`deriveGroups` 拿
+		 * `new Set(snapshot.pinnedSessionIds)` 判断 `pinned`，然后
+		 * `sectionMembers()` 把置顶的行提到前面。也就是说**只要快照里那个数组
+		 * 里有这个 id，界面就置顶**，根本不需要 RPC 成功。
+		 *
+		 * 所以这里在**投影层**直接合并：电脑说置顶的 ∪ 本地已置顶的，
+		 * 减去用户明确取消的。RPC 那条路仍然保留（让本地 registry 一致、
+		 * 重启后不丢），但**显示不再依赖它**。
+		 *
+		 * ## 为什么原地改写 `getSnapshot`
+		 *
+		 * 与排序同一个理由：`dsh-client-ui-workspace/lib/client.js:5039`
+		 * `ctx.slots.provideRoot({ hooks: { workspaces: workspaces.list } })`
+		 * 按引用拷贝进 root binding，返回新对象界面看不到。
+		 *
+		 * ## 身份稳定
+		 *
+		 * 只合并 `pinnedSessionIds` 数组，其余字段原样；源快照与版本都没变时
+		 * 返回**同一个对象**（`useSyncExternalStore` 靠 `Object.is` 判断变化）。
+		 *
+		 * @param workspaces - 官方 `workspaces` 服务（读它的 `.list`）。
+		 * @param sessionsList - 已包装的 `sessions.list`（判「本地认不认识这条会话」）。
+		 * @returns 撤销函数。
+		 */
+		var wrapWorkspaceListPins = function (workspaces, sessionsList) {
+			if (workspaces === null || workspaces === undefined) return function () {};
+			var list = workspaces.list;
+			if (list === null || list === undefined || typeof list.getSnapshot !== 'function') {
+				return function () {};
+			}
+			if (list.__dshPinsWrapped === true) return function () {};
+			var inner = list.getSnapshot.bind(list);
+			var cachedSource;
+			var cachedToken;
+			var cachedValue;
+			try {
+				list.getSnapshot = function () {
+					var source = inner();
+					var token = metaVersion;
+					if (source === cachedSource && token === cachedToken) return cachedValue;
+					cachedSource = source;
+					cachedToken = token;
+					cachedValue = projectPinned(source, sessionsList);
+					return cachedValue;
+				};
+				list.__dshPinsWrapped = true;
+			} catch (error) {
+				void debugLog('原地替换 workspaces.list.getSnapshot 失败: ' + String(error && error.message ? error.message : error));
+				return function () {};
+			}
+			return function () {
+				try {
+					list.getSnapshot = inner;
+					delete list.__dshPinsWrapped;
+				} catch (error) {
+					/* 还原失败不影响主流程 */
+				}
+			};
+		};
+
+		/**
+		 * 拦 `workspaces.unpinSession` / `pinSession`，记「用户自己动过这条」。
+		 *
+		 * ## 为什么需要（不加就是「取消不掉」）
+		 *
+		 * `projectPinned` 每次读快照都从 `desktopPins` 把电脑置顶的会话加回来，
+		 * 于是用户在手机上点「取消置顶」后，下一次渲染又被加回去 ——
+		 * 他会觉得这个按钮坏了。
+		 *
+		 * 所以：用户取消过 ⇒ 记进 `unpinnedByUser`，投影层不再加；
+		 *       用户自己置顶过 ⇒ 清掉那条记录（他的意图变回来了）。
+		 *
+		 * 记录在 `adoptDesktopMeta` 里会按电脑侧的真实置顶表清理：
+		 * 电脑那边也已经取消的，这条记录就失去意义、直接删掉，
+		 * 于是电脑**重新**置顶时可以正常生效。
+		 *
+		 * ## 为什么改的是 `workspaces`（而不是 ctx.uiWorkspace）
+		 *
+		 * 官方 `pinSession` / `unpinSession` 的调用点在
+		 * `dsh-client-ui-workspace/lib/client.js` 的 `pinInjected()` 里，
+		 * 它们最终都落到 `ctx.workspaces.pinSession(...)`。
+		 * 拦这一层与「谁点按钮」无关，菜单、快捷键、命令都覆盖。
+		 *
+		 * @param workspaces - 官方 `workspaces` 服务。
+		 * @returns 撤销函数。
+		 */
+		var hookPinIntent = function (workspaces) {
+			if (workspaces === null || workspaces === undefined) return function () {};
+			if (workspaces.__dshPinIntentHooked === true) return function () {};
+			var undo = [];
+			var wrap = function (name, onCall) {
+				var original = workspaces[name];
+				if (typeof original !== 'function') return;
+				var patched = function (sessionId) {
+					try {
+						onCall(sessionId);
+					} catch (error) {
+						/* 记账失败不能挡住真正的 pin/unpin */
+					}
+					return original.apply(workspaces, arguments);
+				};
+				try {
+					workspaces[name] = patched;
+					undo.push(function () {
+						if (workspaces[name] === patched) workspaces[name] = original;
+					});
+				} catch (error) {
+					/* 不可写就放弃拦截，投影层仍按电脑侧的值工作 */
+				}
+			};
+			wrap('unpinSession', function (sessionId) {
+				if (typeof sessionId === 'string' && sessionId !== '') unpinnedByUser[sessionId] = true;
+			});
+			wrap('pinSession', function (sessionId) {
+				if (typeof sessionId === 'string' && sessionId !== '') delete unpinnedByUser[sessionId];
+			});
+			try {
+				workspaces.__dshPinIntentHooked = true;
+			} catch (error) {
+				/* 标记失败不影响功能 */
+			}
+			return function () {
+				for (var at = 0; at < undo.length; at += 1) {
+					try {
+						undo[at]();
+					} catch (error) {
+						/* 同上 */
+					}
+				}
+			};
+		};
+
+		/**
+		 * 把电脑置顶合并进一个 `workspaces` 快照。
+		 *
+		 * @param source - 官方原始快照。
+		 * @param sessionsList - 用于判断「会话在本地存在」。
+		 * @returns 合并后的快照；无需改动时**原样返回 source**（身份不变）。
+		 */
+		var projectPinned = function (source, sessionsList) {
+			if (source === null || typeof source !== 'object') return source;
+			var base = Array.isArray(source.pinnedSessionIds) ? source.pinnedSessionIds : null;
+			if (base === null) return source;
+			var wanted = Object.keys(desktopPins);
+			if (wanted.length === 0) return source;
+			/*
+			 * 只有「本地真的认识」的会话才合并。
+			 *
+			 * 不认识就加进去没有意义（界面按 `byId` 取行，取不到就不渲染），
+			 * 反而会让快照里混进幽灵 id。这条判断同时替代了上一版那个
+			 * 「`sessionKnown` 必须通过才能 pin」的脆弱前提。
+			 */
+			var byId;
+			try {
+				var snapshot = sessionsList === null || sessionsList === undefined
+					? undefined
+					: sessionsList.getSnapshot();
+				byId = snapshot === null || snapshot === undefined ? undefined : snapshot.byId;
+			} catch (error) {
+				byId = undefined;
+			}
+			if (byId === null || byId === undefined) return source;
+			var seen = {};
+			for (var bit = 0; bit < base.length; bit += 1) seen[base[bit]] = true;
+			var merged = base.slice();
+			var added = 0;
+			for (var at = 0; at < wanted.length; at += 1) {
+				var sessionId = wanted[at];
+				if (seen[sessionId] === true) continue;
+				if (unpinnedByUser[sessionId] === true) continue;
+				if (byId[sessionId] === undefined) continue;
+				merged.unshift(sessionId);
+				seen[sessionId] = true;
+				added += 1;
+			}
+			/*
+			 * 诊断：**界面实际会显示几条置顶** = 本地原有 + 被我们补进来的。
+			 *
+			 * ⚠️ 单独一个字段（`pinnedVisible`），不要复用 `clockDiag.pinned`：
+			 * 那个字段是「RPC pin 成功了几条」，自有另一个写入点
+			 *（`applyPinFromDesktop`）。两者语义不同，共用一个字段会互相覆盖，
+			 * 截图上的数字就看不出是哪条路在起作用了。
+			 */
+			clockDiag.pinnedVisible = merged.length;
+			if (added === 0) return source;
+			var next = {};
+			for (var key in source) {
+				if (Object.prototype.hasOwnProperty.call(source, key)) next[key] = source[key];
+			}
+			next.pinnedSessionIds = merged;
+			return next;
+		};
+
+		/**
 		 * 给官方那个**每会话共享**的 `ModelDirectory` 套一层「按工作区筛」的读路径。
 		 *
 		 * ## 为什么包装 `directoryFor` 而不是改前端 bundle
@@ -925,7 +2363,36 @@ window.__ModuleLoader__.load({
 				let cachedSource;
 				let cachedToken;
 				let cachedProjected;
+				/*
+				 * ## ⚠️⚠️ `bust()` —— 为什么还需要手动作废缓存（1.2.82 加）
+				 *
+				 * 缓存键是「源快照身份 + token」。`token` 只看
+				 * `isRemote()` 和 `sessionChoice`，**看不到目录数据本身**。
+				 * 正常情况下这就够了：目录一变，源快照对象就换了。
+				 *
+				 * 但官方 `catalog.refresh()` 是这么写的（`ModelCatalogDirectory`）：
+				 *
+				 *     refresh() { this.invalidate(); this.load().catch(() => {}); }
+				 *
+				 * `invalidate()` 只把 `status` 改成 idle、**value 保留旧值**；
+				 * 而 `load()` 是异步 RPC，且 `catch` 把错误全吃掉。所以：
+				 *
+				 *   · RPC 成功 ⇒ 源快照换了 ⇒ 缓存自然失效 ⇒ 正常；
+				 *   · RPC 失败 ⇒ status=error、value 仍是旧的 ⇒ 源快照
+				 *     **身份不变** ⇒ 命中缓存 ⇒ 界面一直显示旧模型列表，
+				 *     而且 **没有任何提示**。
+				 *
+				 * 预设那边为什么没这个问题？因为它有 `pullRosterIntoCache`
+				 * —— 直接 `bridge('mergedPresetList')` 拿数据写进缓存，**完全不依赖 RPC 成功**。
+				 * 模型一直没有这条腿，所以用户看到「预设刷新了、模型没刷新」。
+				 *
+				 * `bust()` 让调用方在「我知道数据已经变了」时强制重算一次，
+				 * 不得不靠源快照身份变化。它只清缓存、不改数据，
+				 * 所以调错了最坏也只是多算一次投影。
+				 */
+				const bust = function () { cachedSource = undefined; cachedToken = undefined; cachedProjected = undefined; };
 				return {
+					bust: bust,
 					getSnapshot: function () {
 						const source = store.getSnapshot();
 						const token = volatileToken === undefined ? '' : volatileToken();
@@ -943,6 +2410,65 @@ window.__ModuleLoader__.load({
 			};
 
 			const store = directory.store;
+			/*
+			 * ## ⚠️⚠️ 必须把 localGroups 的身份作为 token 传进去（1.2.67 修）
+			 *
+			 * `wrapStore` 的缓存 key 是「源快照身份 + token」。
+			 * 但投影函数还读了**一个不在 key 里的输入**：
+			 *
+			 *     pickWorkspaceGroups(snapshot, isRemote(), localGroupsOf(directory))
+			 *                                              ^^^^^^^^^^^^^^^^^^^^^^^
+			 *
+			 * 而 `localGroupsOf` 读的是 `directory.catalog.store`，
+			 * 与 `directory.store`（源快照那个）**是两层不同的存储**。
+			 *
+			 * 于是就有这么一条路：
+			 *
+			 *   ① 同步完成，`catalog.refresh()` 刷新了 catalog 层的
+			 *      `localGroups`（电脑上的模型目录进来了）；
+			 *   ② 但 `directory.store` 的快照对象**没换**（它只在输入变化时重建）；
+			 *   ③ 于是 `source === cachedSource` 成立 ⇒ **命中缓存**
+			 *      ⇒ 返回上一次的投影，里面还是旧的 localGroups。
+			 *
+			 * 用户看到的就是：**同步完成了，模型菜单还是旧的；
+			 * 重启 App 就好了**—— 重启把缓存丢了。这正是用户报的 ①。
+			 *
+			 * 修法：把 localGroups 的**数组身份**作为 token。它是 catalog 重建快照时
+			 * 换新数组的，所以身份变化就能触发重算。而它不变时
+			 * 仍然命中缓存 —— **React 需要的快照身份稳定性一点没丢**。
+			 *
+			 * 为什么不把它并进 snapshot？因为 snapshot 的身份必须保持不变（它是
+			 * `useSyncExternalStore` 的比较对象，见上面 React #185 那段）。token 是**另一个维度**，
+			 * 不参与对外曝露。
+			 */
+			const localGroupsToken = function () {
+				try {
+					const groups = localGroupsOf(directory);
+					/*
+					 * token = 数组身份 + 长度 + 每组的 id。
+					 *
+					 * 三项都要：
+					 *   · 身份：官方重建数组（最常见）时变化；
+					 *   · 长度：原地 push/pop 时变化；
+					 *   · id 串：原地替换元素（push 一个同时 pop 一个）时变化。
+					 *
+					 * 为什么不逐个比内容？因为这里只要判「变没变」。
+					 * 全量比内容的成本已经接近「干脆重算一次投影」，那就失去缓存的意义了。
+					 * id 串能抓住绝大多数真实变化，成本是 O(组数)。
+					 */
+					var sig = String(groups.length);
+					for (var gi = 0; gi < groups.length; gi += 1) {
+						var g = groups[gi];
+						sig += '|' + (g && g.id !== undefined ? String(g.id) : '?');
+						/* 每组里的模型数也参与 —— 官方注册新模型属于同一组内部变化 */
+						sig += ':' + ((g && Array.isArray(g.models)) ? g.models.length : 0);
+					}
+					return sig;
+				} catch (tokenError) {
+					/* 取不到就用固定值 —— 宁可不触发重算，也不能抛 */
+					return '';
+				}
+			};
 			wrapper.store = wrapStore(store, function (snapshot) {
 				// ⚠️ `directory.store` 那一层没有 `localGroups`（官方 `syncInputs`
 				// 只拷了 groups/failures），所以从 catalog 的原值里现取一份递进去。
@@ -984,7 +2510,27 @@ window.__ModuleLoader__.load({
 				return next;
 			// ⚠️ 缓存键必须带上「这个会话算不算远程」：同一个源快照在「切成远程会话」
 			// 前后要投影出**不同**结果，只看源快照身份会永远返回旧的那一份。
-			}, function () { return isRemote() === true ? 'remote:1' : 'remote:0'; });
+			//
+			// ## ⚠️⚠️ 还必须带上 localGroups 的签名（1.2.67 修）
+			//
+			// 投影函数里还读了一个**不在缓存 key 里的输入**：
+			//
+			//     pickWorkspaceGroups(snapshot, isRemote(), localGroupsOf(directory))
+			//                                              ^^^^^^^^^^^^^^^^^^^^^^^
+			//
+			// 而 `localGroupsOf` 读的是 `directory.catalog.store`，与这里的
+			// `directory.store`（源快照那个）**是两层不同的存储**。所以：
+			//
+			//   ① 同步完成，`catalog.refresh()` 刷新了 catalog 层的 localGroups；
+			//   ② 但 `directory.store` 的快照对象**没换**；
+			//   ③ `source === cachedSource` 成立 ⇒ 命中缓存 ⇒ 返回旧投影。
+			//
+			// 用户看到：**同步完成了，模型菜单还是旧的；重启 App 就好了**
+			// —— 重启把缓存丢了。正是用户报的 ①。
+			}, function () {
+				var token = isRemote() === true ? 'remote:1' : 'remote:0';
+				return token + '|lg:' + localGroupsToken();
+			});
 
 			// `load()` 返回的就是快照，`/model` 命令直接拿它渲染，所以也要筛。
 			wrapper.load = function () {
@@ -998,15 +2544,266 @@ window.__ModuleLoader__.load({
 				const catalogStore = catalog.store;
 				const catalogWrapper = Object.create(Object.getPrototypeOf(catalog));
 				Object.assign(catalogWrapper, catalog);
+				// ## ⚠️⚠️ 会话级选择的「最后已知值」（2026-10-28 修模型勾选错乱）
+				//
+				// 官方 `syncInputs()` 是这么定「当前选中」的
+				//（`dsh-client-ui-model-selection/lib/client.js:967`）：
+				//
+				//     const selection = projected.next ?? catalog.value.default;
+				//
+				// `projected.next` 来自**会话投影** `modelSelection`，而那个投影是
+				// 由会话历史里的 `model/selection` 事件派生的。远程会话在手机侧是
+				// 一个**镜像会话**，它的历史由电脑的事件流灌进来 —— 而用户手动选
+				// 模型这件事，电脑那边未必、也未必及时地产生一条可供镜像的
+				// `model/selection`。于是 `projected.next` 恒为 `undefined`，
+				// `current` 就**永远**退回 `catalog.value.default` —— 也就是电脑的
+				// **全局默认模型**（用户看到的「官方那个模型」）。
+				//
+				// 症状（用户原话）：
+				//   「收起的时候还是展开的时候，它一直是勾着官方的那个模型……
+				//    但实际发送消息用的又是我选的那个。」
+				// 完全对得上：**发消息走的是插件落盘的 `remoteModels`（对的），
+				// 而界面读的是 `current`（错的）**，两者各走各的。
+				//
+				// 修法：把「用户在这个会话里选过的模型」记下来，并在目录投影里
+				// 把它顶成 `default`。这样 `projected.next ?? default` 的**两个**
+				// 分支都会落到用户的选择上 —— 不管官方有没有拿到投影，收起/展开
+				// 都是同一个值，天然一致。选完立刻覆盖到所有会话目录，无需重载。
+				// ## ⚠️⚠️ 必须按 `sessionId` 取，不能用全局单例（1.2.88 修）
+				//
+				// 这段闭包本身就是**每个会话一个**（`directoryFor(sessionId)` 里建的），
+				// 所以按会话取值是天然正确的粒度。原来的 `modelChoiceBus.selection`
+				// 是全局一个，谁最后选谁覆盖 ⇒ 切到另一个会话时，
+				// 界面显示的是**上一个会话**的模型，而实际发送用的是这个会话的。
+				//
+				// 取值的优先级在 `modelChoiceBus.forSession` 里：
+				//   本会话最近一次选择 → 宿主落盘的真值 → null（退回电脑默认）
+				var remoteChoice = modelChoiceBus.forSession(sessionId);
+				var sessionChoice = remoteChoice; // 每次读时重算，见下面的 volatileToken
+
 				catalogWrapper.store = wrapStore(catalogStore, function (snapshot) {
+					var filtered = filterCatalogValue(snapshot.value, isRemote());
 					return Object.assign({}, snapshot, {
-						value: filterCatalogValue(snapshot.value, isRemote()),
+						value: preferSessionChoice(filtered, sessionChoice),
 					});
-				}, function () { return isRemote() === true ? 'remote:1' : 'remote:0'; });
+				}, function () {
+					// ⚠️ 缓存令牌必须带上「会话选择」：否则选了模型之后
+					// 源快照没变、令牌也没变 ⇒ `wrapStore` 直接返回上一份缓存
+					// ⇒ 界面纹丝不动（这正是「选了没反应」的另一种成因）。
+					//
+					// ⚠️ 而且**必须每次现取**：`sessionChoice` 是建包装那一刻的快照，
+					// 用户之后选了新模型，令牌不变就永远命中旧缓存。
+					sessionChoice = modelChoiceBus.forSession(sessionId);
+					var token = isRemote() === true ? 'remote:1' : 'remote:0';
+					return sessionChoice === null
+						? token
+						: token + '|' + sessionChoice.provider + '/' + sessionChoice.model;
+				});
+				/*
+				 * 把 `bust()` 交给模块级（1.2.82）。
+				 *
+				 * 会话目录（`wrapper.store`）和目录层（`catalogWrapper.store`）
+				 * **两处都有缓存**，只作废一个等于没作废。
+				 */
+				bustModelCatalogRef.value = function () {
+					try { if (wrapper.store && typeof wrapper.store.bust === 'function') wrapper.store.bust(); } catch (e) { /* ignore */ }
+					try { if (catalogWrapper.store && typeof catalogWrapper.store.bust === 'function') catalogWrapper.store.bust(); } catch (e) { /* ignore */ }
+				};
+
+				/**
+				 * 用「本会话的选择」顶掉目录里的 `default`。
+				 *
+				 * 只在那个选择**确实在列表里**时才顶：用户可能在换工作区后
+				 * 看不到原来的 provider（`pickWorkspaceGroups` 筛掉了），
+				 * 这时硬顶会显示一个列表里不存在的模型 —— 宁可退回默认。
+				 *
+				 * 不改 `groups`，只改 `default`：`groups` 决定菜单里能选什么，
+				 * 这里要影响的是「当前是哪个」。
+				 */
+				var preferSessionChoice = function (value, choice) {
+					if (value === null || value === undefined) return value;
+					if (choice === null || typeof choice.provider !== 'string' || typeof choice.model !== 'string') return value;
+					// ⚠️ **只作用于远程会话**。
+					//
+					// 这个 bug 的成因（远程会话在手机侧是镜像、投影里没有
+					// `model/selection`）在**本地会话上不存在**：本地会话的
+					// `selectModel` 会正常写下投影，`projected.next` 是好的。
+					// 若在这里无差别地顶 `default`，会把「最近一次在某个远程
+					// 会话里选过的模型」泄漏到本地会话的显示上 —— 从「永远是
+					// 官方模型」变成「永远是上次远程选的那个」，同样是错的。
+					if (isRemote() !== true) return value;
+					var groups = Array.isArray(value.groups) ? value.groups : [];
+					if (!isSelectable(groups, choice)) return value;
+					return Object.assign({}, value, {
+						default: { provider: choice.provider, model: choice.model },
+					});
+				};
+
+				/**
+				 * 收到「用户选了某个模型」时调用（由 selectModel 拦截器触发）。
+				 *
+				 * 记录了就直接让目录 store 重新广播，官方 `syncInputs` 会跟着
+				 * 重算 `current` ⇒ 卡片里的勾选、输入框的文案、aria-label
+				 * **三处同时**变对，不再需要去改 DOM 文本节点。
+				 */
+				wrapper.noteSessionChoice = function (selection) {
+					if (selection === null || selection === undefined) return;
+					if (typeof selection.provider !== 'string' || typeof selection.model !== 'string') return;
+					if (selection.provider === '' || selection.model === '') return;
+					// ⚠️ 现取，不能用闭包里那份快照：`modelChoiceBus` 已经按会话记，
+					// 而这个闭包属于某一个会话，两边是同一条记录的两次读。
+					var current = modelChoiceBus.forSession(sessionId);
+					if (current !== null
+						&& current.provider === selection.provider
+						&& current.model === selection.model) {
+						return;
+					}
+					sessionChoice = { provider: selection.provider, model: selection.model };
+					// ## ⚠️⚠️ 必须用 `update()` 而不是 `set()` 来触发重算
+					//
+					// 官方 `ModelDirectory` 是这样接到变化的
+					//（`dsh-client-ui-model-selection/lib/client.js:844`）：
+					//
+					//     this.unsubscribeCatalog = catalog.store.subscribe(() => {
+					//         this.syncInputs();
+					//     });
+					//
+					// 也就是说**订阅一被通知**，官方就会自己重算 `current`。
+					//
+					// 而 `set(value)` 是**整值替换**：我第一次写的是
+					// `catalogStore.set({...current})`，把 `getSnapshot()` 拿到的那份
+					//（已经被我们投影过的）对象原样写回去。两个问题：
+					//   ① 它覆盖掉了 store 的原始状态字段（`status`/`error` 等），
+					//      官方据此可能判成「未就绪」而走另一条分支；
+					//   ② 传的是同一个形状的对象，某些 store 实现会做等值判断后
+					//      **不通知订阅者** ⇒ `syncInputs` 根本不跑 ⇒ 选了没反应。
+					//      真机实测就是这个症状：底部按钮变了，卡片里的值还是旧的。
+					//
+					// `update(mutator)` 是官方自己 `load()`/`invalidate()` 用的写法，
+					// 走的是「就地改 + 通知」的正规路径。这里只碰一个**我们自己加的**
+					// 公开字段（`sessionChoiceHint`，官方不读），不篡改它的任何状态。
+					try {
+						catalogStore.update(function (draft) {
+							draft.sessionChoiceHint = sessionChoice;
+						});
+					} catch (bumpError) {
+						/* 触发失败不影响已记录的选择 */
+					}
+				};
+
+				// 让 selectModel 拦截器能通知到这里（并补发它此前记下的选择）。
+				modelChoiceBus.register(wrapper.noteSessionChoice);
 				wrapper.catalog = catalogWrapper;
 			}
 			return wrapper;
 		}
+
+		/**
+		 * 会话级模型选择的**中介**（2026-10-28）。
+		 *
+		 * 两个东西需要说话，但它们在文件的两处、各自是闭包：
+		 *   · `selectModel` 的 fetch 拦截器 —— 知道「用户刚选了哪个模型」；
+		 *   · `patchModelDirectories` 里的目录包装 —— 需要把这个选择顶成
+		 *     `catalog.default`，官方 `syncInputs()` 才会算出正确的 `current`。
+		 *
+		 * 用一个极小的模块级对象传话，比为这一个字段去重构两边的闭包稳得多
+		 *（那两段代码各自都背着几千字的踩坑注释，动结构风险远大于收益）。
+		 *
+		 * `notifier` 由目录包装在安装时注册；`selectModel` 拦截器直接调 `note()`。
+		 * 目录还没装好时 `note()` 只是记下来，等注册时补发 —— 不漏事件。
+		 */
+		/**
+		 * 宿主落盘的「每个会话实际会用哪个模型」（`remoteModels` 桥拉的）。
+		 *
+		 * ⚠️ 这是**权威值**：`prompt` 拦截器真正塞进 `body.model` 用的就是它
+		 * （见宿主 `remoteModels` 的注释）。界面必须读同一份，才能保证
+		 * 「显示的」与「实际用的」是同一个模型。
+		 */
+		var remoteModelsBySession = {};
+
+		var modelChoiceBus = { selection: null, bySession: {}, notifier: null,
+			note: function (selection, sessionId) {
+				if (selection === null || selection === undefined) return;
+				if (typeof selection.provider !== 'string' || typeof selection.model !== 'string') return;
+				if (selection.provider === '' || selection.model === '') return;
+				var choice = { provider: selection.provider, model: selection.model };
+				/*
+				 * ## ⚠️⚠️ 必须按会话记（1.2.88 修「显示与实际不一致」）
+				 *
+				 * 原来这里只存一个全局 `selection`，而**真正发送用的**是宿主那份
+				 * 按会话的 `remoteModels[sessionId]`。两份数据粒度不同，必然对不上：
+				 *
+				 *   在会话 A 选了 M1 → 全局记住 M1
+				 *   切到会话 B（电脑上是 M2）→ 界面显示 M1，实际发出去是 M2
+				 *
+				 * 用户报的「界面上的是一个模型、实际用的是另一个」就是这个。
+				 * 现在按会话记，界面查哪个会话就显示哪个会话的值。
+				 *
+				 * `selection` 保留为「最近一次」（没有 sessionId 的旧调用点仍可用）。
+				 */
+				modelChoiceBus.selection = choice;
+				if (typeof sessionId === 'string' && sessionId !== '') {
+					modelChoiceBus.bySession[sessionId] = choice;
+				}
+				if (typeof modelChoiceBus.notifier === 'function') {
+					try {
+						modelChoiceBus.notifier(choice, sessionId);
+					} catch (notifyError) {
+						/* 通知失败不影响拦截器主流程 */
+					}
+				}
+			},
+			/**
+			 * 查某个会话**实际会用**的模型。
+			 *
+			 * 优先级：本会话的最近一次选择 → 宿主落盘的 `remoteModels[sessionId]`
+			 * →（都没有）null，交给官方退回电脑目录的默认值。
+			 *
+			 * @param sessionId - 会话 id。
+			 * @returns `{provider, model}` 或 null。
+			 */
+			forSession: function (sessionId) {
+				if (typeof sessionId !== 'string' || sessionId === '') return null;
+				var choice = modelChoiceBus.bySession[sessionId];
+				if (choice !== undefined) return choice;
+				var persisted = remoteModelsBySession[sessionId];
+				if (persisted !== undefined
+					&& typeof persisted.provider === 'string' && persisted.provider !== ''
+					&& typeof persisted.model === 'string' && persisted.model !== '') {
+					return { provider: persisted.provider, model: persisted.model };
+				}
+				return null;
+			},
+			/**
+			 * 用宿主落盘的真值表**整体覆盖**本地记忆。
+			 *
+			 * 启动时拉一次（`remoteModels` 桥）。这样「重启 App 后界面退回电脑
+			 * 默认模型」也不复存在 —— 落盘里有值，界面就照样显示对的那个。
+			 */
+			adoptPersisted: function (models) {
+				if (models === null || typeof models !== 'object') return;
+				remoteModelsBySession = models;
+				modelChoiceBus.bySession = {};
+				var keys = Object.keys(models);
+				for (var at = 0; at < keys.length; at += 1) {
+					var value = models[keys[at]];
+					if (value === null || typeof value !== 'object') continue;
+					if (typeof value.provider !== 'string' || value.provider === '') continue;
+					if (typeof value.model !== 'string' || value.model === '') continue;
+					modelChoiceBus.bySession[keys[at]] = { provider: value.provider, model: value.model };
+				}
+			},
+			register: function (notifier) {
+				modelChoiceBus.notifier = notifier;
+				// 补发：拦截器可能比目录包装先跑（用户在目录还没建好时就点了模型）。
+				if (typeof notifier === 'function' && modelChoiceBus.selection !== null) {
+					try {
+						notifier(modelChoiceBus.selection, undefined);
+					} catch (replayError) {
+						/* 同上 */
+					}
+				}
+			} };
 
 		/**
 		 * 把「按工作区筛模型目录」接到官方服务上。
@@ -1273,40 +3070,77 @@ window.__ModuleLoader__.load({
 				var sessionId = currentSessionId();
 				var path = workspacePathOfCurrent(sessionId);
 				if (typeof path === 'string' && path !== '') {
-					var slug = mirrorSlugOf(path);
-					if (slug !== undefined && mirrorSlugs[slug] === true) return true;
 					/**
-					 * ⚠️ **`mirrorSlugs` 是异步拉来的快照，刚启动时可能是空的。**
+					 * 判据收敛到 `isMirrorPath()`（1.2.85）。
 					 *
-					 * 那时上面的精确匹配会落空，若不在这里兜住，电脑工作区会被
-					 * 误判成手机工作区（预设/模型列表「用错了那一套」）。
+					 * 这段原来自己写了一遍「slug 精确匹配 + 路径形态兜底」，
+					 * 而 `isRemoteSession`（**模型**走的那条）只有前半段 ——
+					 * 两份答案不一致，就是用户报了十几个版本的
+					 * 「预设同步了、模型列表没同步」。详见 `isMirrorPath` 的长注释。
 					 *
-					 * 兜底判据用路径形态：电脑镜像工作区由宿主
-					 * `ensureDesktopWorkspace()` 统一建在
-					 * `<DSH_HOME>/remote/workspaces/<slug>/` 下
-					 * （`DSH_HOME` 默认是 `~/.dsh`，所以完整形态是
-					 * `.../.dsh/remote/workspaces/<slug>`），
-					 * 所以**路径里带 `/remote/workspaces/` 就是镜像工作区**，
-					 * 与 slug 集合是否已加载无关。
-					 *
-					 * ⚠️ 别把它写成 `dsh-remote/workspaces/` —— 那是**状态目录**的名字
-					 * （`<DSH_HOME>/dsh-remote/`，放 `mobile.json` / `sessions.json`），
-					 * 不是镜像工作区所在的 `remote/workspaces/`。两者只差一个 `dsh-` 前缀，
-					 * 写错就是「电脑工作区被判成手机」，实测踩过。
-					 *
-					 * 反过来，只要路径读到了、且不带这个片段，就是**手机本地工作区** ——
-					 * 直接定论返回 false，这正是用户要的那个开关
-					 * （「检测到是手机的，你就给我换回手机那一套呗」）。
+					 * 现在两边共用同一个函数，**不可能再漂**。
 					 */
-					if (
-						path.indexOf('remote/workspaces/') !== -1 ||
-						path.indexOf('remote\\workspaces\\') !== -1
-					) {
+					return isMirrorPath(path);
+				}
+				/*
+				 * ## 新建对话时：用「刚选中的工作区」兜底（2026-10-29 修 bug）
+				 *
+				 * 用户报障：「我在主界面就可以直接选择你已经同步的某个工作区来
+				 * 进行新建对话，然后我发现如果我直接选择某个已存在的工作区的话，
+				 * 你电脑的那些预设呀还有模型列表都没办法刷新显示出来」。
+				 *
+				 * 根因就在这两行原来直接 `return false`：
+				 *   · 新建对话**还没有 sessionId** ⇒ `workspacePathOfCurrent` 拿不到
+				 *     路径（它靠 `item.sessionIds.indexOf(sessionId)` 反查）；
+				 *   · 于是落到这里，`sessionId === undefined` ⇒ 判成"手机本地"
+				 *     ⇒ 预设和模型都用了手机那一套。
+				 *
+				 * `currentPendingWorkspace()` 正是为这个场景准备的（见
+				 * `isRemoteSession` 里第 2 条判据的注释）：它记录用户在新建界面
+				 * **刚选中的工作区路径**，不依赖会话是否已建立。
+				 */
+				var pendingPath = currentPendingWorkspace();
+				if (typeof pendingPath === 'string' && pendingPath !== '') {
+					/*
+					 * 同一个 `isMirrorPath()`。拿到明确的本地路径就**直接定论**，
+					 * 不再往下猜（下面的 DOM 探测只在完全没有路径线索时才用）。
+					 */
+					return isMirrorPath(pendingPath);
+				}
+				/*
+				 * ## 没有 sessionId 时**也要问 `cwdOf`**（2026-10-29 修 bug）
+				 *
+				 * 原来这里是 `if (sessionId === undefined) return false;` —— 新建对话
+				 * 界面天然没有 sessionId，于是永远直接判"本地"。
+				 *
+				 * 但 `cwdOf(undefined)` 并**不一定**拿不到东西：它的退路链里有
+				 * 「按当前界面选中工作区的 `workspaceId` 直查」
+				 *（`workspacePathOf(ctx, row.workspaceId)`），那条判据不依赖会话
+				 * 是否已建出来。这正是用户报障的场景：
+				 * 「我在主界面就可以直接选择你已经同步的某个工作区来进行新建对话，
+				 *   然后我发现如果我直接选择某个已存在的工作区的话，你电脑的那些
+				 *   预设呀还有模型列表都没办法刷新显示出来」。
+				 *
+				 * 所以这里改成：先让 `cwdOf` 试一次（它内部有完整的退路链），
+				 * 真拿不到才判本地。
+				 */
+				if (sessionId === undefined) {
+					/*
+					 * 新建对话页：没有会话，`cwdOf(undefined)` 在 `makeCwdOf` 第一行就会
+					 * 返回（那儿有 `typeof sessionId !== 'string'` 的守卫），所以那条路
+					 * 根本走不到退路链。真正的信号在**界面上的工作区选择器**里 ——
+					 * 见 `probeHeroWorkspaceDesktopPath` 的长注释。
+					 */
+					var heroPath = probeHeroWorkspaceDesktopPath();
+					if (typeof heroPath === 'string' && heroPath !== '') {
+						/*
+						 * 探测函数只在与镜像清单**精确命中**时才返回路径，
+						 * 所以拿到非空值就可以直接定论为电脑工作区。
+						 */
 						return true;
 					}
 					return false;
 				}
-				if (sessionId === undefined) return false;
 				return isRemoteSession(sessionId, cwdOf);
 			};
 
@@ -1556,6 +3390,37 @@ window.__ModuleLoader__.load({
 						wanted = null;
 					}
 
+					// ## ⚠️⚠️ 先把选择告诉目录层（2026-10-28 修「勾选永远是官方模型」）
+					//
+					// 这一步是**根因修复**，`paintModelLabelSoon` 只是它生效前的
+					// 视觉兜底，两者分工不同：
+					//
+					//   · `modelChoiceBus.note(...)` ⇒ 目录把该选择顶成 `default`
+					//     ⇒ 官方 `syncInputs()` 重算 `current` ⇒ 卡片勾选、输入框
+					//     文案、aria-label **三处一起**变对，且**收起/展开同一个值**。
+					//   · `paintModelLabelSoon(...)` ⇒ 在官方那一帧 React 渲染完成前，
+					//     先把按钮文字改成新模型，掩盖跨公网的那 2–3 秒延迟。
+					//
+					// 只做后者（旧代码就是这样）会得到一个**分裂的界面**：按钮上
+					// 写着用户选的 `glm-5.3-flash`，卡片里却写着
+					// `DeepSeek-V4.1-Flash` —— 因为按钮文字是改 DOM 改出来的，
+					// 而卡片读的是 React 状态。真机截图已确认过这个分裂。
+					if (wanted !== null) {
+						try {
+							/*
+							 * ⚠️ 必须带 `sessionId`：选择要记到**这个会话**名下。
+							 * 不带的话又退回全局单例 —— 切会话就显示错，
+							 * 正是本轮要修的「显示的与实际用的不一致」。
+							 */
+							modelChoiceBus.note(
+								{ provider: wanted.provider, model: wanted.model },
+								typeof wanted.sessionId === 'string' ? wanted.sessionId : undefined,
+							);
+						} catch (noteError) {
+							/* 记录失败不影响乐观响应 */
+						}
+					}
+
 					var label = wanted === null ? null : prettyModelLabel(wanted);
 					var stopGuard = label === null ? null : paintModelLabelSoon(label);
 
@@ -1703,6 +3568,36 @@ window.__ModuleLoader__.load({
 				return model;
 			};
 
+			/*
+			 * ## ⚠️ 高分辨率时钟必须先判存在（1.2.62 新增）
+			 *
+			 * `performance` 和 `requestAnimationFrame` 一样，是**渲染引擎提供的**，
+			 * 不是语言内建。而它在下面这段里是裸调的：
+			 *
+			 *     var paintStartedAt = performance.now();   // 在 try 之外
+			 *
+			 * 一旦缺失，`paintModelLabelSoon()` 一进来就抛
+			 * ReferenceError ⇒ 模型标签守护整个失效（丢 rAF 那次同样的类型）。
+			 *
+			 * 而它只用来**计算一个诊断耗时**：计不了就不计，
+			 * 绝不能因为诊断不了而不干活。所以逐级降级：
+			 *   performance.now() → Date.now() → 0
+			 *
+			 * 放在模块级：避免每次调 paintModelLabelSoon 都重建一个函数。
+			 */
+			var nowMs = function () {
+				try {
+					if (typeof performance !== 'undefined' && performance !== null
+							&& typeof performance.now === 'function') {
+						return performance.now();
+					}
+				} catch (perfError) { /* 退到 Date.now */ }
+				try {
+					if (typeof Date !== 'undefined' && typeof Date.now === 'function') return Date.now();
+				} catch (dateError) { /* 下面返回 0 */ }
+				return 0;
+			};
+			
 			/**
 			 * 把模型按钮的文案改成 `label`，并短时守护（官方重渲染会覆盖）。
 			 *
@@ -1711,6 +3606,29 @@ window.__ModuleLoader__.load({
 			var paintModelLabelSoon = function (label) {
 				var stopped = false;
 				var apply = function () {
+					if (stopped) return;
+					/*
+					 * ## ⚠️⚠️ 120ms 定时器必须整体兜底（1.2.56 修）
+					 *
+					 * 这个函数**每 120 毫秒**跑一次，而 `findModelTextNode()` 里
+					 * 用了 `document.createTreeWalker(button, NodeFilter.SHOW_TEXT, ...)`
+					 * 和 `button.getAttribute()`，都是裸调用。
+					 *
+					 * 只要有一个 button 处于异常状态（正在被 React 卸载、或者
+					 * `NodeFilter` 在某个内核上缺失），异常就会穿出定时器 ——
+					 * 每 120ms 抛一次，一秒 8 次，把控制台刷满、还拖慢主线程。
+					 * 用户感受到的是「界面一卡一卡的」，却查不到原因。
+					 *
+					 * 所以整段包 try、只吞不抛。模型标签画不上不影响任何功能，
+					 * 但绝不能让它变成持续掉帧的源头。
+					 */
+					try {
+						applyOnce();
+					} catch (paintError) {
+						/* 单个按钮异常不影响其它；吞掉，避免 120ms 连环抛 */
+					}
+				};
+				var applyOnce = function () {
 					if (stopped) return;
 					var buttons = document.querySelectorAll('button[aria-label]');
 					for (var index = 0; index < buttons.length; index++) {
@@ -1731,7 +3649,7 @@ window.__ModuleLoader__.load({
 									at: Date.now(),
 									from: before,
 									to: label,
-									elapsedMs: Math.round(performance.now() - paintStartedAt),
+									elapsedMs: Math.round(nowMs() - paintStartedAt),
 								};
 							} catch (paintLogError) {
 								/* 留痕失败不影响主流程 */
@@ -1739,7 +3657,8 @@ window.__ModuleLoader__.load({
 						}
 					}
 				};
-				var paintStartedAt = performance.now();
+				/* 耗时基准点（nowMs 已在模块级定义，见上）1.2.62）*/
+				var paintStartedAt = nowMs();
 				apply();
 				var timer = setInterval(apply, 120);
 				return function () {
@@ -1873,6 +3792,18 @@ window.__ModuleLoader__.load({
 					 * 判据必须严：拿不到 rpcId 就不许走缓存分支，老老实实发请求。
 					 */
 					var requestRpcId = null;
+					/*
+					 * ## 顺便从请求体里挖出「这次请求属于哪个工作区」
+					 *
+					 * 这是判定"该显示电脑预设还是手机预设"的**最可靠依据**
+					 * （见 `workspaceIdIsDesktopMirror` 的长注释）。
+					 *
+					 * ⚠️ 三态：`true` 电脑 / `false` 非电脑 / `null` 判断不了。
+					 * `null` 时必须退回原来的 `currentIsRemote()`，
+					 * **不能**把"判断不了"当成"不是电脑"—— 那会让已有的同步会话
+					 * （它们本来靠 sessionId 判得很准）全部退化。
+					 */
+					var requestIsDesktopMirror = null;
 					try {
 						var rawBody = init ? init.body : null;
 						if (typeof rawBody === 'string') {
@@ -1886,13 +3817,25 @@ window.__ModuleLoader__.load({
 							) {
 								requestRpcId = parsedBody.rpcId;
 							}
+							// 不论 rpcId 合不合规都试着判工作区（判据独立）。
+							requestIsDesktopMirror = workspaceIdIsDesktopMirror(parsedBody);
 						}
 					} catch (bodyParseError) {
 						requestRpcId = null;
+						requestIsDesktopMirror = null;
 					}
 					if (rosterCache !== null && requestRpcId !== null) {
 						try {
-							var cachedIsRemote = currentIsRemote();
+							/*
+							 * ⚠️ 三态判据优先（`requestIsDesktopMirror`）：
+							 * 请求体里带了 workspaceId 且能对上镜像清单时，直接采信 ——
+							 * 这比 `currentIsRemote()` 准得多（后者在新建对话页
+							 * 根本没有可用的信号，见 `workspaceIdIsDesktopMirror`）。
+							 * 判断不了（null）才退回原逻辑，保持旧行为。
+							 */
+							var cachedIsRemote = requestIsDesktopMirror === null
+								? currentIsRemote()
+								: requestIsDesktopMirror;
 							var cachedValue = pickWorkspacePresets(rosterCache, cachedIsRemote);
 							try {
 								window.__dshRemoteDiag = {
@@ -1977,7 +3920,10 @@ window.__ModuleLoader__.load({
 								} catch (cacheWriteError) {
 									/* 缓存写不进去只影响速度，不影响正确性 */
 								}
-								var isRemoteNow = currentIsRemote();
+								// 同上：三态判据优先，判断不了才退回 `currentIsRemote()`。
+								var isRemoteNow = requestIsDesktopMirror === null
+									? currentIsRemote()
+									: requestIsDesktopMirror;
 								var picked = pickWorkspacePresets(result.value, isRemoteNow);
 								try {
 									window.__dshRemoteDiag = {
@@ -2124,7 +4070,90 @@ window.__ModuleLoader__.load({
 				return undefined;
 			};
 
+			/*
+			 * ## 取回「预设 chip 的 face」本体（1.2.68 新增）
+			 *
+			 * `resolveSeatLoad` 只返回 `face.load` 函数，拿不到 store。
+			 * 而我们现在要判「这一次 load 到底成不成功」，
+			 * 就必须能读到 face 上的 store 状态。
+			 *
+			 * 和 `resolveSeatLoad` 完全同构（同一个 slot、同一套兜底），
+			 * 只是多拿了一层。拿不到就返回 undefined，绝不抛。
+			 */
+			var resolveSeatFace = function () {
+				try {
+					var slots = ctx.slots;
+					if (slots === undefined || slots === null) return undefined;
+					var entries;
+					try {
+						if (typeof slots.entriesOfSlot === 'function') entries = slots.entriesOfSlot(SEAT_SLOT);
+					} catch (entriesError) {
+						entries = undefined;
+					}
+					if (!Array.isArray(entries) || entries.length === 0) {
+						try {
+							if (typeof slots.entries === 'function') entries = slots.entries(SEAT_SLOT);
+						} catch (fallbackError) {
+							entries = undefined;
+						}
+					}
+					if (!Array.isArray(entries)) return undefined;
+					for (var at = 0; at < entries.length; at += 1) {
+						var entry = entries[at];
+						if (!entry || typeof entry.inject !== 'function') continue;
+						var face;
+						try {
+							face = entry.inject(undefined, undefined);
+						} catch (injectError) {
+							continue;
+						}
+						if (face && typeof face.load === 'function') return face;
+					}
+					return undefined;
+				} catch (outerError) {
+					return undefined;
+				}
+			};
+			
+			/*
+			 * 判「这一次 load 是不是真拿到了新数据」。
+			 *
+			 * 官方把结果写进 store，且带一个 `status`。
+			 * 但 `status` 的取值集合可能变，所以用**多重判据**：
+			 *
+			 *   ① 拿不到 face/store ⇒ 判不了，**当成功**（宁可不重试，
+			 *      也不能因为判不了就无限重试）；
+			 *   ② 有 status 且是 'error' ⇒ 失败；
+			 *   ③ 有 status 且是 'loaded'/'ready' ⇒ 成功；
+			 *   ④ 其余 ⇒ 看能不能拿到非空的 value，拿到就算成功。
+			 */
+			var rosterLooksFresh = function () {
+				try {
+					var face = resolveSeatFace();
+					if (!face) return true;
+					var store = face.store;
+					if (!store || typeof store.getSnapshot !== 'function') return true;
+					var snap = store.getSnapshot();
+					if (!snap || typeof snap !== 'object') return true;
+					var status = snap.status;
+					if (typeof status === 'string') {
+						if (status === 'error') return false;
+						if (status === 'loaded' || status === 'ready' || status === 'idle') return true;
+					}
+					/* 没有可信 status ⇒ 看能不能拿到 value */
+					var value = snap.value;
+					if (value === undefined || value === null) return false;
+					if (Array.isArray(value)) return true;
+					if (typeof value === 'object') return true;
+					return false;
+				} catch (probeError) {
+					/* 判不了就当成功 —— 宁可少重试，不能死循环 */
+					return true;
+				}
+			};
+			
 			var noop = function () {};
+
 
 
 			/**
@@ -2178,6 +4207,313 @@ window.__ModuleLoader__.load({
 					/* 刷新失败只影响这一个菜单，绝不能外抛 */
 				}
 			};
+
+			/*
+			 * ## ⚠️⚠️ 强制刷新（绕过「远程性变化」判断）—— 2026-10-29 修热更新
+			 *
+			 * ## 用户报障
+			 *
+			 * 「模型与预设还是没热更新」。上一轮我以为把
+			 * `rosterCache` 置空就够了，但**置空只能让「下一次**请求走网络」
+			 * 而同步完成后根本**不会发生下一次请求**。
+			 *
+			 * ## 为什么只置空不够（这是真正的根因）
+			 *
+			 * 官方 `seat.load()`（预设 chip 的数据源）只在
+			 * 两种时机重跑：
+			 *
+			 *   · `settings/document-updated` —— 用户改设置；
+			 *   · `connection/reset`        —— 连接重置。
+			 *
+			 * **同步完成不属于任何一种**，所以它不会重跑。
+			 *
+			 * 而本文件的 `flushRemoteChange` 又有一道门：
+			 *
+			 *     if (now === lastRemote) return;   // 远程性没变就不刷
+			 *
+			 * 同步前后都是「电脑工作区」⇒ 远程性没变 ⇒ 直接 return
+			 * ⇒ 预设菜单永远停在旧的那份，**只能重启 App**。
+			 * 这与用户描述逐字吻合（「重启之后就马上能显示出来了」）。
+			 *
+			 * ## 做法
+			 *
+			 * 提供一个**无条件**重跑 `load()` 的函数，不看远程性是否变化。
+			 * 同步完成、配对成功、用户手动刷新这三个时机调它。
+			 *
+			 * ⚠️ 必须先把 `lastRemote` **置为一个不可能的值**？不行 ——
+			 * 那会让下一次真实变化被当成「已处理」。
+			 * 直接调 `load()`，不碰 `lastRemote`。
+			 */
+			/*
+			 * ## ⚠️⚠️ 为什么必须重试，且必须**等上一次完成**再重试
+			 *
+			 * ### 为什么重试
+			 *
+			 * `resolveSeatLoad()` 依赖官方把预设 chip 注册进 slot。而「同步完成」
+			 * 与「chip 已注册」是**两个独立时机**：
+			 *
+			 *   · 用户在新建对话页 → chip 通常已注册；
+			 *   · 用户边用边同步、或刚切过工作区 → chip 可能正在重建，
+			 *     此刻 `resolveSeatLoad()` 返回 `undefined`。
+			 *
+			 * 单次调用遇到 `undefined` 就**永远丢了**这次刷新，用户感受与没修一样。
+			 *
+			 * ### ⚠️ 为什么不能「直接连续调 load()」
+			 *
+			 * 查官方源码（`dsh-client-ui-agent-preset/lib/client.js`）：
+			 *
+			 *     load() {
+			 *       return this.loading ??= this.readRoster().finally(...);
+			 *     }
+			 *
+			 * `this.loading ??=` —— 上一次还没完成时，**再调一次拿到的是同一个
+			 * Promise，一个字节都不会重新请求**。
+			 *
+			 * 所以「每 300ms 调一次 load()」那种重试是**假的**：5 次调用里有 4 次
+			 * 只是在等同一个 Promise。必须等它 settle 之后再决定要不要再来一次。
+			 *
+			 * ### 现在的做法
+			 *
+			 * 每一轮：拿到 `load` → 调用 → **等这个 Promise settle** → 再等一小段
+			 * 让 UI 消化 → 检查分叉。总计约 5 秒，覆盖 chip 重建窗口。
+			 *
+			 * ⚠️ 用代次号做互斥：用户连点两次同步时，旧的那轮整条链立刻作废，
+			 * 不会出现两轮互相覆盖。
+			 */
+			var forceRefreshGeneration = 0;
+			/*
+			 * ## ⚠️⚠️ 重试窗口必须够长（1.2.68 调）
+			 *
+			 * 原来是 [0, 300, 800, 1500, 2500]，总时长 5.1 秒。
+			 * 真机上很可能不够：
+			 *
+			 *   · 同步完成后还要写入、触发重渲染、chip 才可能重新就绪；
+			 *   · 一次隧道往返就可能 1–2 秒（手机网络 + 电脑响应）；
+			 *   · 隧道抖动时一次失败就要多等一个间隔。
+			 *
+			 * 5.1 秒内若没成功，就**永久放弃**，用户只能重启 App。
+			 * 而用户明确说过：「通的话你就多等一会嘛」。
+			 *
+			 * 现在拉到约 20 秒。代价很小：
+			 *   · 成功就立刻收手（下面 onSettled 里跳出），不会多打隧道；
+			 *   · 失败才会多试几次，而失败时本来就没别的路。
+			 *
+			 * 并且每次重试都要先看一眼 store 状态（`rosterLooksFresh`），
+			 * 已经好了就不再请求 —— 所以「等得久」不等于「打得多」。
+			 */
+			var forceRefreshRetryDelays = [0, 300, 800, 1500, 2500, 4000, 5000, 6000];
+
+			var forceRefreshPresets = function () {
+				forceRefreshGeneration += 1;
+				var myGeneration = forceRefreshGeneration;
+				var round = 0;
+
+				var scheduleNext = function () {
+					round += 1;
+					if (round >= forceRefreshRetryDelays.length) return;
+					try {
+						var timer = setTimeout(runRound, forceRefreshRetryDelays[round]);
+						if (timer && typeof timer.unref === 'function') timer.unref();
+					} catch (timerError) {
+						/* 定时器都排不上就放弃这一轮 */
+					}
+				};
+
+				var runRound = function () {
+					// 有更新的一轮开始了 ⇒ 这一轮作废
+					if (myGeneration !== forceRefreshGeneration) return;
+					var load;
+					try {
+						load = resolveSeatLoad();
+					} catch (error) {
+						load = undefined;
+					}
+					if (typeof load !== 'function') {
+						// chip 还没注册 ⇒ 按递增间隔再来一次
+						scheduleNext();
+						return;
+					}
+					var result;
+					try {
+						result = load();
+					} catch (loadError) {
+						scheduleNext();
+						return;
+					}
+					/*
+					 * ⚠️ 关键差异：**等这一次 load 真的结束**，再判断要不要重试。
+					 *
+					 * 不等的话撞上 `this.loading ??=` 去重，重试全是空转。
+					 *
+					 * ⚠️ 成功就**立刻收手**，不再多打隧道：
+					 *   · 官方 `load()` 内部把错误吞进 store（`set({status:'error'})`），
+					 *     所以我们无法从 Promise 判断成败，只能看它是否 reject；
+					 *   · 但「成功」的判据其实是 `resolveSeatLoad()` 拿到了函数、
+					 *     且 `load()` 没抛 —— 那说明这一次刷新**已经生效**。
+					 *
+					 * 再多试几次只会重复请求同一份 roster，白白增加隧道往返，
+					 * 而且每次 `set()` 都可能让菜单重渲染一次（用户看到闪）。
+					 */
+					/*
+					 * ## ⚠️⚠️ 不能「拿到 Promise 就当成功」（1.2.68 修）
+					 *
+					 * 原来写的是：
+					 *
+					 *     if (result && typeof result.then === 'function') {
+					 *         result.then(noop, noop);
+					 *         return;              // ⇐ 拿到 Promise 就当成功了
+					 *     }
+					 *
+					 * 但 `seat.load()` 是 async：返回 Promise 只意味着「开始跑了」，
+					 * **不等于跑成功了**。它可能：
+					 *
+					 *   · 回合内网络失败（隧道正好抖动）；
+					 *   · 内部 `try/catch` 把错误吞进 store（`set({status:'error'})`）
+					 *     —— 这种情况下 Promise **不 reject**，但数据没更新；
+					 *   · 还没跑完就被下一次抢先了（`this.loading ??=` 去重）。
+					 *
+					 * 于是就有一条很坑的路：
+					 *
+					 *   同步完成 ⇒ 第 1 次 load() 发网络请求
+					 *   ⇒ 网络抖了一下，内部把错误吞了
+					 *   ⇒ 我们因为「拿到 Promise」就收手，不再重试
+					 *   ⇒ 菜单永远是旧的，直到**重启 App**。
+					 *
+					 * 这正是用户报的「重启 App 就恢复」。
+					 *
+					 * 正确做法：**等 Promise 落定**，然后看 store 里的状态。
+					 * 只有确实拿到了新数据才收手，否则继续重试。
+					 * 这样「网络抖一下」就能自愈，而不用用户去重启。
+					 */
+					if (result && typeof result.then === 'function') {
+						var settled = false;
+						var onSettled = function (ok) {
+							if (settled) return;
+							settled = true;
+							/* 这一轮已经作废（有更新的一轮开始了）⇒ 不再接管 */
+							if (myGeneration !== forceRefreshGeneration) return;
+							if (ok) return;
+							/* 失败 ⇒ 按递增间隔再来一次 */
+							scheduleNext();
+						};
+						result.then(
+							function () {
+								onSettled(rosterLooksFresh());
+							},
+							function () {
+								onSettled(false);
+							},
+						);
+						return;
+					}
+					/*
+					 * 同步返回（非 Promise）：说明 `load()` 是同步实现，
+					 * 那这一次也已经生效，同样收手。
+					 */
+					return;
+				};
+
+				runRound();
+				return true;
+			};
+			// 导出到模块级，供 `runAutoSync`（模块级函数）调用。
+			forceRefreshPresetsRef.value = forceRefreshPresets;
+
+			/**
+			 * **主动把宿主的新 roster 拉回来写进缓存**（与 `seat.load()` 完全解耦）。
+			 *
+			 * ## 为什么不能只靠 `forceRefreshPresets`
+			 *
+			 * 那条路依赖官方 `seat.load()`。我连着改了四版（1.2.32/33/35/36）
+			 * 都在围绕它打转，但始终没有一个**不依赖它**的保证。
+			 *
+			 * 这个方法绕开所有中间环节：
+			 *
+			 *   `bridge('mergedPresetList')` → 宿主 `mergePresets` 合并好的 roster
+			 *   → 直接赋给 `rosterCache`
+			 *
+			 * 补上之后，「缓存里是旧数据」这种状态**在技术上不可能再长期存在**：
+			 * 同步完成的那一刻我们就把它换掉了。
+			 *
+			 * ## ⚠️ 为什么先置 null 再写
+			 *
+			 * 不是多此一举：`rosterCache` 的类型是「服务端响应里的 `result.value`」。
+			 * 万一 `bridge` 拉回来的形状不对（老版本宿主没有 `presets` 字段），
+			 * 写进去反而会让下次读取拿到废数据。所以先校验形状，不合格就不动，
+			 * 保持 `null` 让下次请求走网络 —— 那正是我们想要的降级。
+			 *
+			 * ## ⚠️ 为什么不 await
+			 *
+			 * 这个方法由 `runAutoSync` 的成功回调调用，**不能拖慢同步完成的反馈**。
+			 * 它自己跑在后台，失败也只是"缓存没提前换掉"，不影响同步结果。
+			 */
+			/*
+			 * ## 真机可见的诊断（2026-10-29 补）
+			 *
+			 * 用户明确说过：「把错误原因显示在 App 界面里，我看一张截图就知道」
+			 * —— 真机上 `console.log` 和 `window.__dshRemoteDiag` 都看不到
+			 * （App 是 release、不可调试，adbd 也进不去私有目录）。
+			 *
+			 * 所以这里把**实际拉到的数量**记下来，由同步完成提示直接显示。
+			 * 用户截一张图就能回答那个我一直没法确定的问题：
+			 *
+			 *   · 「0 个预设」 ⇒ 宿主的 `mergedPresetList` 返回了空，
+			 *      问题在电脑侧或隧道，跟前端缓存无关；
+			 *   · 「5 个预设」 ⇒ 数据确实到手了，问题在前端渲染/读取那一步。
+			 *
+			 * 这两个方向的查法完全不同，而这一个数字就能分开它们。
+			 *
+			 * ⚠️ `syncDiagRef` 定义在**模块级**（见文件上方）——渲染浮层的函数
+			 * 也在模块级，看不见这里的局部变量。这正是本文件反复踩的闭包坑。
+			 */
+			var pullRosterIntoCache = function () {
+				try {
+					bridge('mergedPresetList', {}).then(
+						function (value) {
+							try {
+								if (value === null || value === undefined) {
+									syncDiagRef.value = { presets: -1, reason: '桥返回空' };
+									return;
+								}
+								if (typeof value !== 'object') {
+									syncDiagRef.value = { presets: -1, reason: '桥返回非对象' };
+									return;
+								}
+								if (!Array.isArray(value.presets)) {
+									syncDiagRef.value = { presets: -1, reason: '没有 presets 字段' };
+									return;
+								}
+								/*
+								 * 形状合格 ⇒ 直接换掉缓存。
+								 *
+								 * ⚠️ 这里不判 `desktop` 标记：`mergePresets` 一定会打，
+								 * 万一没打（老宿主），`pickWorkspacePresets` 有
+								 * 「没标记就原样返回」的保护，不会把菜单搞空。
+								 */
+								rosterCache = value;
+								syncDiagRef.value = {
+									presets: value.presets.length,
+									desktopCount: value.presets.filter(function (p) {
+										return p && p.desktop === true;
+									}).length,
+									reason: '',
+								};
+							} catch (writeError) {
+								syncDiagRef.value = { presets: -1, reason: '处理时异常' };
+							}
+						},
+						function (error) {
+							syncDiagRef.value = {
+								presets: -1,
+								reason: String((error && error.message) || error).slice(0, 40),
+							};
+						},
+					);
+				} catch (error) {
+					syncDiagRef.value = { presets: -1, reason: 'bridge 调不了' };
+				}
+			};
+			pullRosterIntoCacheRef.value = pullRosterIntoCache;
 
 			var scheduleRemoteCheck = function () {
 				try {
@@ -2471,6 +4807,29 @@ window.__ModuleLoader__.load({
 		 * @returns 结果的 Promise。
 		 */
 		function bridge(method, params) {
+			/*
+			 * ## ⚠️⚠️ `fetch` 必须先判存在（1.2.59 修）
+			 *
+			 * 这是**所有桥调用的唯一入口**（`syncProgress` / `autoSyncDesktop` /
+			 * `mergedPresetList` / `modelCatalog` 全走它）。
+			 *
+			 * `fetch` 不是语言内建，是 WebView 提供的宿主 API。
+			 * 而「它存在」这件事我们从来没检查过 —— 直接裸调。
+			 *
+			 * 一旦它缺失，这里抛的是 **ReferenceError**，不是普通异常：
+			 *
+			 *   · 它发生在 `fetch(...)` 那一刻，**在 Promise 链建立之前**，
+			 *     所以调用方 .catch() 完全接不住；
+			 *   · 而所有桥调用都是异步路径，抛在里面的 ReferenceError
+			 *     会变成 unhandled rejection 或者直接冒到上层。
+			 *
+			 * 正确做法：**返回一个 rejected Promise**，让调用方原有的
+			 * .catch / then(onErr) 照常工作 —— 语义上和网络失败一致，
+			 * 上层不需要任何改动。
+			 */
+			if (typeof fetch !== 'function') {
+				return Promise.reject(new Error('当前内核没有 fetch，无法连接本地桥'));
+			}
 			return fetch(ROUTE_RPC, {
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
@@ -2565,6 +4924,14 @@ window.__ModuleLoader__.load({
 			var markRemote = props.markRemote;
 			/** 重拉一次镜像工作区 slug 集合（新建镜像工作区之后必须调）。 */
 			var refreshMirrorSlugs = props.refreshMirrorSlugs;
+			/**
+			 * 重拉电脑侧展示元数据（真实活动时间 + 置顶标记）。
+			 *
+			 * 同步完成后必须调 —— 那时宿主刚记好这批会话的时间和置顶，
+			 * 不调的话侧边栏顺序仍是「同步顺序」、置顶也不同步
+			 *（用户 2026-10-29 的两个报障）。
+			 */
+			var refreshDesktopMeta = props.refreshDesktopMeta;
 			/** 解绑后把所有会话退回「本地」。 */
 			var clearRemote = props.clearRemote;
 
@@ -2604,6 +4971,26 @@ window.__ModuleLoader__.load({
 				refreshNote: null,
 			});
 			var pairState = pairPair[0];
+
+			/*
+			 * 把配对状态同步给模块级的 `pairedRef`。
+			 *
+			 * ⚠️ **必须在这里同步，不能在 `apply()` 里**：`pairState` 是本组件
+			 *（`RemoteDirectoryFlow`）作用域的变量，`apply()` 是另一个函数，
+			 * 那里根本访问不到它。
+			 *
+			 * 用途：模块级的在线探测（`probeDesktopOnline`）需要在未配对时
+			 * 直接跳过，避免每秒打一次必然 401 的请求。
+			 */
+			react.useEffect(
+				function () {
+					pairedRef.current = pairState !== null && pairState.paired === true;
+					return function () {
+						pairedRef.current = false;
+					};
+				},
+				[pairState === null ? false : pairState.paired],
+			);
 			var setPairState = pairPair[1];
 
 			var patchPair = react.useCallback(function (next) {
@@ -2679,6 +5066,22 @@ window.__ModuleLoader__.load({
 			 * 的注释）：最坏是回到「要点一下刷新按钮」的旧行为，不会报错。
 			 */
 			var reloadModelCatalog = function () {
+				/*
+				 * ⚠️ 先无条件作废我们自己那层缓存（1.2.82）。
+				 *
+				 * 官方 `catalog.refresh()` 内部是 `invalidate()` + `load().catch(() => {})`。
+				 * RPC 一旦失败，它不会通知任何人，而源快照
+				 * 身份不变 ⇒ 我们的 `wrapStore` 会命中缓存 ⇒ 界面永远旧数据。
+				 *
+				 * 先 bust 再 refresh：下一次读快照时无论源快照有没有换，
+				 * 都会重算一次投影 —— 至少能反映出 status/error 的变化。
+				 */
+				try {
+					var bustFn = bustModelCatalogRef.value;
+					if (typeof bustFn === 'function') bustFn();
+				} catch (bustError) {
+					/* 作废失败不影响后面的 refresh */
+				}
 				try {
 					var models = props.modelDirectories;
 					if (models && models.catalog && typeof models.catalog.refresh === 'function') {
@@ -2688,6 +5091,24 @@ window.__ModuleLoader__.load({
 					/* 服务结构变了就只更新宿主缓存，不打扰用户 */
 				}
 			};
+			/*
+			 * 把它承接给模块级，供 `runAutoSync`（模块级函数）在同步完成后调（1.2.69）。
+			 *
+			 * ⚠️ 不能让 `runAutoSync` 直接调 `reloadModelCatalog()`：
+			 * 它是组件内的局部函数，模块级函数看不见 ——
+			 * 就是 `invalidateDesktopCache is not defined` / `mergePresets` /
+			 * `refreshOfficialModelCatalog` 那个反复踩的闭包坑。必须走 ref。
+			 */
+			reloadFrontendModelCatalogRef.value = reloadModelCatalog;	
+			/*
+			 * 同一个理由（模块级 `runAutoSync` 看不见 `apply()` 闭包）：
+			 * 把「重拉电脑侧元数据」也经 ref 承接出去。
+			 *
+			 * 这是本文件第 N 次踩同一个坑（`pendingPlans` / `desktopCache` /
+			 * `desktopCatalog` / `invalidateDesktopCache` / `mergePresets`），
+			 * 所以直接按既有模式走 ref，不留"也许能访问到"的侥幸。
+			 */
+			refreshDesktopMetaRef.value = refreshDesktopMeta;
 
 			// 每次打开都回到「手机」页签，避免上次停在电脑目录造成困惑。
 			react.useEffect(
@@ -2706,6 +5127,21 @@ window.__ModuleLoader__.load({
 						function (result) {
 							if (!aliveRef.current) return;
 							patchPair({ endpoint: result.endpoint, paired: result.paired === true });
+							/*
+							 * 已配对 ⇒ 打开侧边栏时补跑一次自动同步。
+							 *
+							 * 为什么需要这条：`runAutoSync('pair')` 只在**本次**配对成功时
+							 * 触发。老用户升级插件后已经配对过了，不会再走配对回调，
+							 * 于是他们永远看不到"打开就有全部工作区"的效果。
+							 *
+							 * `autoSyncDesktop` 是**幂等**的（已同步过的只补账本、不重建），
+							 * 但为了不白跑一趟网络，加一个"本次启动已跑过"的内存标记，
+							 * 避免用户反复开合侧边栏时重复请求。
+							 */
+							if (result.paired === true && !autoSyncTriedRef.current) {
+								autoSyncTriedRef.current = true;
+								runAutoSync('startup');
+							}
 						},
 						function () {
 							/* 查不到就不显示那一条，用户仍然可以输码 */
@@ -2743,10 +5179,25 @@ window.__ModuleLoader__.load({
 						}
 					}
 					patch({ loading: true, error: null });
-					var load =
-						tab === 'desktop'
+					/*
+					 * ## ⚠️⚠️ 整个加载必须包在 try 里（1.2.80 修）
+					 *
+					 * 只要下面这一行**同步抛错**，`patch({loading:true})` 已经执行了，
+					 * 而 `load.then(…, …)` 连**挂都没挂上** ⇒ `loading` 永远是 true
+					 * ⇒ 界面**永远「加载中…」**。用户截图里的手机页签就是这个状态。
+					 *
+					 * 所以这里不能只改写法，必须**保证任何路径都把 loading 放下来**：
+					 * 抛错就当失败处理，把原因显示到界面上 —— 用户说过「把错误原因
+					 * 显示在 App 界面里，我看一张截图就知道」。
+					 */
+					var load;
+					try {
+						load = tab === 'desktop'
 							? bridge('listDesktop', path === null ? {} : { path: path })
-							: Promise.resolve(listDirectory(path === null ? undefined : path));
+							: Promise.resolve().then(function () { return listDirectory(path === null ? undefined : path); });
+					} catch (startError) {
+						load = Promise.reject(startError);
+					}
 					load.then(
 						function (listing) {
 							if (!aliveRef.current) return;
@@ -2843,6 +5294,23 @@ window.__ModuleLoader__.load({
 						// 是另一份（slug 由电脑路径哈希得来，同名不同机 slug 不同）。
 						// 不重拉的话，新电脑的镜像工作区会被判成「本地」—— 又是那个 bug。
 						if (refreshMirrorSlugs !== undefined) refreshMirrorSlugs();
+						/*
+						 * ⚠️ **配对成功 ⇒ 立刻自动同步全部工作区与对话名**。
+						 *
+						 * 这是本轮改造的核心（用户诉求 2026-10-28）：
+						 * 「用户配对成功之后……打开侧边栏就可以直接看到电脑的所有工作区
+						 *   以及对话历史了」，不再需要手动点「⋯ → 同步对话」。
+						 *
+						 * 放在 `refreshMirrorSlugs()` **之后**：自动同步过程中会
+						 * 新建镜像工作区，而那些工作区的 slug 必须已经在
+						 * `refreshMirrorSlugs` 的集合里，否则侧边栏会把它们当成
+						 * 本地工作区。虽然 `runAutoSync` 完成后自己也会再刷一次，
+						 * 但先刷一次能让建工作区那一刻就判对。
+						 *
+						 * 不 await：配对 UI 该立刻变成"已配对"，同步在后台跑，
+						 * 进度由 `autoSyncStateRef` 驱动动画（见 `mountSyncProgress`）。
+						 */
+						runAutoSync('pair');
 					},
 					function (reason) {
 						if (!aliveRef.current) return;
@@ -3049,6 +5517,19 @@ window.__ModuleLoader__.load({
 							{ style: CSS.pairWho },
 							'还没配对。请在电脑的「设置 → 手机远程」里生成 6 位配对码，填在这里。',
 						),
+				/*
+				 * 版本号（1.2.72 新增）。
+				 *
+				 * ## 为什么要显示在界面上
+				 *
+				 * 这个插件一轮一轮修了很多次，每次都要问「你装的是哪个版本」。
+				 * 靠猜只会浪费一次调试 —— 用户明确说过调试成本很大。
+				 * 写在配对条上，一张截图就能对上版本。
+				 *
+				 * 取不到就不显示 —— 不能因为展示版本号影响主流程。
+				 */
+				versionTag(),
+				sidebarDiagTag(),
 				pairState.paired === true
 					? unpairControls()
 					: h(Input, {
@@ -3180,6 +5661,21 @@ window.__ModuleLoader__.load({
 							// 而消息其实要发到电脑上，用户看到的是「选的模型没生效」。
 							// （`settleLocal` 里也有同一步，这条路径跳过了它，所以补在这里。）
 							if (refreshMirrorSlugs !== undefined) refreshMirrorSlugs();
+							/*
+							 * ## ⚠️⚠️ 模型目录也必须重拉（1.2.84 修）
+							 *
+							 * 用户反馈：「选择电脑的某个已存在工作区时，
+							 * 预设列表刷新过来了，**模型列表没刷新**」。
+							 *
+							 * 预设为什么没事：它走的是本地缓存 + 官方 roster 推送，
+							 * 不经 RPC。而模型目录是「上一次查询结果」的**永久缓存**，
+							 * 只有 `reloadModelCatalog()` 会把它作废。
+							 *
+							 * 配对成功那条路径已经调了（见上方那段注释），
+							 * 但「选一个**已存在**的电脑工作区」走的是这一支，
+							 * 而这一支**漏了** ⇒ 模型菜单显示的还是手机那套模型。
+							 */
+							try { reloadModelCatalog(); } catch (reloadCatalogError) { /* 不阻断选目录 */ }
 							onPicked(result.cwd);
 							return;
 						}
@@ -3250,6 +5746,8 @@ window.__ModuleLoader__.load({
 				// 镜像工作区，`workspaceMap` 可能**刚多出一条**。前端那份集合是快照，
 				// 不重拉的话这个工作区在侧边栏里点进去仍被判成「本地」。
 				if (refreshMirrorSlugs !== undefined) refreshMirrorSlugs();
+				/* 同 `openDesktop`：换了工作区就要重拉模型目录 */
+				try { reloadModelCatalog(); } catch (reloadCatalogError2) { /* 不阻断登记 */ }
 				var local = registerLocal === undefined
 					? Promise.resolve()
 					: Promise.resolve(registerLocal(result.sessionId, result.cwd)).then(null, function () {
@@ -3395,11 +5893,27 @@ window.__ModuleLoader__.load({
 									: h(
 											'div',
 											{ style: CSS.status },
+											/*
+											 * ⚠️ **加载失败时不能说"这里没有子文件夹"**（2026-10-29 修）
+											 *
+											 * 用户截图里同时出现了：
+											 *   · 「这里没有子文件夹」
+											 *   · 「电脑没有响应（15 秒超时）…」
+											 *
+											 * 前者是一句**断言**，会让用户以为"电脑上那个目录真的是空的"，
+											 * 于是去电脑上翻半天，而真相只是请求超时了。
+											 * 这是"文案与事实不符"造成的额外排查成本。
+											 *
+											 * 现在把 `state.error` 也算进来：有错就明说"没能读到"，
+											 * 不再假装目录是空的。
+											 */
 											state.tab === 'desktop' && pairState.paired !== true
 												? '配对后这里会显示电脑上的文件夹'
-												: hiddenCount > 0
-													? '这里只有 ' + hiddenCount + ' 个以 . 开头的隐藏文件夹'
-													: '这里没有子文件夹',
+												: state.error !== null && state.error !== undefined
+													? '没能读出这个目录的内容（见上方提示）'
+													: hiddenCount > 0
+														? '这里只有 ' + hiddenCount + ' 个以 . 开头的隐藏文件夹'
+														: '这里没有子文件夹',
 										),
 							),
 					state.error !== null ? h('div', { style: CSS.error, role: 'alert' }, state.error) : null,
@@ -3496,6 +6010,2518 @@ window.__ModuleLoader__.load({
 				},
 			);
 		};
+
+		//#region 配对后自动同步（含真实进度）
+
+		/**
+		 * 首次配对后自动把电脑上的全部工作区 + 对话名同步过来。
+		 *
+		 * ## 用户需求（2026-10-28）
+		 *
+		 * 「用户配对成功之后，电脑就主动把它 GUI 里面当前已存在的所有工作区的
+		 *   工作区名称以及所有的对话的对话名称一起发送过来……用户配对成功了之后
+		 *   打开侧边栏就可以直接看到电脑的所有工作区以及对话历史了。」
+		 *
+		 * ## 为什么以前没生效
+		 *
+		 * 后端 `autoSyncDesktop` 早就写好了（幂等、只传元数据、历史按需拉），
+		 * 但**前端从来没有调用过它** —— 用户只能在工作区行上手动点
+		 * 「⋯ → 同步对话」逐条勾选。这里补上「配对成功 ⇒ 自动跑一次」。
+		 *
+		 * ## 进度怎么来（用户明确要求真实进度）
+		 *
+		 * 「一定要有真实的进度提示，而不是那种假的循环动画，那样用户就会以为
+		 *   是卡死了。」
+		 *
+		 * 所以同步期间高频轮询 `syncProgress` 桥（纯内存读，零网络）拿
+		 * `done/total`，画真实进度条。分母来自电脑返回的对话条数。
+		 */
+		var autoSyncStateRef = { value: null };
+
+		/**
+		 * 「当前页面还活着吗」的标记（模块级）。
+		 *
+		 * ⚠️ **不能用组件里的 `aliveRef`**：`runAutoSync` / `mountSyncProgress`
+		 * 都是模块级函数，作用域里看不到 `apply()` → 组件内部的 `aliveRef`
+		 * （它在第 2834 行、组件作用域里）。引用它就是 `ReferenceError`，
+		 * 而且是在回调里抛，表现为"同步永远停在统计中"。
+		 *
+		 * 这个模块级标记由 `apply()` 在挂载/卸载时切换。
+		 */
+		var autoSyncAlive = { current: true };
+
+		/**
+		 * 本次 App 启动是否已经尝试过自动同步（避免反复开合侧边栏重复请求）。
+		 *
+		 * 只在内存里，不持久化：每次冷启动重新判断一次是合理的 ——
+		 * 用户可能在上次之后又在电脑上新建了对话，值得再问一次。
+		 */
+		var autoSyncTriedRef = { current: false };
+
+		/**
+		 * 跑一次自动同步，并把进度写进 `autoSyncStateRef`。
+		 *
+		 * @param reason 触发原因，仅用于日志。
+		 * @returns Promise，永远 resolve（失败已内部记进 state）。
+		 */
+		var runAutoSync = function (reason) {
+			// 防重入：正在跑就不再起一轮（配对回调 + 启动钩子可能同时触发）。
+			var current = autoSyncStateRef.value;
+			if (current && (current.phase === 'running' || current.phase === 'estimating')) {
+				return Promise.resolve();
+			}
+
+			/*
+			 * ## ⚠️⚠️ 预设侧的诊断也要清（1.2.64 修）
+			 *
+			 * `syncDiagRef` 自 1.2.4x 引入以来 **从来没被重置过** ——
+			 * 修之前全文件**只有写入、没有清零**。
+			 *
+			 * 后果和 1.2.54 修的 modelRefresh 残留完全同类：
+			 *
+			 *   第一轮：pullRosterIntoCache 失败，写入
+			 *          { presets:-1, reason:'连不上电脑' }
+			 *   第二轮：开始时不清 ⇒ 界面仍显示上一轮的错误
+			 *          直到新一轮的 bridge 回来才被覆盖。
+			 *          而 bridge 是异步的，中间那段时间全是假的。
+			 *
+			 * 更糟的情形：神机反复进入后台 / 恢复，漏了一次
+			 * pullRoster 调用 ⇒ 错误信息无限期挂在那里，永远不消。
+			 *
+			 * 所以在轮次起点就清成 null —— 「本轮还没取到」是诚实的状态，
+			 * 渲染处对 null 不显示任何预设提示（见下面的 diag 分支）。
+			 */
+			try {
+				syncDiagRef.value = null;
+			} catch (diagResetError) {
+				/* 清不了也不能影响同步启动 */
+			}
+
+			autoSyncStateRef.value = {
+				phase: 'estimating',
+				done: 0,
+				total: 0,
+				workspaces: 0,
+				bytes: 0,
+				message: '',
+				/*
+				 * ⚠️ **必须重置成 null**（1.2.54）。
+				 *
+				 * 这是新一轮同步的**起点**。不重置的话，上一轮留下的
+				 * modelRefresh=false 会一直带到这里 ⇒ 本轮才刚开始
+				 * （phase 还是 estimating）就显示「模型列表未刷新」，
+				 * 纯属误报。
+				 *
+				 * 这与 1.2.47 修的 message 残留、1.2.53 宿主侧的重置是
+				 * 同一类错误：状态对象换轮不清理，旧值冒充新结果。
+				 */
+				modelRefresh: null,
+				/* 与 modelRefresh 成对：失败时的具体原因（1.2.63） */
+				modelRefreshReason: '',
+			};
+			
+			
+
+			/*
+			 * 轮询进度。250ms 一次：
+			 *   · 太快 → 大量无意义的桥往返（虽然零网络，但也是 fetch 开销）；
+			 *   · 太慢 → 进度条一跳一跳，观感差。
+			 * 250ms 在"顺滑"和"省开销"之间。
+			 */
+			var pollTimer = null;
+			var stopPoll = function () {
+				if (pollTimer !== null) {
+					clearInterval(pollTimer);
+					pollTimer = null;
+				}
+			};
+			/**
+			 * `tick` 的正体（由外层统一兜底，见上）。
+			 *
+			 * @param p - 宿主 `syncProgress` 的返回。
+			 */
+			var tickOnce = function (p) {
+				var prev = autoSyncStateRef.value || {};
+				// 只往前推进：done 不回退，否则进度条会来回跳。
+				/*
+				 * ⚠️ `message` **不能**沿用 `prev`（1.2.47 修）
+				 *
+				 * 原来是 `p.message || prev.message || ''`。
+				 * `||` 会让**旧的错误消息一直粘着**：
+				 *
+				 *   1. 中途失败一次（宿主持有 `phase='failed'` +
+				 *      message='连不上电脑'）；
+				 *   2. 用户重试 / 宿主自己恢复，这次成功
+				 *      （`phase='done'`，宿主把 message 清成 `''`）；
+				 *   3. `'' || '连不上电脑'` ⇒ 取到**旧错误**
+				 *      ⇒ 状态里挂着一条早已不成立的错误。
+				 *
+				 * 虽然标题只看 `phase`（所以还会显示「同步完成」），
+				 * 但这个残留 message 会在别处被当作失败原因展示，
+				 * 用户就会看到「说完成了，又写着连不上电脑」这种自相矛盾。
+				 *
+				 * 正确语义：**message 属于当前 phase**。
+				 *   · phase 变了 ⇒ 取宿主这一次的 message（哪怕为空）；
+				 *   · phase 没变 ⇒ 才沿用上次（宿主可能只更新了进度没重写 message）。
+				 */
+				var nextPhase = p.phase || prev.phase || 'running';
+				var nextMessage;
+				if (nextPhase !== prev.phase) {
+					// 阶段切换：以宿主这次的为准，空就是空。
+					nextMessage = typeof p.message === 'string' ? p.message : '';
+				} else {
+					nextMessage = (typeof p.message === 'string' && p.message !== '')
+						? p.message
+						: (typeof prev.message === 'string' ? prev.message : '');
+				}
+					/*
+					 * 先算出「最终生效的成功标志」，两个字段共用（1.2.65）。
+					 *
+					 * 它们必须同命：一个说成功、另一个挂着失败原因，
+					 * 界面就自相矛盾。所以在对象外算一次，对象里只用结果。
+					 *
+					 * ⚠️ 这里的 nextModelRefresh 不同于 p.modelRefresh：
+					 *     p.modelRefresh = null（宿主本次没说）
+					 *     prev.modelRefresh = true（上次已成功）
+					 *     ⇒ nextModelRefresh = true
+					 * 下面若去判 p.modelRefresh 就会错过 —— 最终状态是「成功」，
+					 * 却因宿主顺带了一句原因而把原因保留下来。
+					 * 这正是穷举 256 种组合时扫出的 12 例违规。
+					 */
+					var nextModelRefresh = (typeof p.modelRefresh === 'boolean')
+						? p.modelRefresh
+						: (typeof prev.modelRefresh === 'boolean' ? prev.modelRefresh : null);
+					
+				var next = {
+					phase: nextPhase,
+					done: Math.max(prev.done || 0, p.done || 0),
+					total: p.total || prev.total || 0,
+					workspaces: p.workspaces || prev.workspaces || 0,
+					bytes: p.bytes || prev.bytes || 0,
+					message: nextMessage,
+				/*
+				 * ⚠️ **必须搬运**（1.2.53）。
+				 *
+				 * 这个对象是新建的、只挑字段复制。少写一个字段，宿主那边
+				 * 报上来的值就在这一层被静默丢掉 —— 和 1.2.52 修的
+				 * `message` 被 then 回调覆盖是同一类错误：
+				 * 中间层不搬运 = 后端说了前端永远收不到。
+				 */
+					modelRefresh: nextModelRefresh,
+					/*
+					 * 三步归一，保证两个字段**永远同命**：
+					 *
+					 *   ① 宿主说已经刷新成功了 ⇒ 原因归零
+					 *      （成功时原因无意义，而且可能是上一轮残留）
+					 *   ② 宿主本次发了原因（哪怕空串）⇒ 用宿主的
+					 *   ③ 其余（宿主没发字段，也没说成功）⇒ 沿用上次
+					 *
+					 * ⚠️ **① 必须排在②前面**（1.2.65 穷举测出的边界）。
+					 *
+					 * 若先看宿主发了什么、再看成功标志，就会漏掉一种自相矛盾的输入：
+					 *
+					 *     { modelRefresh: true, modelRefreshReason: '无 refresh 方法' }
+					 *
+					 * 即「说成功、又带着失败原因」。这种输入宿主不应该发，
+					 * 但**它可能发**（并发写入、版本不匹配、字段残留……）。
+					 *
+					 * 上层一旦把它原样存下来，界面就会出现
+					 * 「同步完成 · 模型未刷新：无 refresh 方法」这种自相矛盾的句子。
+					 *
+					 * 正确做法：**让布尔字段做唯一事实源**。它说成功，
+					 * 原因就归零；不管宿主顺带了什么。宁可丢掉一条
+					 * 矛盾的原因，也不能把矛盾显示给用户。
+					 */
+					modelRefreshReason: (nextModelRefresh === true)
+						? ''
+						: (typeof p.modelRefreshReason === 'string')
+							? p.modelRefreshReason
+							: (typeof prev.modelRefreshReason === 'string' ? prev.modelRefreshReason : ''),
+				};
+				autoSyncStateRef.value = next;
+				if (next.phase === 'done' || next.phase === 'failed') stopPoll();
+			};
+
+			var tick = function () {
+				/*
+				 * ## ⚠️⚠️ then 的成功回调也要兜底（1.2.56 修）
+				 *
+				 * `.then(onOk, onErr)` 里的 `onErr` **只接上游 Promise 的拒绝**，
+				 * 接不住 `onOk` 自己抛出的异常 —— 那会变成 unhandled rejection。
+				 *
+				 * 这个 tick 每 250ms 一次，即一秒 4 次。onOk 里要读
+				 * `autoSyncStateRef.value`、逐字段比对、写回状态，任何一处意外
+				 * 都会在 250ms 后**重演**。
+				 *
+				 * 后果：unhandled rejection 以每秒 4 条的速度堆积，部分内核
+				 * 会记进 error 事件并拖慢页面；而进度浮层看起来「就是不更新」，
+				 * 没有任何线索。
+				 *
+				 * 所以把正体抽成 tickOnce，外面包 try。
+				 */
+				bridge('syncProgress', {}).then(
+					function (p) {
+						if (!autoSyncAlive.current || !p) return;
+						try {
+							tickOnce(p);
+						} catch (tickError) {
+							/* 吞掉：单次进度更新失败不应变成 unhandled rejection */
+						}
+					},
+					function () {
+						/* 轮询失败静默：不影响真正的同步（它走另一条 fetch） */
+					},
+				);
+			};
+			/*
+			 * ## ⚠️⚠️ 启动前先把旧定时器停掉（1.2.78 修）
+			 *
+			 * `pollTimer` 是**单个变量**。而 `runAutoSync` 有三个入口：
+			 *
+			 *     'startup'  打开侧边栏时（受 `autoSyncTriedRef` 防重）
+			 *     'pair'     配对成功时（**完全无守卫**）
+			 *     'dirty:..' 定时 ping 发现变更（受 `syncBusyRef` 防重）
+			 *
+			 * `autoSyncTriedRef` 只管「本次启动已跑过」，`syncBusyRef` 只管 dirty 那条。
+			 * 于是这个组合是真实可达的：
+			 *
+			 *     用户打开侧边栏 ⇒ startup 开跑（pollTimer = A）
+			 *     此时配对成功   ⇒ pair 又进来（pollTimer = B，**A 被覆盖**）
+			 *
+			 * A 的句柄丢了 ⇒ `stopPoll()` 只能停掉 B ⇒
+			 * **A 每 250ms 打一次 bridge 调用，直到页面重载**。
+			 * 用户感受到的就是「同步完了还是卡」、手机发热。
+			 *
+			 * 先停再启：保证任何时候都只有**一个** 进度轮询在跑。
+			 */
+			stopPoll();
+			pollTimer = setInterval(tick, 250);
+			tick();
+
+			return bridge('autoSyncDesktop', { limit: 50 }).then(
+				function (result) {
+					stopPoll();
+					if (!autoSyncAlive.current) return;
+					var created = (result && result.created) || [];
+					var wsCount = (result && result.workspaces) || 0;
+					logAutoSync(reason, created.length, wsCount);
+					var prev = autoSyncStateRef.value || {};
+					// 同步跑完，放开占用（见 `syncBusyRef` 的注释）。
+					syncBusyRef.current = false;
+					/*
+					 * ## 同步完成 ⇒ 让预设 roster 缓存失效（2026-10-29 修 bug）
+					 *
+					 * 用户报障：「我手动点击添加工作区来选择一个文件夹的话，模型列表可以
+					 * 刷新过来显示电脑上面的列表了，但是预设列表的话还是没有同步过来。
+					 * 然后我退出 APP 重启之后，预设列表也同步过来了。」
+					 *
+					 * 根因：`rosterCache` 只在**第一次**拿到 `agentPresets/list` 响应时写入，
+					 * 之后同样的请求直接本地合成、一个字节都不上网（那是为了切工作区
+					 * 不闪烁而做的优化）。而它原本只在 `settings/document-updated`
+					 * 时才失效 —— 那个事件只有用户**改设置**才触发，
+					 * **同步完成不会触发它**。
+					 *
+					 * 于是：刚同步完的那批电脑预设进不了缓存 ⇒ 界面还是旧的那份
+					 * ⇒ 只能重启（重启后缓存为空，重新拉一次就对了）。
+					 * 这与用户描述的现象完全吻合。
+					 *
+					 * 置空之后，下一次官方请求 `agentPresets/list` 会走真实网络，
+					 * 拿到宿主刚合并好的新 roster（含电脑预设）。
+					 */
+					rosterCache = null;
+					/*
+					 * ## ⚠️⚠️ 仅仅置空缓存是**不够**的（2026-10-29 修）
+					 *
+					 * 上一轮我只写了 `rosterCache = null`，以为这就能让菜单刷新。
+					 * 但那只能让「**下一次**请求」走网络 —— 而同步完成后
+					 * **根本不会发生下一次请求**：
+					 *
+					 *   · 官方 `seat.load()` 只在 `settings/document-updated` 与
+					 *     `connection/reset` 重跑，同步完成不属于两者；
+					 *   · `flushRemoteChange` 又有 `if (now === lastRemote) return`。
+					 *
+					 * 同步前后都是「电脑工作区」⇒ 远程性没变 ⇒ 不刷。
+					 * 结果就是用户看到的「模型与预设还是没热更新」。
+					 *
+					 * ## 两条腿走路（1.2.37 补第二条）
+					 *
+					 * 第一条：叫官方 `seat.load()` 重跑（`forceRefreshPresets`）。
+					 *   它能让**界面**重新渲染，但依赖两个前提：chip 已注册、
+					 *   且官方那次 `load()` 真的拿到新数据。任一不成立就没效果。
+					 *
+					 * 第二条（这条是**兜底**）：我们自己经 `bridge('mergedPresetList')`
+					 *   把宿主刚合并好的 roster 拉回来，**直接写进 `rosterCache`**。
+					 *
+					 *   这样做的好处是它与官方 `load()` 完全解耦：
+					 *     · 不需要 chip 注册；
+					 *     · 不需要等任何事件；
+					 *     · 下一次任何界面读缓存时，拿到的就已经是新数据。
+					 *
+					 *   即使第一条彻底失效，第二条也能保证「缓存里是新数据」——
+					 *   用户下次打开预设菜单（哪怕只是切一下工作区）就能看到。
+					 *   这是"无论如何都不会停留在旧数据"的保证。
+					 */
+					try {
+						var forceRefresh = forceRefreshPresetsRef.value;
+						if (typeof forceRefresh === 'function') forceRefresh();
+					} catch (refreshError) {
+						/* 刷新失败不影响同步结果 */
+					}
+					try {
+						var pullRoster = pullRosterIntoCacheRef.value;
+						if (typeof pullRoster === 'function') pullRoster();
+					} catch (pullError) {
+						/* 兜底拉取失败也不能影响同步结果 */
+					}
+					/*
+					 * ## ⚠️⚠️ 模型目录还要刷**前端**那一份（1.2.69）
+					 *
+					 * 上面两步只管预设（`forceRefreshPresets` 走官方 `seat.load()`，
+					 * `pullRoster` 直接写 `rosterCache`）。而模型目录有**两份缓存**：
+					 *
+					 *   宿主侧（Node）  —— 同步末尾已经调了
+					 *                       `refreshOfficialModelCatalog`（在 index.js）
+					 *   前端（WebView） —— **之前没人叫**，这就是漏洞
+					 *
+					 * 两段代码字面上一模一样（都是 `catalog.refresh()`），但操作的是
+					 * 两个进程里的两个不同对象。宿主侧刷了，WebView 侧**不会自动跟**。
+					 *
+					 * 而前端那一次（`reloadModelCatalog`）**只在配对成功时调过**。
+					 * 所以配对那一次能刷到，而后续的同步都刷不到 ——
+					 * 用户看到的就是「同步完成了，模型菜单还是旧的」。
+					 *
+					 * 放在预设后面、不影响预设那两步的结果。
+					 */
+					try {
+						var reloadFrontendModel = reloadFrontendModelCatalogRef.value;
+						if (typeof reloadFrontendModel === 'function') reloadFrontendModel();
+					} catch (modelReloadError) {
+						/* 刷不了只影响这一次显示，绝不能影响同步结果 */
+					}
+					/*
+					 * ## ⚠️⚠️ 电脑侧展示元数据也要重拉（2026-10-29）
+					 *
+					 * 同步刚把电脑上的对话全建出来，同时宿主也把每条对话的
+					 * **真实活动时间**和**置顶标记**记进了 `desktop-meta.json`。
+					 *
+					 * 现在必须让前端拿到这份新数据，否则：
+					 *
+					 *   · 侧边栏顺序仍是「同步顺序」（用户报障②「没有按时间排序」）；
+					 *   · 电脑上置顶的对话在手机上不置顶（用户报障③）。
+					 *
+					 * 刷新本身会递增 `metaVersion` ⇒ `wrapSessionListClock` 的缓存
+					 * 立刻失效 ⇒ 下一次渲染就是新顺序。置顶那边由
+					 * `sessions.list` 的订阅自动重试（见 `applyPinFromDesktop`）。
+					 *
+					 * 不 await：这是展示层增强，绝不能挡住同步完成的状态更新。
+					 */
+					try {
+						var refreshMeta = refreshDesktopMetaRef.value;
+						if (typeof refreshMeta === 'function') refreshMeta();
+					} catch (metaRefreshError) {
+						/* 拉不到就保持旧顺序，不影响同步结果 */
+					}
+					/*
+					 * ## ⚠️⚠️ 这里**不能**硬编码 message:'' 和 done:total（1.2.52 修）
+					 *
+					 * 原来这一块无条件写
+					 *
+					 *     done: prev.total || created.length,
+					 *     total: prev.total || created.length,
+					 *     message: '',
+					 *
+					 * 于是宿主那边刚刚如实报上来的「2 条会话同步失败」**被这里
+					 * 覆盖成空串**，进度也强行对齐成 100%。宿主改了等于白改 ——
+					 * 前端这一层才是最后说话的人。
+					 *
+					 * 现在改成读宿主返回值：`result.failed` 是失败条数。
+					 * 有失败就保留真实 done 并带上 message；全绿才写空串。
+					 */
+					var failedCount = (result && typeof result.failed === 'number') ? result.failed : 0;
+					var realTotal = prev.total || created.length || 0;
+					autoSyncStateRef.value = {
+						phase: 'done',
+						done: failedCount > 0
+							? Math.min(prev.done || 0, realTotal)
+							: realTotal,
+						total: realTotal,
+						workspaces: wsCount,
+						bytes: prev.bytes || 0,
+						message: failedCount > 0
+							? (failedCount + ' 条会话同步失败（其余已就绪）')
+							: '',
+						/*
+						 * 同上：不搬运就会被这一层静默丢掉（1.2.53）。
+						 * 轮询可能还没收到宿主的最终值（stopPoll 恰好在它之前），
+						 * 所以退回 prev 里最后一次拿到的。
+						 */
+						/*
+						 * 两个字段**同命**（1.2.66 修）。
+						 *
+						 * 这里也要遵守 1.2.65 在 tickOnce 里建立的不变量：
+						 * **说成功，原因就必须为空**。
+						 *
+						 * 原来两个字段各自从 prev 搬，互不干涉。于是：
+						 *
+						 *     prev = { modelRefresh: true, modelRefreshReason: '无 refresh 方法' }
+						 *     ⇒ 这里也是 { true, '无 refresh 方法' }
+						 *
+						 * 这种矛盾组合一旦存下来，渲染层若以后改成
+						 * 「成功也显示原因」就会出现自相矛盾的句子。
+						 * 即便现在渲染层不显示，数据层也不该存一个说不通的状态。
+						 *
+						 * tickOnce 里已经这么做了，这里没同步就是漏洞 ——
+						 * 同一个不变量在两个写入点都必须成立。
+						 */
+						modelRefresh: (typeof prev.modelRefresh === 'boolean') ? prev.modelRefresh : null,
+						modelRefreshReason: ((typeof prev.modelRefresh === 'boolean') && prev.modelRefresh === true)
+							? ''
+							: ((typeof prev.modelRefreshReason === 'string') ? prev.modelRefreshReason : ''),
+					};
+					/*
+					 * ⚠️ 同步完必须刷新这两份缓存，否则侧边栏里刚同步过来的工作区
+					 * 仍被当成「本地工作区」（判据是镜像 slug 集合）—— 那就是老 bug
+					 * 「同步完工作区显示成手机的」。
+					 */
+					/*
+					 * ⚠️ **不能用组件里的 `refreshMirrorSlugs`**（它在 `apply()` 组件
+					 * 作用域里，来自 `props.refreshMirrorSlugs`）。`runAutoSync` 是
+					 * 模块级函数，直接引用就是 `ReferenceError` —— 而且是在
+					 * Promise 回调里抛，用户看到的现象是「同步完成了但侧边栏没变」。
+					 *
+					 * 正确做法：走模块级的 `refreshMirrorSlugsByBridge()`
+					 *（直接调桥，不依赖组件作用域）。
+					 */
+					refreshMirrorSlugsByBridge();
+					refreshMirrorWorkspaces();
+				},
+				function (error) {
+					stopPoll();
+					if (!autoSyncAlive.current) return;
+					var text = String((error && error.message) || error);
+					// 失败也要放开占用，否则 dirty 同步永远进不去。
+					syncBusyRef.current = false;
+					logAutoSync(reason, -1, 0, text);
+					/*
+					 * ⚠️ **保留已完成的数量，不要清零**（2026-10-29 修）
+					 *
+					 * 原来这里写死 `done: 0, total: 0`。于是同步跑到一半失败时
+					 * （比如 15 个里做完了 12 个，第 13 个网络断了）：
+					 *
+					 *   · 界面上那 12 个已经建好的会话**真实存在**；
+					 *   · 进度条却从「12/15」一下跳回「0/0」全红。
+					 *
+					 * 用户的感受是「白同步了」—— 但实际上绝大部分已经成功。
+					 * 这会造成不必要的挫败感和重复操作（他会再点一次同步）。
+					 *
+					 * 现在保留 `prev` 里的进度，只把 phase 改成 failed，
+					 * 让用户看到「做到 12 个，第 13 个失败了」这个**真实情况**。
+					 */
+					var prevState = autoSyncStateRef.value || {};
+					autoSyncStateRef.value = {
+						phase: 'failed',
+						done: typeof prevState.done === 'number' ? prevState.done : 0,
+						total: typeof prevState.total === 'number' ? prevState.total : 0,
+						workspaces: typeof prevState.workspaces === 'number' ? prevState.workspaces : 0,
+						bytes: typeof prevState.bytes === 'number' ? prevState.bytes : 0,
+						message: text,
+						/*
+						 * 失败态也带上这个字段，保持**形状一致**（1.2.54）。
+						 *
+						 * 这里不显示模型诊断（failed 分支优先），但如果状态对象
+						 * 的字段集合时有时无，后面任何一处读它都要先判 undefined ——
+						 * 那正是 1.2.52/1.2.53 两轮踩过的坑。统一成同一套字段最省心。
+						 */
+						modelRefresh: null,
+						/* 失败态不带原因：本轮根本没走到刷新那一步 */
+						modelRefreshReason: '',
+					};
+				},
+			).catch(function () {
+				// 兜底：整体抛错也不能让界面卡在 estimating。
+				stopPoll();
+				if (autoSyncAlive.current) {
+					var prev = autoSyncStateRef.value || {};
+					if (prev.phase !== 'done' && prev.phase !== 'failed') {
+						prev.phase = 'failed';
+						prev.message = '同步过程出现异常';
+						autoSyncStateRef.value = prev;
+					}
+				}
+			});
+		};
+
+		/**
+		 * 通过桥重新拉「镜像工作区 slug → 电脑路径」清单。
+		 *
+		 * 这是模块级的，替代组件里的 `refreshMirrorSlugs`（见 `runAutoSync` 里
+		 * 的注释：模块级函数看不见组件作用域变量）。
+		 *
+		 * 同步完成后必须调用：刚建出来的镜像工作区 slug 得让宿主知道，
+		 * 否则侧边栏会把它们当成本地工作区。
+		 */
+		function refreshMirrorSlugsByBridge() {
+			bridge('mirrorWorkspaces', {}).then(
+				function (result) {
+					mirrorWorkspacesRef.value = (result && result.workspaces) || [];
+				},
+				function () {
+					/* 拿不到就保持原样：不影响已同步会话，只是分类可能暂时不准 */
+				},
+			);
+		}
+
+		//#region 电脑在线状态探测
+
+		/**
+		 * 电脑在线状态（侧边栏「电脑工作区」标题旁的小圆点）。
+		 *
+		 * ## 用户需求（2026-10-28）
+		 *
+		 * 「可以在我们电脑工作区的这个大分类标题旁边做一个状态，比如每多少秒就
+		 *   自动 ping 一下这个电脑，看一下隧道连不连通，连通的话就有对应的在线
+		 *   标识，不连通的话就给出对应的不连通标识，这样子体验就会好很多。」
+		 *
+		 * ## 探测节奏
+		 *
+		 * · **一律 3 秒一次**（用户 2026-10-29 要求："每 3 秒 ping 一次"）。
+		 *   原来是在线 20 秒 / 离线 8 秒 —— 太慢：ask 弹窗、新消息这类
+		 *   "必须立刻知道"的变化最坏要等 20 秒才被发现。
+		 *
+		 *   代价可接受：`pingStatus` 只带一个 `dirty` 数组，走的是本来就要发的
+		 *   隧道连接，响应体几十字节。3 秒一次 ≈ 每分钟 20 次 ≈ 可忽略。
+		 *
+		 * · 页面不可见（`document.hidden`）时**完全不探**：后台没必要烧电，
+		 *   回到前台立刻补一次。
+		 *
+		 * 单次探测超时 4 秒（见宿主 `pingStatus`），所以最坏情况是
+		 * 「4 秒探测 + 3 秒间隔」= 7 秒发现电脑上线。
+		 */
+		/**
+		 * 模块级的「是否已配对」快照。
+		 *
+		 * ⚠️ **不能直接用组件里的 `pairState`**：它定义在 `apply()` 的组件
+		 * 作用域里（`var pairState = pairPair[0]`），而 `probeDesktopOnline`
+		 * 是模块级函数 —— 直接引用就是 `ReferenceError`，表现为状态灯永远不亮。
+		 *
+		 * 由组件在 `pairState.paired` 变化时同步进来（见 `apply()` 里的 effect）。
+		 */
+		var pairedRef = { current: false };
+
+		/**
+		 * 「同步正在进行中」的标记（模块级）。
+		 *
+		 * 用途：在线探测发现电脑侧数据变了时会顺手触发同步，而探测每 3 秒
+		 * 就跑一次 —— 没有这个标记的话，一次慢同步（100 个对话要建 100 次壳）
+		 * 期间会被后续探测反复触发，虽然 `runAutoSync` 自己有防重入，
+		 * 但这里的 dirty 标记会被"消费掉却没处理"，导致那批变化永久丢失。
+		 */
+		var syncBusyRef = { current: false };
+
+		var desktopOnlineRef = {
+			value: { ok: false, known: false, latencyMs: null, reason: '' },
+		};
+
+		/**
+		 * 跑一次在线探测，写进 `desktopOnlineRef`。
+		 *
+		 * ⚠️ **永不 reject**：`pingStatus` 桥保证 resolve，「电脑离线」是正常
+		 * 状态而不是错误。这里再兜一层，防止桥调用本身出错（比如插件正在卸载）。
+		 */
+		var probeDesktopOnline = function () {
+			// 未配对就别探：没有令牌，探了必然是 401，会一直显示"配对已失效"。
+			if (pairedRef.current !== true) {
+				desktopOnlineRef.value = { ok: false, known: true, latencyMs: null, reason: '未配对' };
+				return Promise.resolve();
+			}
+			return bridge('pingStatus', {}).then(
+				function (result) {
+					if (!autoSyncAlive.current) return;
+					var r = result || {};
+					desktopOnlineRef.value = {
+						ok: r.ok === true,
+						known: true,
+						latencyMs: typeof r.latencyMs === 'number' ? r.latencyMs : null,
+						reason: typeof r.reason === 'string' ? r.reason : '',
+					};
+					/*
+					 * **电脑侧数据变了 ⇒ 顺手再同步一次**（需求 5 的最后一环）。
+					 *
+					 * 用户要求：「有变化的话，那就下次手机发起连通性测试的时候告诉手机
+					 * 我这边有数据变化了你同步一下，然后再进行一个同步。」
+					 *
+					 * 时机正好：我们本来就在做"连通性测试"（ping），响应里带回了
+					 * `dirty` 数组。有标记就说明电脑上工作区/模型/预设变了，
+					 * 直接跑一次 `runAutoSync`（幂等，不会重复建会话）。
+					 *
+					 * ⚠️ 只在**在线且不在同步中**时才触发：
+					 *    · 离线时同步必然失败，白跑一趟；
+					 *    · 正在同步时触发，dirty 会被"消费掉却没处理"，那批变化
+					 *      就永久丢了（见 `syncBusyRef` 的注释）。
+					 */
+					var dirtyAll = Array.isArray(r.dirty) ? r.dirty : [];
+					/*
+					 * ## `ask` 走独立通道（用户 2026-10-29 报障：弹窗收不到）
+					 *
+					 * `dirty` 原来只有 workspace / model / preset 三类，**没有 ask**
+					 * —— 所以"电脑上来了个待审批"这件事手机根本不知道，只能靠
+					 * 用户切前后台时那一次 `pullAsks`，他在会话里干等着就永远等不到。
+					 *
+					 * 现在探测每 3 秒一次，电脑一打上 `ask` 标记，这里最迟 3 秒
+					 * 就能发现并补拉。与同步无关，所以不走 `syncBusyRef` 那条路
+					 *（同步 100 个会话可能跑几分钟，会把弹窗一起堵住）。
+					 *
+					 * ⚠️ 从 `dirty` 里**剔除** `ask` 再交给下面的同步分支：
+					 * 否则那条路会把它一起 ack 掉，而它对应的补拉还没完成。
+					 */
+					var dirty = [];
+					var sawAsk = false;
+					for (var di = 0; di < dirtyAll.length; di += 1) {
+						if (dirtyAll[di] === 'ask') sawAsk = true;
+						else dirty.push(dirtyAll[di]);
+					}
+					if (r.ok === true && sawAsk === true) {
+						bridge('pullAsks', {}).then(
+							function () {
+								// 补拉成功才 ack（顺序不能反，与下面同步分支同一个理由）。
+								bridge('ackDirty', { domains: ['ask'] }).then(
+									function () { /* 清成功与否都不影响界面 */ },
+									function () { /* 静默 */ },
+								);
+							},
+							function () { /* 电脑离线 ⇒ 不 ack，下次探测再试 */ },
+						);
+					}
+					if (r.ok === true && dirty.length > 0 && !syncBusyRef.current) {
+						syncBusyRef.current = true;
+						var needSync = dirty.indexOf('workspace') >= 0;
+						runAutoSync('dirty:' + dirty.join(',')).then(function () {
+							syncBusyRef.current = false;
+							/*
+							 * 拉完再 ack —— 顺序不能反（见电脑端 `ackDirty` 注释）。
+							 * 即使 sync 失败也 ack：一直亮着会让每次 ping 都触发一次
+							 * 失败的重试，反而更糟。
+							 */
+							bridge('ackDirty', { domains: dirty }).then(
+								function () { /* 清成功与否都不影响界面 */ },
+								function () { /* 静默 */ },
+							);
+							if (needSync) refreshMirrorSlugsByBridge();
+						});
+					}
+				},
+				function () {
+					if (!autoSyncAlive.current) return;
+					desktopOnlineRef.value = {
+						ok: false, known: true, latencyMs: null, reason: '连不上电脑',
+					};
+				},
+			);
+		};
+
+		/**
+		 * 启动在线探测循环。
+		 *
+		 * @returns 停止函数（供 `ctx.effect` 的清理调用）。
+		 */
+		function startDesktopOnlineWatch() {
+			var stopped = false;
+			var timer = null;
+
+			var schedule = function (delayMs) {
+				if (stopped) return;
+				if (timer !== null) clearTimeout(timer);
+				timer = setTimeout(function () {
+					timer = null;
+					run();
+				}, delayMs);
+			};
+
+			var run = function () {
+				if (stopped) return;
+				/*
+				 * 页面在后台就跳过这一轮，但要继续排下一轮 ——
+				 * 否则用户切回前台时没有任何定时器在跑，状态灯永远停在旧值。
+				 */
+				if (typeof document !== 'undefined' && document.hidden === true) {
+					schedule(3000);
+					return;
+				}
+				probeDesktopOnline().then(function () {
+					if (stopped) return;
+					// 一律 3 秒一次（见上面的节奏说明）。
+					schedule(3000);
+				});
+			};
+
+			// 立刻探一次：打开侧边栏就能看到状态，不用等 8 秒。
+			run();
+
+			/*
+			 * 切回前台立刻补探一次（上面的循环里后台是跳过的，
+			 * 用户回来看第一眼就必须是新鲜状态）。
+			 */
+			var onVisibility = function () {
+				if (stopped) return;
+				if (typeof document === 'undefined' || document.hidden !== true) {
+					schedule(0);
+				}
+			};
+			if (typeof document !== 'undefined' && document.addEventListener) {
+				document.addEventListener('visibilitychange', onVisibility);
+			}
+
+			return function stop() {
+				stopped = true;
+				if (timer !== null) {
+					clearTimeout(timer);
+					timer = null;
+				}
+				if (typeof document !== 'undefined' && document.removeEventListener) {
+					document.removeEventListener('visibilitychange', onVisibility);
+				}
+			};
+		}
+
+		//#endregion
+
+		//#region 在「电脑工作区」标题旁渲染在线状态
+
+		/**
+		 * 把在线状态小圆点挂到侧边栏的「电脑工作区」标题旁。
+		 *
+		 * ## 怎么找到「那个标题」
+		 *
+		 * 本插件没有往侧边栏插节点的 slot，所以只能**按文字找 DOM**。
+		 * 判据是「工作区行的标题以零宽前缀 `\u200B` 开头」（见宿主 `desktopCategoryTitle`）——
+		 * 这是本插件自己定的前缀，不会和用户自己建的工作区撞。
+		 *
+		 * 找到第一个这样的行之后，把圆点插到它的**前面**（视觉上像分组标题前的
+		 * 状态灯），而不是每行都插一遍 —— 用户要的是「电脑这一大类的状态」。
+		 *
+		 * ## ⚠️ 必须幂等且能自愈
+		 *
+		 * 侧边栏是 React 渲染的，会整块重挂。所以：
+		 *   · 每轮都先找有没有已经插好的圆点（按 `data-dsh-online-dot`），
+		 *     有就只更新颜色，不重复插入；
+		 *   · 节点被 React 换掉（`!isConnected`）就重新插；
+		 *   · 找不到电脑工作区行（还没同步过）就什么都不做，不报错。
+		 */
+		function startOnlineDotWatch() {
+			var ATTR = 'data-dsh-online-dot';
+			var stopped = false;
+
+			var findDesktopRow = function () {
+				/*
+				 * 兜底多档：不同版本的侧边栏结构不同。
+				 * 用 `[role="treeitem"]` 作为主判据（官方工作区行用的就是它），
+				 * 拿不到再退回全文档扫描带零宽前缀的短文本节点。
+				 */
+				/*
+				 * 判据：标题以**零宽前缀**开头，**不再用 emoji**。
+				 *
+				 * 标题前缀在 2026-10-29 已从 emoji 改成 `\u200B`（见宿主
+				 * `DESKTOP_TITLE_PREFIX`）。这里若不同步改，在线状态圆点会永远
+				 * 找不到目标行 —— 功能静默失效，而且**看不出任何报错**。
+				 *
+				 * ⚠️ 这里**不使用** `decorateDesktopRows` 那边的 `isDesktopTitle`：
+				 * 它定义在另一个闭包里（后文 ~4577 行），在这里引用会取到
+				 * `undefined` 而抛 TypeError。就地内联最稳。
+				 */
+				var hasMark = function (value) {
+					var s = String(value === undefined || value === null ? '' : value);
+					s = s.replace(/^[ \t\r\n\u00a0\u1680\u2000-\u2006\u2008-\u200a\u2028\u2029\u202f\u205f\u3000]+/, '');
+					return s.indexOf('\u200B') === 0;
+				};
+				var rows = document.querySelectorAll('[role="treeitem"]');
+				for (var i = 0; i < rows.length; i += 1) {
+					if (hasMark(rows[i].textContent)) return rows[i];
+				}
+				// 退路：直接找带该前缀的最内层节点。
+				var all = document.querySelectorAll('div,span,li');
+				for (var j = 0; j < all.length; j += 1) {
+					var el = all[j];
+					if (!hasMark(el.textContent)) continue;
+					var txt = String(el.textContent || '').trim();
+					// 要求它足够短（是标题而不是整个侧边栏）。
+					if (txt.length > 60) continue;
+					if (el.children.length > 3) continue;
+					return el;
+				}
+				return null;
+			};
+
+			var GROUP_ATTR = 'data-dsh-group-head';
+
+			/**
+			 * 在「第一个电脑工作区行」**前面**插入一条分组标题。
+			 *
+			 * ## 用户需求（2026-10-28）
+			 *
+			 * 「侧边栏目前是有工作区的一个大标签，我们可以给它分类成一个手机工作区
+			 *   和电脑工作区的两个大分类。」
+			 *
+			 * ## 为什么只能用「插入一条标题」而不是真的分组
+			 *
+			 * 官方侧边栏的工作区列表由 `dsh-client-ui-workspace` 渲染，它对外
+			 * **只暴露 `sidebar.workspaces.directoryFlow` 一个 slot**，而且是
+			 * `kind: 'single'`（同时只能有一个 occupant，见本插件文件头的说明）。
+			 * 没有任何「在工作区之间插入分组头」的扩展点。
+			 *
+			 * 所以退一步：把电脑侧的工作区**视觉上归到一起** ——
+			 *   · 在第一段电脑行前插一条标题「电脑工作区」（带在线状态圆点）；
+			 *   · 标题下面就是所有 带零宽前缀的镜像工作区（它们本来就排在一起，
+			 *     因为名字有相同前缀、官方按创建/使用顺序排列）。
+			 *
+			 * 这样用户扫一眼就能分清"上面是手机本地的、下面是电脑的"，
+			 * 达到他要的"比较容易找到"的效果。
+			 *
+			 * ⚠️ 插的是**兄弟节点**，不能塞进行内部 —— 行是 flex 布局、
+			 * 高度固定 34px，塞进去会把那行撑变形。所以要 `insertBefore`。
+			 */
+			/**
+			 * 生成「电脑工作区」角标的**真实 DOM 节点** —— 用官方 SVG 图标。
+			 *
+			 * ## ⚠️ 为什么不用 `react-dom/server` 的 `renderToStaticMarkup`
+			 *
+			 * 1.2.30 第一版就是这么写的，结果用户在真机上看到的是一个**小蓝点**
+			 * —— 因为 `require('react-dom/server')` 在这个前端模块加载器里
+			 * **根本解析不到**，`require` 直接抛错，代码静默退化成圆点兜底。
+			 *
+			 * 证据：官方所有客户端包里 `require` 过的 react-dom 入口只有两个
+			 * （全量搜索各 `dsh-client-ui-xxx` 包的 client.js 确认）：
+			 *
+			 *     require("react-dom")          // legacy render
+			 *     require("react-dom/client")   // React 18 createRoot
+			 *
+			 * `react-dom/server` **一次都没出现过** ⇒ 加载器不保证提供它。
+			 *
+			 * ## 现在这条路
+			 *
+			 * 用官方确实提供的 `react-dom` 把图标渲染进一个**游离的 div**，
+			 * 再把里面的 `<svg>` 抠出来克隆一份。这不是黑科技 ——
+			 * 官方自己的 `IconXxx` 组件就是返回 `<svg>` 的纯函数组件。
+			 *
+			 * 渲染一次就缓存（图标与主题无关，描边用 `currentColor`），
+			 * 之后每个工作区行克隆一份，100 行也不会重复渲染。
+			 */
+			var badgeNodeCache = null;
+
+			/**
+			 * 把一个 React 元素（`jsx(...)` 的产物）**递归转成真实 DOM 节点**。
+			 *
+			 * ## 为什么需要这个函数（2026-10-29 真机空白行）
+			 *
+			 * 用户截图里，电脑工作区那几行**行首一片空白**：文件夹图标被我们藏了，
+			 * 而电脑图标没画出来。
+			 *
+			 * 根因是我上一版只建了一个 `<svg viewBox>` 空壳，**一条 `path` 都没有**。
+			 * 官方图标的真实结构是：
+			 *
+			 *     <svg width=16 height=16 viewBox="0 0 16 16" fill="none" strokeWidth=1>
+			 *       <path d="..." stroke="currentColor"/>    ← 3 条
+			 *     </svg>
+			 *
+			 * 没有 path 的 svg 渲染出来是**完全透明**的，占着 16px 位置却什么都看不到。
+			 *
+			 * ## 为什么不硬编码 path 字符串
+			 *
+			 * 我一度打算把 3 条 path 的 `d` 抄进代码（共约 2.3 KB）。但那是脆的：
+			 * 官方换图标、改路径、改 `strokeWidth`，我们都得跟着改，而且不会有人提醒。
+			 *
+			 * 图标组件本身是**纯函数**（`(props) => jsxs('svg', {children:[jsx('path',...)]})`），
+			 * 直接调它就能拿到完整元素树 —— 里面就有全部真实 path。
+			 * 把它转成 DOM，得到的图标与官方渲染的**完全一致**，且自动跟随官方变化。
+			 *
+			 * ## 参数
+			 *
+			 * @param element - React 元素（含 `type` 与 `props`）。
+			 * @param depth - 递归深度，防止异常数据导致无限递归。
+			 * @returns DOM 节点；无法转换时返回 `null`。
+			 */
+			var elementToDom = function (element, depth) {
+				try {
+					if (depth > 12) return null;
+					if (element === null || element === undefined) return null;
+					// 纯文本 / 数字：直接变文本节点
+					if (typeof element === 'string' || typeof element === 'number') {
+						return document.createTextNode(String(element));
+					}
+					if (typeof element !== 'object') return null;
+					var type = element.type;
+					/*
+					 * React Fragment（`type` 是 Symbol）或函数组件：
+					 * 直接调用它，把返回的元素再转一次。
+					 */
+					if (typeof type === 'function') {
+						try {
+							return elementToDom(type(element.props || {}), depth + 1);
+						} catch (componentError) {
+							return null;
+						}
+					}
+					if (typeof type !== 'string') return null;
+					var props = element.props || {};
+					var node;
+					if (type === 'svg' || type === 'path' || type === 'g' || type === 'circle'
+						|| type === 'rect' || type === 'line' || type === 'polyline'
+						|| type === 'polygon' || type === 'ellipse' || type === 'defs'
+						|| type === 'clipPath' || type === 'mask' || type === 'use') {
+						node = document.createElementNS('http://www.w3.org/2000/svg', type);
+					} else {
+						node = document.createElement(type);
+					}
+					/*
+					 * 把 props 写进 DOM 属性。
+					 *
+					 * 跳过：`children`（单独递归）、`key`/`ref`（React 内部）、
+					 * 以及函数/对象类型的事件与样式属性（在纯 DOM 上无意义）。
+					 */
+					for (var key in props) {
+						if (!Object.prototype.hasOwnProperty.call(props, key)) continue;
+						if (key === 'children' || key === 'key' || key === 'ref') continue;
+						var value = props[key];
+						if (value === null || value === undefined) continue;
+						if (typeof value === 'function') continue;
+						if (typeof value === 'object') {
+							// `style` 对象：逐条写内联样式
+							if (key === 'style' && node.style !== undefined) {
+								for (var styleKey in value) {
+									if (!Object.prototype.hasOwnProperty.call(value, styleKey)) continue;
+									try {
+										node.style[styleKey] = value[styleKey];
+									} catch (styleError) {
+										/* 单个样式失败不影响其它 */
+									}
+								}
+							}
+							continue;
+						}
+						try {
+							/*
+							 * ⚠️ React 的 `strokeWidth` / `fillRule` 这类**驼峰 prop 名**，
+							 * 到 DOM 上必须是 `stroke-width` / `fill-rule`。
+							 *
+							 * svg 属性名**大小写敏感**：`strokeWidth` 写进去不会报错，
+							 * 但浏览器**完全忽略**它 —— 图标描边宽度就是默认值，
+							 * 细得几乎看不见。这类“转换器”最容易漏。
+							 *
+							 * ## ⚠️⚠️ 但要排除 SVG 自己的驼峰属性名
+							 *
+							 * `viewBox`、`preserveAspectRatio`、`patternUnits`、
+							 * `gradientUnits`、`textLength`、`clipPathUnits` ……
+							 * 这些**本来就是驼峰**，是 SVG 规范规定的写法。
+							 *
+							 * 无条件转小写会得到 `view-box` —— 浏览器同样静默忽略，
+							 * 于是图标**完全没有坐标系**，渲染出来是错的或空的。
+							 * （第一版就这么错的，被测试抓到了。）
+							 */
+							var SVG_CAMEL_ATTRS = {
+								viewBox: 1, preserveAspectRatio: 1, patternUnits: 1,
+								patternContentUnits: 1, patternTransform: 1, gradientUnits: 1,
+								gradientTransform: 1, clipPathUnits: 1, maskUnits: 1,
+								maskContentUnits: 1, textLength: 1, lengthAdjust: 1,
+								markerUnits: 1, markerWidth: 1, markerHeight: 1,
+								refX: 1, refY: 1, filterUnits: 1, primitiveUnits: 1,
+								startOffset: 1, spreadMethod: 1, tableValues: 1,
+								pathLength: 1, baseFrequency: 1, numOctaves: 1,
+								stdDeviation: 1, stitchTiles: 1, surfaceScale: 1,
+								diffuseConstant: 1, specularConstant: 1, specularExponent: 1,
+								kernelMatrix: 1, targetX: 1, targetY: 1, radius_keep: 1,
+							};
+							var attrName = key;
+							if (/[A-Z]/.test(key) && SVG_CAMEL_ATTRS[key] !== 1) {
+								attrName = key.replace(/[A-Z]/g, function (ch) { return '-' + ch.toLowerCase(); });
+							}
+							node.setAttribute(attrName, String(value));
+						} catch (attrError) {
+							/* 个别属性写不进去就跳过 */
+						}
+					}
+					/*
+					 * 递归 children。
+					 *
+					 * ⚠️ 官方图标里 path 的 `stroke="currentColor"` 是**写死在 path 上**的，
+					 * 所以这里必须原样搬过来 —— 少了它，图标就是不显色的。
+					 */
+					var children = props.children;
+					if (children !== null && children !== undefined) {
+						var list = Array.isArray(children) ? children : [children];
+						for (var ci = 0; ci < list.length; ci += 1) {
+							var childNode = elementToDom(list[ci], depth + 1);
+							if (childNode !== null) node.appendChild(childNode);
+						}
+					}
+					return node;
+				} catch (error) {
+					return null;
+				}
+			};
+
+			var buildBadgeNode = function () {
+				if (badgeNodeCache !== null) return badgeNodeCache;
+				/*
+				 * ## ⚠️⚠️ 不再用官方图标 —— 只自绘小电脑（1.2.84 改）
+				 *
+				 * 旧实现四级降级，但前三级都在拿官方的
+				 * `IconGlobeOutlineRegular`（一个**地球**）—— 那是用户截图里看到的那个图标。
+				 *
+				 * 用户原话：「你这个电脑的标识太丑了，你都用 SVG 了
+				 * 你为什么不换一个小小的电脑呢？」
+				 *
+				 * 地球的语义是「远程 / 网络」，表达不了「这是一台电脑」。
+				 * 而且它只有在官方提供该 key 时才拿得到 —— 拿不到就退回自绘，
+				 * 于是同一个界面上「有时地球、有时电脑」，观感不统一。
+				 *
+				 * 现在只保留**一条路**：直接自绘。它不依赖任何模块、
+				 * 不依赖 React、不依赖官方是否改名 —— 四种写法里唯一
+				 * 不可能失败的一种（`createElementNS` 是 DOM 规范本体）。
+				 *
+				 * 四级降级看起来「更健壮」，实际上是三个不同的图标源
+				 * 在争同一个位置 ——				 * 那才是不稳定的根源。
+				 */
+				try {
+					var NS = 'http://www.w3.org/2000/svg';
+					var drawn = document.createElementNS(NS, 'svg');
+					drawn.setAttribute('width', '12');
+					drawn.setAttribute('height', '12');
+					drawn.setAttribute('viewBox', '0 0 16 16');
+					drawn.setAttribute('fill', 'none');
+					drawn.setAttribute('aria-hidden', 'true');
+					/*
+					 * ## 画一台小电脑（显示器 + 支柱 + 底座）
+					 *
+					 * 对齐官方图标的规律（参 `IconFolderCloseRegular` 的 16×16）：
+					 *   · 线宽 1、圆角轮廓，与文字粗细接近；
+					 *   · 描边用 `currentColor`，深浅主题自动跟随；
+					 *   · 四周留 2px 留白，不顶满 16×16。
+					 *
+					 * 只画**轮廓**，不画屏幕里的内容：12px 下任何内部
+					 * 细节都会糊成一团。官方的文件夹图标也只有轮廓。
+					 */
+					var kOf = function (node, attrs) {
+						for (var ai in attrs) {
+							if (!Object.prototype.hasOwnProperty.call(attrs, ai)) continue;
+							try { node.setAttribute(ai, attrs[ai]); } catch (attrError) { /* 单个属性失败不影响其它 */ }
+						}
+						return node;
+					};
+					/* ① 显示器屏幕：宽体圆角矩形，居中偏上 */
+					drawn.appendChild(kOf(document.createElementNS(NS, 'rect'), {
+						x: '2.5',
+						y: '3.5',
+						width: '11',
+						height: '7.5',
+						rx: '1.2',
+						ry: '1.2',
+						stroke: 'currentColor',
+						'stroke-width': '1',
+						fill: 'none',
+					}));
+					/* ② 支柱：屏幕到底座的短竖线 */
+					drawn.appendChild(kOf(document.createElementNS(NS, 'path'), {
+						d: 'M8 11v1.5',
+						stroke: 'currentColor',
+						'stroke-width': '1',
+						'stroke-linecap': 'round',
+						fill: 'none',
+					}));
+					/* ③ 底座：比屏幕窄的横线，让整体上宽下窄更稳 */
+					drawn.appendChild(kOf(document.createElementNS(NS, 'path'), {
+						d: 'M5.5 13.5h5',
+						stroke: 'currentColor',
+						'stroke-width': '1',
+						'stroke-linecap': 'round',
+						fill: 'none',
+					}));					badgeNodeCache = drawn;
+					return badgeNodeCache;
+				} catch (drawError) {
+					// 连 createElementNS 都没有 —— 那真的没法画了。
+					return null;
+				}
+			};
+
+			/**
+			 * 把「电脑」标识插进工作区行 —— **替换掉官方那个文件夹图标的位置**。
+			 *
+			 * ## 用户要求（2026-10-29）
+			 *
+			 * 「图标的位置能不能跟原来那个文件夹的那个图标位置换一下？
+			 *   因为这样子会比较好看一点」
+			 *
+			 * 所以做法是：找到行里那个**文件夹图标**（官方 `IconFolderCloseRegular`），
+			 * 把它隐藏、在原位置插入电脑图标 —— 等价于"换掉那个图标"，
+			 * 而不是在行首再挤一个额外的小图标。
+			 *
+			 * ## 为什么要"隐藏"而不是"删除"
+			 *
+			 * 那个文件夹节点是 **React 管理的**。我把它从 DOM 里删掉之后，
+			 * React 下次渲染时找不到它（`removeChild` 抛 NotFoundError），
+			 * 会连带把这棵子树重建 —— 表现为侧边栏闪烁。
+			 *
+			 * 用 `visibility:hidden` 保留节点、只让它不可见，React 的 diff 就
+			 * 完全不受影响，而视觉上那个位置留给了我们插入的电脑图标。
+			 */
+			/*
+ * @param row - 工作区行。
+ * @param desktopState - 电脑在线状态 `{ ok, known, latencyMs, reason }`；
+ *        传 `null` 表示不画状态灯。它决定下面的 dotColor。
+ */
+var insertDesktopBadge = function (row, desktopState) {
+				if (!row) return;
+				if (row.querySelector('[data-dsh-desktop-badge]') !== null) return;
+				/*
+				 * ## 状态灯的三种颜色（1.2.84）
+				 *
+				 * 全部走官方主题令牌，深浅色主题自动跟随：
+				 *   · 在线   → `--dsw-alias-state-business-primary`（与主按钮同一档绿/蓝）
+				 *   · 离线   → `--dsw-alias-label-quaternary`（灰，不引人注意）
+				 *   · 未知   → `--dsw-alias-border-l3`（更淡的灰，区分于「确定离线」）
+				 *
+				 * 每个都带字面 fallback：令牌在某些主题下可能不存在，
+				 * 而 `var()` 解析失败会让填充变成透明 ⇒ 看不见状态灯。
+				 */
+				var dotColor = null;
+				try {
+					if (desktopState !== null && desktopState !== undefined) {
+						if (desktopState.known !== true) {
+							dotColor = 'var(--dsw-alias-border-l3, rgba(127,127,127,0.45))';
+						} else if (desktopState.ok === true) {
+							dotColor = 'var(--dsw-alias-state-business-primary, #4D6BFE)';
+						} else {
+							dotColor = 'var(--dsw-alias-label-quaternary, rgba(127,127,127,0.5))';
+						}
+					}
+				} catch (dotColorError) {
+					dotColor = null;
+				}
+				var icon = buildBadgeNode();
+				/*
+				 * ## ⚠️⚠️ 必须 `cloneNode`（1.2.83 修 —— 本轮的真根因）
+				 *
+				 * `buildBadgeNode()` 按设计**缓存同一个 DOM 节点**实例（`badgeNodeCache`），
+				 * 本意是「只画一次」。但 `wrap.appendChild(icon)` 的语义是
+				 * **移动**（move）而不是复制：同一个节点不能同时属于两个父节点。
+				 *
+				 * 于是：
+				 *   第 1 行 ⇒ appendChild 把 svg 移进 wrap#1 ⇒ wrap#1 有图；
+				 *   第 2 行 ⇒ 拿到同一个节点 ⇒ appendChild 把它**从 wrap#1 抽走**
+				 *            ⇒ wrap#2 有图、**wrap#1 变空壳**；
+				 *   第 3 行 ⇒ 同理 ⇒ 最后**只有最后一行有图标**，
+				 *   前面所有行都是「folder 被隐藏 + 空 span」⇒ **行首一片空白**。
+				 *
+				 * 这与用户截图**完全吻合**：多行电脑工作区里，只有一行
+				 * 有图标（截图里是 `_项目文件夹`），其余全是空白。
+				 *
+				 * 修法：缓存的只能当**模板**，每行用 `cloneNode(true)` 拿一份独立副本。
+				 * clone 失败（非法 DOM）就退回用原节点 —— 至少最后一行能显示。
+				 */
+				try {
+					if (icon !== null && icon !== undefined && typeof icon.cloneNode === 'function') {
+						icon = icon.cloneNode(true);
+					}
+				} catch (cloneError) {
+					/* clone 不了就用原节点，不影响本行 */
+				}
+				if (icon === null) {
+					/*
+					 * 拿不到图标就**什么也不做** —— 不要留空壳、也不要退回圆点。
+					 *
+					 * 用户明确否定了"小点"这个方案（「这是你的设计意图吗，
+					 * 为什么不做一个小电脑的SVG图标呢」）。宁可不加标识，
+					 * 也不要再上一个丑的兜底。
+					 */
+					return;
+				}
+				/*
+				 * 找官方那个**文件夹图标**的宿主节点。
+				 *
+				 * ## ⚠️ 直接子层优先，拿不到再往深处找（2026-10-29 修）
+				 *
+				 * 原来只扫 `row.children`（直接子层）。真机上官方的结构是
+				 * 嵌套的（图标 span 可能在一层包装里），于是找不到 ⇒
+				 * 走 `else` 分支插在行首 ⇒ 细节上不对。更糟的是：
+				 * 万一找到了**错的**节点（比如状态圆点），会把它隐藏。
+				 *
+				 * 所以加一层校验：只认**尺寸接近 16px 的 svg**，
+				 * 并且优先取最靠前的那个（官方布局里图标在最左）。
+				 */
+				var isFolderIcon = function (node) {
+					try {
+						if (!node || typeof node.querySelector !== 'function') return false;
+						/*
+						 * ## ⚠️⚠️ 先看官方的**专属特征**，不要只看尺寸（1.2.74 修）
+						 *
+						 * 官方真实结构（`dsh-client-ui-workspace` 的 `ownRow`）：
+						 *
+						 *     <div role="treeitem">
+						 *       <span class="slot folder">   <svg>  ← 文件夹图标
+						 *       <span class="slot chevron">  <svg>  ← 折叠箭头，**也是 16px**
+						 *       <span class="projectText">
+						 *       <span class="rowActions">
+						 *     </div>
+						 *
+						 * 旧写法只判尺寸（10–26px），于是 chevron **也被认成文件夹图标**。
+						 * 现在没出事只是因为循环碰巧先取到 folder。
+						 * 一旦官方调整顺序（或某个版本箭头在前），就会把**箭头**藏掉、
+						 * 并在箭头位置插徽标 ⇒ 用户看到的就是「图标位置不对 / 行首空白」。
+						 *
+						 * 策略：字面信号 > 尺寸猜测。
+						 *   · 命中 `folder` ⇒ 就是它；
+						 *   · 命中 `chevron/arrow/triangle/caret` ⇒ 不是它。
+						 * 两者都没命中时，才回到尺寸判断。
+						 */
+						var hintOf = function (n) {
+							try {
+								var parts = [];
+								if (n && typeof n.className === 'string') parts.push(n.className);
+								else if (n && n.getAttribute) {
+									var cn = n.getAttribute('class');
+									if (cn) parts.push(String(cn));
+								}
+								if (n && n.getAttribute) {
+									var d = n.getAttribute('data-icon');
+									if (d) parts.push(String(d));
+									var tid = n.getAttribute('data-testid');
+									if (tid) parts.push(String(tid));
+									var aria = n.getAttribute('aria-label');
+									if (aria) parts.push(String(aria));
+								}
+								return parts.join(' ').toLowerCase();
+							} catch (hintError) {
+								return '';
+							}
+						};
+						/* ① 自身的字面信号 */
+						var selfHint = hintOf(node);
+						var selfArrow = /chevron|arrow|triangle|caret|expander/.test(selfHint);
+						var selfFolder = /folder/.test(selfHint);
+						if (selfArrow && !selfFolder) return false;
+						if (selfFolder && !selfArrow) return true;
+						/* ② 后代 svg 的字面信号（图标在子层时） */
+						var innerSvgs = node.querySelectorAll('svg');
+						for (var hi = 0; hi < innerSvgs.length; hi += 1) {
+							var ih = hintOf(innerSvgs[hi]);
+							if (/chevron|arrow|triangle|caret|expander/.test(ih)) return false;
+							if (/folder/.test(ih)) return true;
+						}
+						/*
+						 * ## ⚠️⚠️ `querySelectorAll` **不包含节点自身**（1.2.49 修）
+						 *
+						 * 这是本轮抓到的真缺陷。官方把图标直接渲染成
+						 * `<svg>`（`ProjectRowItem` 里就是一个裸 svg，没有
+						 * 包裹层），于是 `row.children[0]` **本身就是那个 svg**。
+						 *
+						 * 而 `svgEl.querySelectorAll('svg')` 按规范只返回
+						 * **后代**元素，对它自己返回**空集合** —— 实测：
+						 *
+						 *     row.children[0].tagName                 // 'svg'
+						 *     row.children[0].querySelectorAll('svg') // length 0
+						 *
+						 * ⇒ `isFolderIcon` 恒为 `false`
+						 * ⇒ 找不到文件夹图标（`folderHost = null`）
+						 * ⇒ 走 else 分支把图标插到**行首**
+						 * ⇒ 用户看到的正是「行首一片空白、图标位置不对」。
+						 *
+						 * 现在：先看节点自身，再看后代。
+						 */
+						var widthOf = function (s) {
+							var w = 0;
+							var attrW = s.getAttribute('width');
+							if (attrW !== null && attrW !== '') w = parseFloat(attrW);
+							if (!(w > 0) && typeof s.getBoundingClientRect === 'function') {
+								try { w = s.getBoundingClientRect().width; } catch (rectError) { w = 0; }
+							}
+							return w;
+						};
+						/*
+						 * ③ 尺寸判断（字面信号都没命中时才走这里）
+						 *
+						 * ⚠️ `width` 属性**可能不存在** —— 官方很多 svg 只给 `viewBox`，
+						 * 尺寸由 CSS 定。而 `getBoundingClientRect()` 在两种情况下返回 0：
+						 *   · 侧边栏刚展开、还没布局；
+						 *   · 行处于 `visibility:hidden` / 父层未渲染。
+						 * 两者都会让 `isFolderIcon` 误判为 false ⇒ 找不到文件夹图标
+						 * ⇒ 退到「插在行首」⇒ 行首多出 16px 空白。
+						 *
+						 * 所以：宽度取不到时，只要命中 folder 字样就算它是。
+						 */
+						/* ① 节点自身就是 svg（官方有这种结构） */
+						if (node.tagName !== undefined
+							&& String(node.tagName).toLowerCase() === 'svg') {
+							var wSelf = widthOf(node);
+							if (wSelf >= 10 && wSelf <= 26) return true;
+							/*
+							 * 宽度不可知（没属性 + rect 为 0）时，看父层是不是 folder 槽位。
+							 * 这一条是专门为「刚展开还没布局」准备的。
+							 */
+							if (!(wSelf > 0) && node.parentNode
+								&& /folder/.test(hintOf(node.parentNode))) return true;
+							return false;
+						}
+						/* ② 后代里有 svg（有包裹层的版本） */
+						var svgs = node.querySelectorAll('svg');
+						for (var si = 0; si < svgs.length; si += 1) {
+							/*
+							 * 宽度取属性，没属性就看实际尺寸（getBoundingClientRect）。
+							 * 容差放宽到 10–26px：不同版本 / 不同屏幕密度下
+							 * 官方这个图标实测在 14–20px 之间。
+							 */
+							var w = widthOf(svgs[si]);
+							if (w >= 10 && w <= 26) return true;
+						}
+						return false;
+					} catch (error) {
+						return false;
+					}
+				};
+				var folderHost = null;
+				var direct = row.children;
+				for (var at = 0; at < direct.length; at += 1) {
+					var child = direct[at];
+					if (child === undefined || child === null) continue;
+					if (isFolderIcon(child)) {
+						folderHost = child;
+						break;
+					}
+				}
+				var wrap = document.createElement('span');
+				wrap.setAttribute('data-dsh-desktop-badge', '1');
+				var ws = wrap.style;
+				ws.display = 'inline-flex';
+				ws.alignItems = 'center';
+				ws.justifyContent = 'center';
+				ws.flexShrink = '0';
+				ws.width = '16px';
+				ws.height = '16px';
+				/*
+				 * 颜色用官方"次要信息"令牌，与原来的文件夹图标同一档 ——
+				 * 换图标不换醒目程度，用户不会觉得这一行突然变重。
+				 */
+				/*
+				 * ## ⚠️ 颜色三重保障（2026-10-29，防“图标拿到但不可见”）
+				 *
+				 * `IconGlobeOutlineRegular` 是**描边**图标，描边用 `currentColor`。
+				 * 如果 `--dsw-alias-label-secondary` 在这个位置解析不到（不同主题 /
+				 * 不同版本可能没有这个变量），`var()` 就会失败。
+				 *
+				 * 而它一旦失败，描边就是**透明的** —— 用户看到的就是
+				 * 「文件夹图标被隐藏了、电脑图标也看不见」⇒ 整行空白。
+				 * 这正是用户截图里的样子。
+				 *
+				 * 所以：
+				 *   ① `color` 用两级 fallback（业务主色 → currentColor）；
+				 *   ② 再直接给 svg 设 `stroke` 与 `color`，
+				 *      不依赖上下文能否正确继承；
+				 *   ③ 明确设 `visibility:visible`，防止从某个隐藏父层继承。
+				 */
+				ws.color = 'var(--dsw-alias-label-secondary, var(--dsw-alias-label-tertiary, currentColor))';
+				ws.visibility = 'visible';
+				ws.verticalAlign = 'middle';
+				/*
+				 * ## ⚠️ 在线状态灯（1.2.84 新增）
+				 *
+				 * 用户原话：「我希望在工作区可以显示出电脑的在线状态？
+				 * 比如你在侧边栏的某个位置加一个状态灯？」
+				 *
+				 * ## 为什么做在小电脑图标的右上角
+				 *
+				 *   · 放行尾：离标题远，被当成「另一个按钮」；
+				 *   · 放文字后：长标题会把它挤出可见区；
+				 *   · 放图标右上角：**与图标同一个视觉对象**，
+				 *     一眼就知道它属于这台电脑 —— 也是 IM 表示在线的惯例位置。
+				 *
+				 * ## 为什么用 SVG 而不是 CSS 圆点
+				 *
+				 * 用户明确要求：「这个状态灯你也记得用 SVG 换一个」。
+				 * 而且 SVG 能做 CSS 做不到的事：给点加一圈**背景色边框**，
+				 * 让它从小电脑的轮廓里「浮出来」。CSS 圆点在 1px 线框上会混成一团。
+				 */
+				if (desktopState !== null && desktopState !== undefined) {
+					try {
+						var dotNS = 'http://www.w3.org/2000/svg';
+						var dot = document.createElementNS(dotNS, 'svg');
+						dot.setAttribute('width', '7');
+						dot.setAttribute('height', '7');
+						dot.setAttribute('viewBox', '0 0 8 8');
+						dot.setAttribute('aria-hidden', 'true');
+						dot.setAttribute('data-dsh-online-dot', '1');
+						var ds = dot.style;
+						ds.position = 'absolute';
+						ds.right = '-2px';
+						ds.top = '-1px';
+						ds.pointerEvents = 'none';
+						var dotCircle = document.createElementNS(dotNS, 'circle');
+						dotCircle.setAttribute('cx', '4');
+						dotCircle.setAttribute('cy', '4');
+						dotCircle.setAttribute('r', '2.6');
+						/* 颜色三态：在线 / 离线 / 未知（见下方 dotColor 的推导） */
+						dotCircle.setAttribute('fill', dotColor);
+						/* 一圈背景色边框：让点从图标轮廓上「浮出来」 */
+						dotCircle.setAttribute('stroke', 'var(--dsw-alias-bg-layer-1, #FFFFFF)');
+						dotCircle.setAttribute('stroke-width', '1.2');
+						dot.appendChild(dotCircle);
+						wrap.style.position = 'relative';
+						wrap.appendChild(dot);
+					} catch (dotError) {
+						/* 状态灯失败绝不能影响图标本身 */
+					}
+				}
+				/*
+				 * 直接给图标元素本身上色 —— 不依赖它内部是否正确
+				 * 使用了 `currentColor`（图标集实现可能变化）。
+				 */
+				try {
+					icon.style.color = 'var(--dsw-alias-label-secondary, currentColor)';
+					icon.style.visibility = 'visible';
+					if (icon.setAttribute !== undefined) {
+						icon.setAttribute('stroke', 'currentColor');
+						icon.setAttribute('fill', 'none');
+					}
+				} catch (iconStyleError) {
+					/* 图标上色失败不影响插入 */
+				}
+				wrap.appendChild(icon);
+				/*
+				 * ## ⚠️⚠️ 必须验证「图标真的进去了」（1.2.83 修）
+				 *
+				 * 断言实测：徽标 `span` 能被插进行里、folder 也被隐藏了，
+				 * 但 **span 里面是空的**（`childNodes.length === 0`，实测尺寸 0×0）。
+				 * 于是用户看到的就是「行首一片空白」—— folder 没了，徽标也没图。
+				 *
+				 * `buildBadgeNode()` 已经四级降级且都会校验有图形元素，
+				 * 但它校验的是**它自己返回的那个节点**。一旦这个节点
+				 * 在 `appendChild` 过程中没真正挂上，后面就没人检查了。
+				 *
+				 * 所以这里直接数子节点：为 0 则**不要把 folder 隐藏**，
+				 * 宁可保留原来那个文件夹图标（至少不空白），也不要留下一个空壳。
+				 * 这是「失败时保持原样」而不是「失败时更糟」。
+				 */
+				var iconMounted = false;
+				try {
+					iconMounted = wrap.childNodes !== undefined && wrap.childNodes.length > 0;
+				} catch (mountCheckError) {
+					iconMounted = false;
+				}
+				if (!iconMounted) {
+					/*
+					 * 图标没挂上 ⇒ 整个徽标放弃：**不插、不隐藏 folder**。
+					 * 留下诊断痕迹，供「侧栏自检」行显示。
+					 */
+					try { window.__dshRemoteSidebarError = 'badge icon not mounted'; } catch (mountProbeError) { /* ignore */ }
+					return;
+				}
+				try {
+					if (folderHost !== null && folderHost.parentNode === row) {
+						/*
+						 * 把文件夹图标藏起来（保留节点，见上面的 KDoc），
+						 * 在**同一位置**插入电脑图标。
+						 *
+						 * ## ⚠️⚠️ 只 `visibility:hidden` **不够**（1.2.49 修）
+						 *
+						 * `visibility:hidden` 会让元素**不可见但仍占位**。
+						 * 而我们在它**前面**插了一个 16px 的徽标 ⇒ 那一格
+						 * 同时被「徽标 16px」+「隐藏的文件夹图标 16px」占着
+						 * ⇒ 行首多出 16px 空白、标题整体右移。
+						 *
+						 * 用户原话是「图标的位置能不能跟原来那个文件夹的
+						 * 那个图标**位置换一下**」—— 要的是**换**，不是**并排**。
+						 *
+						 * 所以：让它塌陷成 0 尺寸（节点仍在 ⇒ React 安全），
+						 * 徽标正好落在它原来的位置上，行宽不变。
+						 *
+						 * 用 `display:none` 会触发 React 的 removeChild 问题吗？
+						 * 不会 —— 那不是从 DOM 移除，节点还在树上。但
+						 * `display:none` 在部分 WebView 上会让 svg 尺寸计算异常，
+						 * 所以这里用 width/height/padding/margin 归零 + 继续
+						 * 保留 `visibility:hidden` 双保险，最稳。
+						 */
+						folderHost.style.visibility = 'hidden';
+						folderHost.style.width = '0';
+						folderHost.style.height = '0';
+						folderHost.style.minWidth = '0';
+						folderHost.style.minHeight = '0';
+						folderHost.style.overflow = 'hidden';
+						folderHost.style.padding = '0';
+						folderHost.style.margin = '0';
+						folderHost.style.flexGrow = '0';
+						folderHost.setAttribute('data-dsh-folder-hidden', '1');
+						row.insertBefore(wrap, folderHost);
+						/*
+						 * ⚠️⚠️ 必须给行打标记（1.2.50 修 —— 这是个悬空引用）
+						 *
+						 * `stop()` 卸载时的清理逻辑查的是
+						 * `document.querySelectorAll('[data-dsh-desktop-row]')`，
+						 * 但**这个属性从来没被设置过**（全文件只有两处：
+						 * 查它、和移除它）。
+						 *
+						 * 后果：插件被禁用 / 热重载时，清理循环**一次都不执行**
+						 * ⇒ 徽标留在侧边栏上没人认领，而且我们藏起来的文件夹
+						 * 图标**永远不恢复** ⇒ 那一行变成彻底的空白行。
+						 *
+						 * 用户看到的就是「禁用插件后侧边栏更乱了」，
+						 * 只能重启 GUI 才好 —— 这正是卸载逻辑想避免的事。
+						 *
+						 * 现在补上设置，让清理能真正跑起来。
+						 */
+						row.setAttribute('data-dsh-desktop-row', '1');
+					} else {
+						/* 没找到文件夹图标：退回插在行首，至少标识还在 */
+						row.insertBefore(wrap, row.firstChild);
+						row.setAttribute('data-dsh-desktop-row', '1');
+					}
+				} catch (ignored) {
+					/* 行结构异常就放弃标记，不影响功能 */
+				}
+			};
+
+			/**
+			 * 同步一次：打行标识 + 给在线圆点配色。
+			 *
+			 * 由 `setInterval` 驱动（见下面的定时器），也可被外部立即调一次。
+			 */
+			/**
+			 * 这一行的标题是否属于「电脑工作区」。
+			 *
+			 * 判据是宿主写入的**零宽前缀**（`DESKTOP_TITLE_PREFIX = '\u200B'`）。
+			 *
+			 * ## ⚠️ 为什么不用 `String.prototype.trim()`
+			 *
+			 * 踩过的坑：第一版用 `\u2009`（thin space）当标记，而 `trim()` 和
+			 * `\s` 都会把它吃掉 ⇒ 一个电脑工作区都认不出来，而且不报错。
+			 * 现在用零宽空格（`trim()` 不碰它），下面只剥**真正的排版空白**，
+			 * 显式排除所有零宽字符。
+			 */
+			var isDesktopTitle = function (text) {
+				var t = String(text === undefined || text === null ? '' : text);
+				t = t.replace(/^[ \t\r\n\u00a0\u1680\u2000-\u2006\u2008-\u200a\u2028\u2029\u202f\u205f\u3000]+/, '');
+				return t.indexOf('\u200B') === 0;
+			};
+
+						/**
+			 * 找出所有「电脑工作区」行。
+			 *
+			 * 判据只有一条：`role="treeitem"` 且标题以**零宽前缀**开头。
+			 * 前缀由宿主 `desktopCategoryTitle()` 写入（见 `DESKTOP_TITLE_PREFIX`），
+			 * 用户看不见它，所以侧边栏里显示的是干净的目录名。
+			 */
+			/*
+			 * 这一行是不是电脑工作区行？
+			 *
+			 * ## ⚠️⚠️ 先看结构标识，看不到才退回标题前缀（1.2.75 修）
+			 *
+			 * 官方 `ownRow` 里写了精确的标识：
+			 *
+			 *     工作区行   data-row-key="workspace:<key>"
+			 *     会话行     data-row-key="session:<id>"
+			 *
+			 * 这比猜文本可靠得多。原来只看 `textContent` 是否以零宽开头，
+			 * 而 `textContent` 会把**所有子元素的文字拼在一起**（包括 `rowActions`
+			 * 里的「⋯」按钮文字）。于是会出现两种坏情况：
+			 *
+			 *   ① **会话标题恰好以零宽开头**（用户复制粘贴很容易带上）
+			 *      ⇒ 该会话被认成电脑行 ⇒ 被插上电脑图标、图标槽被藏。
+			 *   ② 工作区行的标题前面若多出任何一个字符（官方改版式）
+			 *      ⇒ 认不出来 ⇒ **图标完全不出现**。
+			 *
+			 * 现在：结构标识优先；只有拿不到 `data-row-key` 时才猜文本。
+			 */
+			var rowKindOf = function (row) {
+				try {
+					if (!row || typeof row.getAttribute !== 'function') return '';
+					var key = row.getAttribute('data-row-key');
+					if (typeof key !== 'string' || key === '') return '';
+					var at = key.indexOf(':');
+					if (at <= 0) return '';
+					/* 只认两种已知类型，其他一律当作“不知道” */
+					var kind = key.slice(0, at);
+					if (kind === 'workspace' || kind === 'session') return kind;
+					return '';
+				} catch (kindError) {
+					return '';
+				}
+			};
+			var isDesktopRow = function (row) {
+				/*
+				 * ⚠️ 先判空。
+				 * 下面要读 `row.textContent`；传进 `null` 时会抛 TypeError，
+				 * 而调用方（`decorateDesktopRows` 的循环）并不去检查。
+				 * 抛出去就是整次装饰失败 —— 图标又没了。
+				 */
+				if (!row) return false;
+				/* ① 结构标识最可靠 */
+				var kind = rowKindOf(row);
+				if (kind === 'session') return false;
+				if (kind === 'workspace') return isDesktopTitle(row.textContent);
+				/* ② 拿不到结构标识（官方版本变了）—— 退回标题前缀 */
+				return isDesktopTitle(row.textContent);
+			};
+			var findDesktopRows = function () {
+				var out = [];
+				var rows = document.querySelectorAll('[role="treeitem"]');
+				for (var i = 0; i < rows.length; i += 1) {
+					if (isDesktopRow(rows[i])) out.push(rows[i]);
+				}
+				return out;
+			};
+
+			/**
+			 * 给每个电脑工作区行换上「电脑」图标。
+			 *
+			 * ## 为什么不插分组标题了
+			 *
+			 * 1.2.29 试过「在第一个电脑行前插一条『电脑工作区』标题」，结论是
+			 * 不可靠：官方侧边栏按**最近使用时间**排序，电脑行会被手机行隔开，
+			 * 一条标题只能圈住其中一段，反而误导。
+			 *
+			 * 现在既然每一行都有自己的电脑图标（替换掉文件夹图标），
+			 * 分组标题就完全多余了 —— 少一层 DOM 也少一处会闪烁的地方。
+			 *
+			 * @returns 第一个电脑行（供调用方挂在线状态），没有则 `null`。
+			 */
+			var decorateDesktopRows = function () {
+				var rows = findDesktopRows();
+				if (rows.length === 0) return null;
+				/*
+				 * 把当前在线状态传给每一行 —— 状态灯是**行级**的，
+				 * 而不是一个全局切换。
+				 *
+				 * ⚠️ 不能因为「没探测到」就不传：那会让状态灯忽然消失、
+				 * 又忽然出现，看起来像闪烁。传 `null` 才表示「不画」。
+				 */
+				var st = desktopOnlineRef.value;
+				for (var i = 0; i < rows.length; i += 1) {
+					insertDesktopBadge(rows[i], st);
+				}
+				return rows[0];
+			};
+
+			/**
+			 * 同步一次：给电脑行换图标 + 把在线状态写进行属性。
+			 *
+			 * 由定时器驱动（见下面的 `setInterval`）。
+			 *
+			 * ## ⚠️ 幂等性是硬要求
+			 *
+			 * 这个函数每 1.5 秒跑一次。任何「每次都追加节点」的写法都会
+			 * 让侧边栏越长越乱 —— 所以插入图标那一步必须先检查有没有插过
+			 * （`insertDesktopBadge` 内部有 `data-dsh-desktop-badge` 判重）。
+			 */
+			/**
+			 * ## ⚠️⚠️ 定时器回调必须整体兜底（1.2.56 修）
+			 *
+			 * 这个函数每 1.5 秒被 `setInterval` 调一次。内部虽然逐段有 try，
+			 * 但 `decorateDesktopRows()` 那一句是**裸调用**：
+			 *
+			 *     var firstRow = decorateDesktopRows();
+			 *
+			 * 它里面会 `buildBadgeNode()` → `document.createElementNS` 画 svg。
+			 * 任何一步抛错（旧内核不认某个属性、DOM 处于怪异状态、
+			 * 官方结构变了导致取不到东西），异常都会**穿过 sync 逃出去**。
+			 *
+			 * 后果不是崩一次就完 —— 是每 1.5 秒**抛一次**，无限循环。
+			 * 而 `installSyncMenu` 外面那层 guard 早就返回了，接不住后续的
+			 * 定时器回调 ⇒ 侧边栏图标**永远插不上**、也没有任何提示。
+			 *
+			 * 这就是「装饰像是没生效」的典型成因：不是逻辑错，是定时器
+			 * 每次都在同一个地方炸掉。所以整段包一层 try，并且**只吞不抛**。
+			 */
+			var sync = function () {
+				if (stopped) return;
+				try {
+					syncOnce();
+				} catch (syncError) {
+					/*
+					 * 吞掉：绝不能让定时器连环抛错。但要留痕 ——
+					 * 用户「改了没效果」时，这是唯一的现场证据。
+					 */
+					try {
+						window.__dshRemoteSidebarError = String(syncError);
+					} catch (probeError) { /* 诊断失败不影响主流程 */ }
+				}
+			};
+			/** `sync` 的正体（由外层统一兜底，见上）。 */
+			var syncOnce = function () {
+				if (stopped) return;
+				/*
+				 * ## ⚠️⚠️ 先清理「孤儿装饰」（1.2.50 修）
+				 *
+				 * 必须放在 `decorateDesktopRows()` **之前**，而且**不能**被
+				 * 下面那个 `if (firstRow === null) return` 挡住。
+				 *
+				 * 场景：某个工作区原来是电脑工作区（我们给它插了徽标、
+				 * 把文件夹图标塌陷隐藏），后来用户解绑 / 清理了它，
+				 * 那一行的标题不再带零宽前缀 ⇒ `findDesktopRows()` 找不到它
+				 * ⇒ `decorateDesktopRows()` 也不会再碰它
+				 * ⇒ **徽标留在那里，文件夹图标永远是 0×0 的隐形状态**。
+				 *
+				 * 用户看到的是：那一行没有图标，而且点哪儿都不对。
+				 * 而且原来 `if (firstRow === null) return` 会让
+				 * 「一个电脑行都没有」的情况直接跳过整个函数 ——
+				 * 那时恰恰是最需要清理的时候。
+				 *
+				 * 所以这里无条件扫一遍：凡是被我们标记过、
+				 * 但现在已不是电脑工作区的行，把装饰全部撤销。
+				 */
+				try {
+					var decorated = document.querySelectorAll('[data-dsh-desktop-row]');
+					for (var di = 0; di < decorated.length; di += 1) {
+						var dRow = decorated[di];
+						try {
+							if (isDesktopTitle(dRow.textContent)) continue; // 仍是电脑行，留着
+							var dBadge = dRow.querySelector('[data-dsh-desktop-badge]');
+							if (dBadge && dBadge.parentNode) dBadge.parentNode.removeChild(dBadge);
+							var dHidden = dRow.querySelectorAll('[data-dsh-folder-hidden]');
+							for (var dh = 0; dh < dHidden.length; dh += 1) {
+								try {
+									var dhEl = dHidden[dh];
+									dhEl.style.visibility = '';
+									dhEl.style.width = '';
+									dhEl.style.height = '';
+									dhEl.style.minWidth = '';
+									dhEl.style.minHeight = '';
+									dhEl.style.overflow = '';
+									dhEl.style.padding = '';
+									dhEl.style.margin = '';
+									dhEl.style.flexGrow = '';
+									dhEl.removeAttribute('data-dsh-folder-hidden');
+								} catch (dhError) { /* 单个失败不影响其它 */ }
+							}
+							dRow.removeAttribute('data-dsh-desktop-row');
+							dRow.removeAttribute('title');
+						} catch (dRowError) { /* 单行失败继续下一条 */ }
+					}
+				} catch (cleanupError) { /* 清理失败绝不能影响正常装饰 */ }
+
+				var firstRow = decorateDesktopRows();
+				if (firstRow === null) return;
+				/*
+				 * ## 在线状态写在行属性上，不再有「分组标题上的圆点」
+				 *
+				 * 1.2.29 那个圆点是挂在分组标题里的，现在没有分组标题了。
+				 * 而且用户明确否定了圆点这种表达（「这是你的设计意图吗」）。
+				 *
+				 * 用 `title` 属性：手机侧边栏一行只有 34px 高，再塞一个可见
+				 * 状态点会把标题挤窄；长按/悬浮能看到"电脑在线（23 ms）"就够。
+				 */
+				var st = desktopOnlineRef.value || {};
+				var tip = '电脑状态未知';
+				if (st.known === true) {
+					if (st.ok === true) {
+						tip = '电脑在线'
+							+ (typeof st.latencyMs === 'number' ? '（' + st.latencyMs + ' ms）' : '');
+					} else {
+						tip = st.reason ? ('电脑离线：' + st.reason) : '电脑离线';
+					}
+				}
+				var rows = findDesktopRows();
+				for (var ri = 0; ri < rows.length; ri += 1) {
+					try {
+						if (rows[ri].getAttribute('title') !== tip) rows[ri].setAttribute('title', tip);
+					} catch (titleError) { /* 单个失败不影响其它行 */ }
+				}
+				/*
+				 * ## ⚠️️ 真机自检：把「找到几行 / 插了几个徽标 / 徽标多大」写进全局变量
+				 *
+				 * 用户报「侧边栏电脑标记不显示」，代码路径上看不出问题：
+				 * findDesktopRows 能认、buildBadgeNode 四级降级都完备、
+				 * wrap 尺寸颜色都对。那就只能靠**现场数据**定位。
+				 *
+				 * 这段把实测值存起来，配合 App 的「导出诊断包」就能看到：
+				 *   · `rows`     —— 认出几个电脑行（与用户数到的图标数应一致）
+				 *   · `badges`   —— DOM 里真实存在几个徽标节点
+				 *   · `box`      —— 第一个徽标的**实测尺寸**（0 = 真的没显示出来）
+				 *   · `folderHidden` —— 被隐藏的文件夹图标数（应等于 badges）
+				 *   · `err`      —— 装饰过程中的最后一个错误
+				 *
+				 * ⚠️ 全程 try：诊断本身绝不能影响装饰。
+				 */
+				try {
+					var allBadges = document.querySelectorAll('[data-dsh-desktop-badge]');
+					var allHidden = document.querySelectorAll('[data-dsh-folder-hidden]');
+					var firstBox = null;
+					if (allBadges.length > 0) {
+						var b0 = allBadges[0];
+						var rect = b0.getBoundingClientRect();
+						firstBox = { w: Math.round(rect.width), h: Math.round(rect.height) };
+				}
+					window.__dshRemoteSidebarDiag = {
+						rows: rows.length,
+						badges: allBadges.length,
+						folderHidden: allHidden.length,
+						box: firstBox,
+						err: window.__dshRemoteSidebarError === undefined ? null : window.__dshRemoteSidebarError,
+						at: Date.now(),
+				};
+				} catch (diagError) { /* 诊断失败不影响装饰 */ }
+			};
+
+			var timer = setInterval(sync, 1500);
+			sync();
+
+			return function stop() {
+				stopped = true;
+				if (timer !== null) clearInterval(timer);
+				timer = null;
+				/*
+				 * 卸载时把装饰全部撤掉：分组标题（圆点在它里面）+ 每行的标识。
+				 *
+				 * 不撤的话，插件被禁用/热重载后侧边栏上会残留一堆蓝线，
+				 * 而没有任何插件认领它们 —— 用户只能重启 GUI。
+				 */
+				var heads = document.querySelectorAll('[' + GROUP_ATTR + ']');
+				for (var hi = 0; hi < heads.length; hi += 1) {
+					if (heads[hi].parentNode) {
+						try { heads[hi].parentNode.removeChild(heads[hi]); } catch (ignored) {}
+					}
+				}
+				var marked = document.querySelectorAll('[data-dsh-desktop-row]');
+				for (var mi = 0; mi < marked.length; mi += 1) {
+					var m = marked[mi];
+					try {
+						var badge = m.querySelector('[data-dsh-desktop-badge]');
+						if (badge && badge.parentNode) badge.parentNode.removeChild(badge);
+						/*
+						 * ⚠️ 必须把藏起来的文件夹图标**恢复显示** ——
+						 * 这个工作区不再是电脑工作区（用户解绑 / 清理）时，
+						 * 不给它恢复的话那一行就永远没有图标，看起来像坏了。
+						 */
+						var hidden = m.querySelectorAll('[data-dsh-folder-hidden]');
+						/*
+						 * ⚠️ 循环变量**不能**叫 `hi` —— 外层遍历分组标题的循环也用 `hi`
+						 * （同一函数作用域，`var` 不隔层），复用会让外层提前退出。
+						 */
+						for (var ri2 = 0; ri2 < hidden.length; ri2 += 1) {
+							try {
+								var hEl = hidden[ri2];
+								hEl.style.visibility = '';
+								/*
+								 * ⚠️ **尺寸也必须恢复**（1.2.50 修）
+								 *
+								 * 插入时为了让出位置，把这几项全归零了
+								 *（否则徽标和隐藏图标同时占位 ⇒ 行首多 16px）。
+								 * 如果卸载时只恢复 visibility 而不恢复尺寸，
+								 * 这个文件夹图标会变成 **0×0 的隐形元素** ——
+								 * 视觉上仍然是"那一行没有图标"。
+								 *
+								 * 所以每一项都要显式清回空字符串（= 交还给
+								 * 官方样式表 / 元素的 width 属性）。
+								 */
+								hEl.style.width = '';
+								hEl.style.height = '';
+								hEl.style.minWidth = '';
+								hEl.style.minHeight = '';
+								hEl.style.overflow = '';
+								hEl.style.padding = '';
+								hEl.style.margin = '';
+								hEl.style.flexGrow = '';
+								hEl.removeAttribute('data-dsh-folder-hidden');
+							} catch (restoreError) { /* 单个失败不影响其它 */ }
+						}
+						m.removeAttribute('data-dsh-desktop-row');
+					} catch (ignored) {}
+				}
+			};
+		}
+
+		//#endregion
+
+		/** 自动同步的日志（只在真正有事件时打，避免刷屏）。 */
+		function logAutoSync(reason, createdCount, workspaceCount, errorText) {
+			try {
+				if (errorText) {
+					console.warn('[dsh-jiuling-remote-mobile] 自动同步失败(' + reason + '): ' + errorText);
+				} else {
+					console.info(
+						'[dsh-jiuling-remote-mobile] 自动同步完成(' + reason + '): '
+						+ workspaceCount + ' 个工作区, 新建 ' + createdCount + ' 个对话',
+					);
+				}
+			} catch (ignored) { /* 日志失败不影响主流程 */ }
+		}
+
+		//#endregion
+
+
+		/**
+		 * 把同步进度**用原生 DOM** 挂到侧边栏面板上。
+		 *
+		 * ## 为什么不用 React
+		 *
+		 * 进度浮层要挂在「侧边栏面板」这个官方 DOM 上，而宿主没有给我们
+		 * 一个对应的 slot。现有「同步对话」对话框走的是
+		 * `ReactDOM.createRoot(body 下的 div)`（见 `ensureHost`），
+		 * 那是**独立 portal**，会盖在面板之外。
+		 *
+		 * 进度浮层需要贴着面板底部（用户的视线在那里），所以直接用原生 DOM
+		 * 定位到面板内部更稳，也少一层 React 开销。
+		 *
+		 * ## ⚠️ 必须自己管生命周期
+		 *
+		 * 原生 DOM 不受 React 回收，所以：
+		 *   · 每次更新都先找有没有现存节点（按 `data-dsh-sync-progress`），
+		 *     有就复用，避免重复插入；
+		 *   · 终态（done/failed）后延时移除，不留垃圾节点；
+		 *   · `dispose` 时强制清掉，防止面板重建后残留。
+		 */
+		/**
+		 * 首次同步的**进度浮层**（需求 7）。
+		 *
+		 * ## 用户对这版的意见（2026-10-29，逐条）
+		 *
+		 * 「图1下面这个黑色横幅太丑太丑太丑了，你是一点设计感都没有吗，而且你
+		 *   为什么要坐在下面呢，我是建议你用官方的一些组件来进行设计，因为这样
+		 *   子用户换主题的话，比如他换浅色模式，他也可以跟着变过来，还有就是
+		 *   我希望动画是出现在屏幕中间，而不是在下面」
+		 *
+		 * 「在开始真正的进度计算之前的那个等待过程，你没有做任何的一个文字提示，
+		 *   比如那个阶段我猜测的话应该是在等待电脑告诉我手机有多少数据吧，
+		 *   那你也可以写一下，比如说正在连接电脑」
+		 *
+		 * ## 因此这一版全部重写
+		 *
+		 * | 问题 | 上一版 | 现在 |
+		 * |---|---|---|
+		 * | 位置 | `position:absolute; bottom:16px` 贴底 | **屏幕正中**，flex 居中 |
+		 * | 配色 | 硬编码 `rgba(28,32,38,0.94)` 深色 | 全走 `--dsw-alias-*` 令牌，**跟随主题** |
+		 * | 造型 | 一条黑色横条 + 6px 进度条 | 圆角卡片 + 图标 + 标题 + 细进度条 |
+		 * | 无预估时 | 只写"正在统计…"，进度条卡 38% | 分阶段文案 + **不确定态流动动画** |
+		 *
+		 * ## 为什么进度条在"未知总数"时必须动
+		 *
+		 * 用户原话：「他刚开始同步的时候，下面那个进度条一直是卡在那个位置的，
+		 * 等了大概有好一会之后，我才变成了图示的这个图片」。
+		 *
+		 * 静态停在 38% 会让人以为卡死。未知阶段改用不确定态（indeterminate）
+		 * 的横向流动动画 —— 这是进度条的标准语汇，传达"还在进行、总量未知"。
+		 * 一旦拿到真实总数就切回确定态按百分比走（这部分用户说"做得非常好"）。
+		 */
+		function mountSyncProgress(getState, isAlive) {
+			var ATTR = 'data-dsh-sync-progress';
+			var node = null;
+			var cardEl = null;
+			var fill = null;
+			var titleEl = null;
+			var subEl = null;
+			var pctEl = null;
+			var iconWrap = null;
+			var removeTimer = null;
+			/*
+			 * 刷新循环的两个句柄。
+			 *
+			 * ⚠️ 必须在 `teardown` **之前**声明。
+			 * `teardown` 里要用它们判断「有没有东西需要清」：
+			 * 若声明在后，虽然 `var` 提升不会抛 ReferenceError，
+			 * 但初值是 `undefined` 而不是 `null` ⇒ `!== null` 成立
+			 * ⇒ 会去调 `cancelAnimationFrame(undefined)`，
+			 * 属于「写错了但恰好没崩」的隐患，必须避免。
+			 */
+			var rafId = null;
+			var intervalId = null;
+
+			/**
+			 * 挂到 `document.body`，**不用侧边栏容器**。
+			 *
+			 * ⚠️ 上一版挂在侧边栏面板里（`[data-dsh-sidebar]` 等），三个问题：
+			 *   1. 侧边栏可能**根本没渲染**（用户从对话页触发同步）⇒ 挂不上；
+			 *   2. 面板有自己的 `overflow:hidden`，贴底卡片被裁掉一半；
+			 *   3. 面板宽度随侧栏拖拽变化，卡片跟着变形。
+			 *
+			 * 用户要求"出现在屏幕中间" —— 那本来就是**全屏浮层**的语义，
+			 * 挂 body + `position:fixed` 才是对的。
+			 */
+			var ensureNode = function () {
+				if (node && node.isConnected) return node;
+				if (!document.body) return null;
+
+				node = document.createElement('div');
+				node.setAttribute(ATTR, '1');
+				/*
+				 * `role="status"` + `aria-live="polite"`：读屏在内容变化时朗读
+				 * 进度，且不打断用户当前操作（polite 而非 assertive）。
+				 */
+				node.setAttribute('role', 'status');
+				node.setAttribute('aria-live', 'polite');
+
+				var s = node.style;
+				// —— 遮罩层：全屏居中 ——
+				s.position = 'fixed';
+				s.left = '0';
+				s.top = '0';
+				s.right = '0';
+				s.bottom = '0';
+				s.display = 'flex';
+				s.alignItems = 'center';
+				s.justifyContent = 'center';
+				/*
+				 * 遮罩本身完全透明：这是**进度提示**不是模态框，
+				 * 用户仍应能看清后面的界面（同步期间他可能还在看对话）。
+				 */
+				s.background = 'transparent';
+				s.zIndex = '2147483000';
+				/*
+				 * ⚠️ `pointer-events:none` 打在遮罩上、卡片单独恢复 auto：
+				 * 否则整屏不可点，同步期间用户什么都干不了。
+				 */
+				s.pointerEvents = 'none';
+				s.transition = 'opacity 240ms ease';
+				s.opacity = '0';
+
+				// —— 卡片 ——
+				cardEl = document.createElement('div');
+				/*
+				 * 关键：**每个颜色都来自官方设计令牌**，深浅主题自动跟随。
+				 * 令牌名都核对过（`--dsw-alias-bg-layer-*` / `label-*` /
+				 * `border-l3` / `state-business-primary`）。
+				 */
+				var cs = cardEl.style;
+				cs.boxSizing = 'border-box';
+				cs.minWidth = '260px';
+				cs.maxWidth = 'min(78vw, 340px)';
+				cs.padding = '20px 22px 18px';
+				cs.borderRadius = '16px';
+				cs.background = 'var(--dsw-alias-bg-layer-1, #FFFFFF)';
+				cs.color = 'var(--dsw-alias-label-primary, #0F1115)';
+				cs.border = '0.5px solid var(--dsw-alias-border-l3, rgba(127,127,127,0.24))';
+				/*
+				 * 阴影用中性黑（不随主题变）：浅色下是柔和投影，深色下几乎看不见，
+				 * 两种情况都不刺眼。不用令牌是因为官方没有"悬浮阴影"档位。
+				 */
+				cs.boxShadow = '0 12px 40px rgba(0,0,0,0.18)';
+				cs.display = 'flex';
+				cs.flexDirection = 'column';
+				cs.pointerEvents = 'auto';
+				cs.transform = 'scale(0.96)';
+				cs.transition = 'transform 240ms cubic-bezier(0.22,1,0.36,1)';
+
+				// —— 顶部：图标 + 标题 ——
+				var head = document.createElement('div');
+				head.style.display = 'flex';
+				head.style.alignItems = 'center';
+				head.style.gap = '8px';
+
+				iconWrap = document.createElement('span');
+				iconWrap.style.display = 'inline-flex';
+				iconWrap.style.alignItems = 'center';
+				iconWrap.style.flexShrink = '0';
+				iconWrap.style.color = 'var(--dsw-alias-state-business-primary, #4A7DFF)';
+				iconWrap.style.animation = 'jlmSyncSpin 1.1s linear infinite';
+				head.appendChild(iconWrap);
+
+				titleEl = document.createElement('div');
+				titleEl.style.fontSize = '14px';
+				titleEl.style.fontWeight = '600';
+				titleEl.style.lineHeight = '20px';
+				titleEl.style.color = 'var(--dsw-alias-label-primary, #0F1115)';
+				head.appendChild(titleEl);
+				cardEl.appendChild(head);
+
+				// —— 副标题（阶段说明 / 计数）——
+				subEl = document.createElement('div');
+				subEl.style.fontSize = '12px';
+				subEl.style.lineHeight = '18px';
+				subEl.style.marginTop = '6px';
+				subEl.style.color = 'var(--dsw-alias-label-tertiary, #8A8F98)';
+				cardEl.appendChild(subEl);
+
+				// —— 进度条 ——
+				var bar = document.createElement('div');
+				var bs = bar.style;
+				bs.position = 'relative';
+				bs.height = '4px';
+				bs.borderRadius = '2px';
+				bs.marginTop = '14px';
+				bs.overflow = 'hidden';
+				bs.background = 'var(--dsw-alias-bg-layer-2, rgba(127,127,127,0.16))';
+
+				fill = document.createElement('div');
+				var fs = fill.style;
+				fs.position = 'absolute';
+				fs.left = '0';
+				fs.top = '0';
+				fs.bottom = '0';
+				fs.width = '0%';
+				fs.borderRadius = '2px';
+				fs.background = 'var(--dsw-alias-state-business-primary, #4A7DFF)';
+				/*
+				 * 宽度过渡 300ms：真实进度是"一跳一跳"上报的（每建一个会话 +1），
+				 * 有过渡看起来才连贯，像在稳步走 —— 用户认可的那一点。
+				 */
+				fs.transition = 'width 300ms cubic-bezier(0.22,1,0.36,1)';
+				bar.appendChild(fill);
+				cardEl.appendChild(bar);
+
+				// —— 计数字（只在有确定总数时显示）——
+				pctEl = document.createElement('div');
+				pctEl.style.fontSize = '11px';
+				pctEl.style.lineHeight = '16px';
+				pctEl.style.marginTop = '8px';
+				pctEl.style.textAlign = 'right';
+				// 等宽数字：数字跳动时列宽不变，不会左右抖。
+				pctEl.style.fontVariantNumeric = 'tabular-nums';
+				pctEl.style.color = 'var(--dsw-alias-label-caption, #9AA0A6)';
+				cardEl.appendChild(pctEl);
+
+				node.appendChild(cardEl);
+				document.body.appendChild(node);
+				return node;
+			};
+
+			/**
+			 * 把官方 `IconLoadingOutlineRegular` 渲染进图标位（旋转加载圈）。
+			 *
+			 * 拿不到图标就退回纯 CSS 圆环 —— 保证这个位置永远有东西在转，
+			 * 传达"在干活"。
+			 */
+			var ensureIcon = function () {
+				if (!iconWrap) return;
+				if (iconWrap.childNodes.length > 0) return;
+				/*
+				 * ## ⚠️ 用 `react-dom`（legacy render）而不是 `react-dom/server`
+				 *
+				 * 与 `buildBadgeNode` 同一个坑：`react-dom/server` 在这个前端模块
+				 * 加载器里解析不到（官方所有客户端包一次都没 require 过它），
+				 * `require` 直接抛错 ⇒ 静默退化成下面那个自制 CSS 圆环。
+				 *
+				 * 真机表现就是「同步时那个图标不是官方的转圈，而是一个细圆环」
+				 * —— 不报错，但一眼能看出和官方不一致。
+				 */
+				try {
+					var Icon = primitives.IconLoadingOutlineRegular;
+					var legacy = require('react-dom');
+					if (Icon !== null && Icon !== undefined
+						&& legacy && typeof legacy.render === 'function') {
+						var holder = document.createElement('div');
+						legacy.render(h(Icon, { size: 15 }), holder);
+						var svg = holder.querySelector('svg');
+						try { legacy.unmountComponentAtNode(holder); } catch (unmountError) {}
+						if (svg !== null) {
+							iconWrap.appendChild(svg.cloneNode(true));
+							return;
+						}
+					}
+				} catch (error) {
+					/* 退回 CSS 圆环 */
+				}
+				var ring = document.createElement('span');
+				ring.style.width = '14px';
+				ring.style.height = '14px';
+				ring.style.borderRadius = '50%';
+				ring.style.border = '2px solid currentColor';
+				ring.style.borderTopColor = 'transparent';
+				ring.style.boxSizing = 'border-box';
+				iconWrap.appendChild(ring);
+			};
+
+			var render = function () {
+				var st = getState();
+				if (!isAlive()) { teardown(); return; }
+				if (!st || !st.phase || st.phase === 'idle') { if (node) { try { node.style.opacity = '0'; } catch (hideErr) { /* ignore */ } } return; }
+				var n = ensureNode();
+				if (!n) return;
+				ensureIcon();
+
+				var total = st.total || 0;
+				var done = st.done || 0;
+				var known = total > 0;
+				var pct = known ? Math.max(0, Math.min(100, Math.round((done / total) * 100))) : 0;
+				var failed = st.phase === 'failed';
+				var finished = st.phase === 'done';
+				/*
+				 * 「完成但不完整」：phase 已是 done，但宿主写了 message
+				 * 说明有会话没同步成功（见宿主 1.2.52 的 failedCount）。
+				 *
+				 * ⚠️ 必须在这里声明，不能只在 finished 分支里 var ——
+				 * 那样走别的分支时它是 undefined，虽然结果碰巧对，
+				 * 但任何一处逻辑微调就会变成隐蔽 bug。
+				 */
+				var partial = finished && typeof st.message === 'string' && st.message !== '';
+
+				/*
+				 * ## 分阶段文案
+				 *
+				 * 用户明确要求：「开始真正的进度计算之前的那个等待过程，你没有做
+				 * 任何的一个文字提示……那你也可以写一下，比如说正在连接电脑」。
+				 *
+				 * 三个阶段：
+				 *   · `estimating` —— 正在问电脑"你那边有多少东西"（用户猜得很准）
+				 *   · `running` + total==0 —— 已经开工，但总量还没拿到
+				 *   · `running` + total>0  —— 有真实分母，按百分比走
+				 */
+				var title;
+				var subtitle;
+				if (failed) {
+					title = '同步未完成';
+					subtitle = st.message || '连接电脑失败，稍后可在侧边栏重试';
+				} else if (finished) {
+					title = '同步完成';
+					/*
+					 * ⚠️ 在这里挂上**预设实际拉到的条数**（真机诊断）。
+					 *
+					 * 用户明确要求过「把原因显示在界面里，我看一张截图就知道」。
+					 * 这个数字能分开两个方向完全不同的故障：
+					 *   · 拉到 0 条 ⇒ 数据没到手机，查电脑侧/隧道；
+					 *   · 拉到 N 条 ⇒ 数据到手了，查前端读取/渲染。
+					 *
+					 * 没有诊断值时退回原来的文案，不影响正常显示。
+					 */
+					/*
+					 * ## ⚠️⚠️ 完成但有失败 ⇒ 如实说明（1.2.52 修）
+					 *
+					 * 宿主现在会在「有会话没同步成功」时保留真实 done 并写入
+					 * message。但这里原来**根本不读 message** —— 后端说了，
+					 * 前端不显示，等于没说。用户看到的仍是「同步完成 ·
+					 * N 个工作区已就绪」，完全不知道有 2 条失败了。
+					 *
+					 * 所以：phase 是 done 且 message 非空 ⇒ 说明这是「完成但
+					 * 不完整」，标题改用「同步完成（有失败）」，副标题直接用
+					 * 宿主那句话。没有 message 才是真正的全绿。
+					 */
+					title = partial ? '同步完成（有失败）' : '同步完成';
+					subtitle = partial ? st.message : ((st.workspaces || 0) + ' 个工作区已就绪');
+					var diag = syncDiagRef.value;
+					/*
+					 * ## 模型没刷新时也要说出来（1.2.53）
+					 *
+					 * 宿主拿不到 `modelDirectories` 服务时只 return false，
+					 * 界面上却仍显示「同步完成 · N 个工作区已就绪」。
+					 * 用户接着打开模型菜单看到旧数据，会以为是同步没生效 ——
+					 * 实际是官方服务没接上，两件事完全不同。
+					 *
+					 * 只在**明确 false** 时提示；null（未尝试）和 true 都不打扰。
+					 */
+					/*
+					 * ## 把「为什么没刷新」直接写在界面上（1.2.63）
+					 *
+					 * 用户明确要求过：「把错误原因显示在 App 界面里，
+					 * 我看一张截图就知道」。一张截图不花钱，
+					 * 而反复让用户装包试错很费钱也很费时间。
+					 *
+					 * “未刷新”三个字不够：服务没注册 / 没 catalog /
+					 * 没 refresh 这三种情况修法完全不同。有原因就括起来一起显示。
+					 * 原因很长时截断：副标题只有一行，被截断反而更难读。
+					 */
+					if (!partial && st.modelRefresh === false) {
+						var mrReason = (typeof st.modelRefreshReason === 'string') ? st.modelRefreshReason : '';
+						/*
+						 * ⚠️ 阈值取 12 而不是 24（1.2.63：中文字符宽）
+						 *
+						 * 副标题是一行小字，能容纳的中文大约 20–24 个。
+						 * 而「模型未刷新：」本身就占 7 个字，中间那个间隔符又占 1 个。
+						 *
+						 * 若原因也留 24 个，总长会到 32+ ⇒ 整条被 CSS 截断
+						 * （尾部丢失，看不到结论），比只显示「未刷新」还难读。
+						 * 所以在源头就截到 12 个字并加省略号 —— 保证整条
+						 * 能完整显示，用户看得到尾。
+						 */
+						if (mrReason.length > 12) mrReason = mrReason.slice(0, 12) + '…';
+						subtitle += mrReason !== ''
+							? (' · 模型未刷新：' + mrReason)
+							: ' · 模型列表未刷新';
+					}
+					if (!partial && diag !== null && typeof diag === 'object') {
+						if (typeof diag.presets === 'number' && diag.presets >= 0) {
+							subtitle += ' · 预设 ' + diag.presets + ' 条';
+						} else if (typeof diag.reason === 'string' && diag.reason !== '') {
+							subtitle += ' · 预设未取到（' + diag.reason + '）';
+						}
+					}
+				} else if (st.phase === 'estimating' || (!known && st.phase !== 'running')) {
+					title = '正在连接电脑';
+					subtitle = '正在获取电脑上的工作区与对话数量…';
+				} else if (!known) {
+					title = '正在同步电脑上的对话';
+					subtitle = '正在统计总量，马上开始…';
+				} else {
+					title = '正在同步电脑上的对话';
+					subtitle = done + ' / ' + total;
+				}
+
+				if (titleEl) titleEl.textContent = title;
+				if (subEl) subEl.textContent = subtitle;
+
+				/*
+				 * ## 进度条的三种形态
+				 *
+				 *   ① 未知总数 ⇒ **不确定态**：一条短亮块来回流动，表示"在进行、
+				 *      总量未知"。这是用户最在意的一点 —— 上一版静态卡在 38%
+				 *      让他以为死机了。
+				 *   ② 已知总数 ⇒ 确定态按百分比（用户认可的"稳步前进"）。
+				 *   ③ 失败 ⇒ 变红并停在当前值（不回退，保留现场）。
+				 */
+				if (fill) {
+					if (failed) {
+						fill.style.width = (known ? pct : 100) + '%';
+						fill.style.background = 'var(--dsw-alias-state-error-primary, #D9534F)';
+						fill.style.animation = 'none';
+						fill.style.opacity = '1';
+					} else if (known) {
+						fill.style.animation = 'none';
+						fill.style.opacity = '1';
+						/*
+						 * 有失败时**不能**画成 100% —— 那是在撒谎。
+						 * 保留真实比例，并换成警告色，让「没全成」这件事一眼可见。
+						 */
+						fill.style.width = ((finished && !partial) ? 100 : pct) + '%';
+						fill.style.background = (finished && partial)
+							? 'var(--dsw-alias-state-warning-primary, #E8A33D)'
+							: 'var(--dsw-alias-state-business-primary, #4A7DFF)';
+					} else {
+						/*
+						 * 不确定态：宽度固定 35%，靠 transform 来回扫。
+						 * 用 transform 而不是改 width —— 前者走合成器不触发重排，
+						 * 每秒 60 帧也不卡。
+						 */
+						fill.style.width = '35%';
+						fill.style.background = 'var(--dsw-alias-state-business-primary, #4A7DFF)';
+						fill.style.animation = 'jlmSyncIndeterminate 1.35s ease-in-out infinite';
+					}
+				}
+
+				if (pctEl) {
+					pctEl.textContent = failed ? '' : (known ? (done + ' / ' + total + '  ·  ' + pct + '%') : '');
+				}
+
+				/*
+				 * 全绿才淡出。有失败时留在屏幕上 —— 否则 900ms 就消失，
+				 * 用户根本来不及看清哪条失败了，那等于没说。
+				 */
+				var holdOn = (finished && partial);
+				n.style.opacity = (finished && !partial) ? '0' : '1';
+				if (cardEl) cardEl.style.transform = 'scale(1)';
+
+				if (removeTimer !== null) { clearTimeout(removeTimer); removeTimer = null; }
+				if (finished || failed) {
+					removeTimer = setTimeout(function () {
+						removeTimer = null;
+						teardown();
+					}, failed ? 6000 : (holdOn ? 8000 : 900));
+				}
+			};
+
+			var teardown = function () {
+				if (removeTimer !== null) { clearTimeout(removeTimer); removeTimer = null; }
+				/*
+				 * ⭐ 两种句柄都必须清（1.2.61）。
+				 *
+				 * 漏清 rafId 的后果：浮层已经从页面上摸掉了，
+				 * 但帧回调还在下一帧跑 —— 每帧都去 getState()、
+				 * 读一个已经没人看的状态，白耗 CPU 和电。
+				 * 漏清 intervalId 同理（且它不受页面可见性影响，更容易漏）。
+				 */
+				if (rafId !== null) {
+					try {
+						if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(rafId);
+					} catch (cancelError) { /* 取消失败不影响主流程 */ }
+					rafId = null;
+				}
+				if (intervalId !== null) {
+					try {
+						if (typeof clearInterval === 'function') clearInterval(intervalId);
+					} catch (clearError) { /* 同上 */ }
+					intervalId = null;
+				}
+				if (node) {
+					try { if (node.parentNode) node.parentNode.removeChild(node); } catch (ignored) { /* 已被移除 */ }
+				}
+				node = null;
+				cardEl = null;
+				fill = null;
+				titleEl = null;
+				subEl = null;
+				pctEl = null;
+				iconWrap = null;
+			};
+
+			var lastPhase = '';
+			var lastDone = -1;
+			var lastTotal = -1;
+			/*
+			 * ## ⚠️⚠️ 刷新循环必须双通道 + 整体兜底（1.2.61 修）
+			 *
+			 * 原来直接调 `requestAnimationFrame(loop)`，两个问题：
+			 *
+			 * ① **`requestAnimationFrame` 未判存**。它不是语言内建，
+			 *    而是渲染引擎提供的。某些 WebView / 页面处于非活跃
+			 *    状态时它不存在 ⇒ 这里抛 ReferenceError。
+			 *
+			 * ② **它在帧回调里抛，外面的 guard 接不住**。
+			 *    `guard('mountSyncProgress', ...)` 只能捉到**同步执行时**
+			 *    的异常。而 loop 是下一帧才跑的 —— 抛在那里
+			 *    就是 unhandled error，且**浮层永远画不出来**。
+			 *
+			 * 这正是「进度浮层不出现」的一种成因，而且比渲染错难查得多。
+			 *
+			 * 所以：有 rAF 就用 rAF（流畅、自带节流），
+			 * 没有就退到 setInterval（功能等价，只是流畅度差一点）。
+			 * 两条通道都要：整体包 try、每帧也包 try、
+			 * dispose 时把两种句柄都清掉。
+			 */
+			var tickOnce = function () {
+				if (!isAlive()) { teardown(); return; }
+				var st = getState();
+				var phase = (st && st.phase) || 'idle';
+				var done = (st && st.done) || 0;
+				var total = (st && st.total) || 0;
+				if (phase !== lastPhase || done !== lastDone || total !== lastTotal) {
+					lastPhase = phase;
+					lastDone = done;
+					lastTotal = total;
+					render();
+				}
+			};
+			/*
+			 * 帧回调：任何异常都必须吞掉，否则浮层不更新且每帧报错。
+			 * 注意重新注册必须在 try 之外：若 render() 抛错，
+			 * 循环也不能断 —— 否则一次渲染失败就执行不到下一帧了。
+			 */
+			var frame = function () {
+				try {
+					tickOnce();
+				} catch (renderError) {
+					try { window.__dshRemoteProgressError = String(renderError); } catch (probeError) { /* 诊断失败不影响主流程 */ }
+				}
+					/*
+					 * 已经 teardown（浮层拆了）就不再续帧。
+					 * 否则 dispose 之后还会一直空跑，白耗 CPU。
+					 */
+				/*
+				 * ## ⚠️⚠️ 不能把 `node === null` 当退出条件（1.2.84 修）
+				 *
+				 * 本函数在插件 `apply()` 时就 mount 并立刻 `schedule()`，
+				 * 而那一刻还未配对 ⇒ `render()` 判 idle ⇒ teardown ⇒ `node = null`
+				 * ⇒ 旧写法这里直接 `return` ⇒ **循环在第一帧就死了**。
+				 *
+				 * 于是配对成功、`runAutoSync` 把 phase 改成 `estimating` 之后，
+				 * 没有任何循环在跑 ⇒ 进度动画永远不出现。
+				 * 它不是「后来消失了」，而是「从来没出现过」。
+				 *
+				 * 现在只在**真正卸载**时停。空循环每帧只比 3 个字段。
+				 */
+				if (!isAlive()) return;
+				schedule();
+			};
+			var schedule = function () {
+				try {
+					if (typeof requestAnimationFrame === 'function') {
+						rafId = requestAnimationFrame(frame);
+						return;
+					}
+				} catch (rafError) {
+					/* rAF 存在但调用失败 ⇒ 退到定时器 */
+				}
+				try {
+					if (typeof setInterval === 'function' && intervalId === null) {
+						intervalId = setInterval(frame, 120);
+					}
+				} catch (timerError) {
+					/* 连定时器都没有 ⇒ 只能静默放弃，但绝不能抛 */
+				}
+			};
+			schedule();
+
+			return { dispose: teardown };
+		}
 
 		/**
 		 * 把电脑上某个目录的历史对话**按需同步**到手机侧边栏。
@@ -3858,6 +8884,44 @@ window.__ModuleLoader__.load({
 		 * 完全不知道我们的存在，所以不可能被我们弄坏。
 		 */
 		function installSyncMenu(ctx) {
+			/*
+			 * ## ⚠️⚠️ 日志出口（1.2.55 新增）
+			 *
+			 * 原来这三处 catch 里写的是 `ctx.logger?.warn?.(...)`。两个问题：
+			 *
+			 * ① **可选链 `?.` 是 chrome80+ 语法**，而本文件受 chrome73 约束。
+			 *    旧 WebView 解析到这里会直接抛 SyntaxError —— **整个文件不执行**，
+			 *    侧边栏图标、进度浮层、所有装饰一起消失。用户看到的是
+			 *    「插件像是没装」，而不是「某个功能坏了」。
+			 *
+			 * ② `ctx` 允许为 undefined（见文件头对该参数的说明）。
+			 *    即便语法能过，`undefined?.logger` 之后 `warn` 调用仍是问题。
+			 *    所以必须**先判类型再调**，等价于可选链、但兼容更老的引擎。
+			 *
+			 * 这个函数本身也包了 try：日志打不出来绝不能再炸一次，
+			 * 否则 catch 里抛错会盖掉真正要报的错。
+			 */
+			/*
+			 * ⚠️ `logWarn` 已提到**模块级**（1.2.70 修）。
+			 *
+			 * 原来它就定义在这里（`installSyncMenu` 内部），但下面三个
+			 * **模块级**函数也在调它：
+			 *
+			 *     showPromptFailure（行 8396）  → logWarn
+			 *     showAskCard（行 8465）        → logWarn
+			 *     异常回传那段（行 8574）     → logWarn
+			 *
+			 * 而 `installSyncMenu` 的范围是 7444~8320 —— 上面三处**全在范围外**。
+			 * 于是这三个 catch 里一定抛 `ReferenceError: logWarn is not defined`，
+			 * **把真正要报的错误盖掉**。
+			 *
+			 * 这和 `invalidateDesktopCache is not defined`、`mergePresets`、
+			 * `refreshOfficialModelCatalog` 是**同一类**销误：模块级函数看不见
+			 * 某个闭包里的局部变量。只是前三个被真机撞到了，
+			 * 这三个还没被撞到 —— 因为它们只在 catch 里跑。
+			 *
+			 * 定义见模块开头的 `var logWarn = function (message) {`。
+			 */
 			/** 当前挂着的那个「同步对话」按钮（避免重复插入）。 */
 			var mounted = null;
 			/** 当前对话框状态。 */
@@ -4020,10 +9084,42 @@ window.__ModuleLoader__.load({
 				// 兜底：行上没打到属性（比如 `decorate()` 那一刻清单还没回来）时，
 				// 按标题去镜像清单里找。标题取路径末段，同名概率低，作为兜底够用。
 				if (lastMenuRowTitle === '') return null;
+				/*
+				 * ⚠️ 两侧都要先剥掉零宽标记（`stripDesktopMark`）。
+				 *
+				 * `lastMenuRowTitle` 来自 `node.textContent.trim()` —— 而 `trim()` 会留着
+				 * `\u200B`（零宽不算空白），宿主下发的 `title` 也带它。
+				 * 两边都带、看似能对上，但只要哪一侧经过了别的地方的 `trim` 或
+				 * 字符串比较，就会失配。统一剥掉最稳。
+				 */
+				var rowTitlePlain = stripDesktopMark(lastMenuRowTitle);
 				var list = mirrorWorkspacesRef.value;
 				for (var index = 0; index < list.length; index += 1) {
-					var title = list[index].title;
-					if (title !== '' && lastMenuRowTitle.indexOf(title) === 0) return list[index].desktopPath;
+					var title = stripDesktopMark(list[index].title);
+					if (title !== '' && rowTitlePlain.indexOf(title) === 0) return list[index].desktopPath;
+				}
+				/*
+				 * ## 默认工作区的兜底（用户长期留存的问题，2026-10-29 修）
+				 *
+				 * 用户原话：「之前用户手动选择工作区的时候，如果那个工作区是电脑的
+				 * DSH 默认工作区的话，就无法手动点击同步对话，点击同步对话没有任何
+				 * 反应」。
+				 *
+				 * 前两条判据在这里都会失败：
+				 *   · `lastMenuRowPath` 为空 —— `decorate()` 没能给这一行打上标记
+				 *     （原因见下）；
+				 *   · 标题前缀匹配失败 —— 电脑默认工作区的镜像标题取自**路径末段**
+				 *     （如 `.dsh`、`X`），而官方可能把它渲染成本地化名字，
+				 *     或者末段太短（<3 字符）被 `rowMatchesMirror` 里那条
+				 *     `title.length < 3` 的保护挡掉。
+				 *
+				 * 最后这一条兜底：**清单里只有一条镜像工作区时，就是它**。
+				 * 单条时不可能"串台"，而这个功能本身就是"给这个工作区同步对话"，
+				 * 比什么都不发生好得多（用户要的是"点了有反应"）。
+				 */
+				if (list.length === 1) {
+					var onlyPath = list[0] && list[0].desktopPath;
+					if (typeof onlyPath === 'string' && onlyPath !== '') return onlyPath;
 				}
 				return null;
 			};
@@ -4044,6 +9140,84 @@ window.__ModuleLoader__.load({
 			 *
 			 * @param row - 刚被点开的那个 `role="treeitem"` 元素（可能已经不在 DOM 里）。
 			 */
+			/**
+			 * 判断某个侧边栏行的文本是否对应这条镜像工作区。
+			 *
+			 * ## 为什么不只是 `rowText.indexOf(title) === 0`
+			 *
+			 * 官方 UI 会对**内置工作区**做本地化显示：registry 里 id 是
+			 * `default-workspace`，界面上写的是「默认工作区」（英文环境是
+			 * `Default workspace`）。而本插件下发的 `title` 取自**电脑路径末段**
+			 * （`desktopTitle()`），对默认工作区就是 `DeepSeek` 这类目录名 ——
+			 * 两个字符串毫无交集，`indexOf` 必然失败。
+			 *
+			 * 失败的后果不是"显示不出来"，而是：这一行**打不上**
+			 * `data-dsh-workspace-desktop` ⇒ 用户点「⋯ → 同步对话」时前端
+			 * 拿不到电脑路径 ⇒ 菜单直接消失、什么也不发生。也就是用户报的
+			 * 「在默认工作区点同步对话没反应」。
+			 *
+			 * ## 判据（按可靠性排序）
+			 *
+			 * ① 精确相等 —— 最稳，不受后续追加的角标/计数影响；
+			 * ② 本地化别名 —— 已知的内置工作区显示名；
+			 * ③ 前缀匹配 —— 行文本以标题开头（官方会在标题后追加徽标文本）。
+			 *
+			 * ⚠️ ③ 必须**只在标题足够长时**才用：短标题（如 `a`、`docs`）
+			 * 会命中一堆无关行，反而把别的行标错。
+			 *
+			 * @param rowText - 行文本（已 trim）。
+			 * @param title - 插件下发的镜像工作区标题。
+			 * @param slug - 工作区 slug（用于识别内置工作区）。
+			 * @returns 是否匹配。
+			 */
+			/**
+			 * 剥掉标题里的零宽标记，只留用户能看见的文字。
+			 *
+			 * 宿主给镜像工作区标题加了 `\u200B` 前缀（用来识别"这是电脑工作区"），
+			 * 而官方 UI 渲染时它是**不可见**的。凡是要拿行文本跟标题比对的地方，
+			 * 两边都得先剥掉它，否则 `'\u200Bdsh' !== 'dsh'` ⇒ 匹配失败
+			 * ⇒「同步对话」菜单认不出这一行。
+			 */
+			var stripDesktopMark = function (text) {
+				return String(text === undefined || text === null ? '' : text).split(TITLE_PREFIX).join('');
+			};
+
+			var rowMatchesMirror = function (rowText, title, slug) {
+				if (rowText === '' || typeof title !== 'string' || title === '') return false;
+				// 两边统一剥掉零宽标记后再比（见 `stripDesktopMark`）。
+				rowText = stripDesktopMark(rowText);
+				title = stripDesktopMark(title);
+				if (rowText === '') return false;
+				// ① 精确相等
+				if (rowText === title) return true;
+				// ② 本地化别名：官方内置工作区按语言显示，与路径末段对不上。
+				var ALIAS = {
+					'default-workspace': ['默认工作区', 'Default workspace', 'Default Workspace'],
+				};
+				var aliases = ALIAS[slug];
+				if (aliases !== undefined) {
+					for (var a = 0; a < aliases.length; a += 1) {
+						if (rowText === aliases[a]) return true;
+					}
+				}
+				// ③ 前缀匹配：只在标题够长时启用（短标题会误伤）
+				if (title.length < 3) {
+					/*
+					 * 短标题（如 `X`、`.dsh`）不能用「前缀匹配」—— 会误伤一堆无关行。
+					 *
+					 * 但也不能就此放弃：电脑默认工作区的路径末段常常就是这么短
+					 * （`C:\Users\X`、`~/.dsh`），而用户报的「默认工作区点同步对话
+					 * 没反应」正是这一类。
+					 *
+					 * 折中：改成**整行等于**标题才算命中（不是前缀）。短标题下这个
+					 * 判据足够严 —— 一行文字恰好只有 `X` 或 `.dsh`，几乎只能是它。
+					 * 仍然误伤的话，还有 `desktopPathOfMenu` 里「清单只有一条」那道兜底。
+					 */
+					return rowText === title;
+				}
+				return rowText.indexOf(title) === 0;
+			};
+
 			var refreshMirrorWorkspacesAsync = function (row) {
 				bridge('mirrorWorkspaces', {}).then(
 					function (result) {
@@ -4059,7 +9233,7 @@ window.__ModuleLoader__.load({
 							var item = list[i];
 							if (!item || typeof item.desktopPath !== 'string' || item.desktopPath === '') continue;
 							if (typeof item.title !== 'string' || item.title === '') continue;
-							if (rowText.indexOf(item.title) !== 0) continue;
+							if (!rowMatchesMirror(rowText, item.title, item.slug)) continue;
 							try {
 								row.setAttribute('data-dsh-workspace-desktop', item.desktopPath);
 							} catch (setError) {
@@ -4106,8 +9280,41 @@ window.__ModuleLoader__.load({
 				// ⚠️ 侧边栏收起时 `treeitem` 数量是 0，这一圈本来就什么都不做；
 				// 但 `querySelectorAll` 本身仍要走一次选择器引擎。加个闸把它也免掉 ——
 				// 用户大多数时间是在**会话里**，侧边栏是收起的。
-				var sidebarOpen = document.querySelector('[class*="mp-drawer-open"]') !== null;
-				if (mirrors.length > 0 && sidebarOpen) {
+				/*
+				 * ## ⚠️⚠️ 这个门槛原来用的类名**根本不存在**（1.2.73 修）
+				 *
+				 * 原来写的是：
+				 *
+				 *     var sidebarOpen = document.querySelector('[class*="mp-drawer-open"]') !== null;
+				 *     if (mirrors.length > 0 && sidebarOpen) { ...整段装饰... }
+				 *
+				 * `mp-drawer-open` 在官方引擎里**一次都没出现过**。实测：
+				 *
+				 *     grep -r 'drawer' 在 dsh-client-ui-各包的 client.js 里   ⇒ 零命中
+				 *
+				 * 官方用的是 **data 属性**：`dsh-client-ui-layout` 渲染时写
+				 * `data-sidebar-collapsed`（见它自己的 CSS 选择器），根本不是一个类名。
+				 *
+				 * 后果：`sidebarOpen` **恒为 false** ⇒ 下面整段永远不执行 ⇒
+				 *
+				 *   · `insertDesktopBadge` 从来没被调用　⇐用户报的「电脑 SVG 图标完全没出现」
+				 *   · 工作区行永远打不上 `data-dsh-workspace-desktop` ⇐用户报的「图标位置不对 / 行首空白」
+				 *
+				 * 都是静默失效，没有任何报错 —— 这就是一直查不到的原因。
+				 *
+				 * ## 现在怎么判
+				 *
+				 * 反过来想：这个门槛本来就不应该存在。
+				 * 下面第一句就是 `querySelectorAll('[role="treeitem"]')`，
+				 * 侧边栏收起时它自然返回空集合，循环一次也不走。
+				 * 所以这个前置判断只是“预热优化”，却把功能整个关掉了。
+				 *
+				 * 保留一个**真实存在的**快速路：只要页面里连一个 `treeitem` 都没有，
+				 * 就直接跳过（这一步只是 `querySelector`，比 `querySelectorAll` 还便宜）。
+				 * 而“侧边栏是不是展开”交给下面的行数自然判定。
+				 */
+				var hasTreeRows = document.querySelector('[role="treeitem"]') !== null;
+				if (mirrors.length > 0 && hasTreeRows) {
 					var rows = document.querySelectorAll('[role="treeitem"]');
 					for (var r = 0; r < rows.length; r += 1) {
 						var row = rows[r];
@@ -4134,7 +9341,7 @@ window.__ModuleLoader__.load({
 							for (var m = 0; m < mirrors.length; m += 1) {
 								var item = mirrors[m];
 								if (item.desktopPath === undefined || item.desktopPath === null) continue;
-								if (item.title !== '' && rowText.indexOf(item.title) === 0) {
+								if (rowMatchesMirror(rowText, item.title, item.slug)) {
 									// ⚠️ **打 `desktopPath`，不打 `workspaceId`**。
 									//
 									// 原先打的是 workspaceId，实测行不通：镜像工作区是
@@ -4177,11 +9384,55 @@ window.__ModuleLoader__.load({
 				// 官方菜单浮层一定带它（真机 DOM 核对过：
 				// `<div role="menu" class="_surface_ri079_1 _list_4ub78_7">`）。
 				// 所以先用它当闸门，没菜单就直接跳过整段。
-				if (document.querySelector('[role="menu"]') === null) {
+				/*
+				 * ## ⚠️⚠️ 闸门本身比被保护的代价还大（1.2.77 修）
+				 *
+				 * 上面那段注释说 `querySelector('[role="menu"]')` 是
+				 * 「O(1) 的属性查询（走的是原生 attribute 索引）」。
+				 * **实测不是。**在 200 行侧边栏的真实 DOM 上：
+				 *
+				 *     document.querySelector('[role="menu"]')          3.77 ms
+				 *     遍历 document.body.children 查 role             0.14 ms   ← 快 27 倍
+				 *     而它要跳过的那段（遍历 body.children 读 textContent）  0.26 ms
+				 *
+				 * 也就是说：**为了省 0.26ms，先花了 3.77ms。**
+				 * 闸门比被保护的那段还贵 14 倍 —— 这个闸门本身就是负收益。
+				 *
+				 * `querySelector` 不是 O(1)：它要从根开始遍历整棵树直到命中。
+				 * 而菜单没开时**永远不会命中** ⇒ 每次都是最坏情况（扫完才知道没有）。
+				 *
+				 * 所以改成：直接遍历 `body.children`。
+				 * 官方菜单浮层是 body 的**直接子节点**（这一点下面的代码已经在用），
+				 * 而 body 的直接子节点通常就十几个 —— 遍历比选择器引擎快得多。
+				 */
+				var menuOpen = false;
+				if (document.body) {
+					var bodyKids = document.body.children;
+					for (var mk = 0; mk < bodyKids.length; mk += 1) {
+						var mkNode = bodyKids[mk];
+						if (mkNode && mkNode.getAttribute
+							&& mkNode.getAttribute('role') === 'menu') {
+							menuOpen = true;
+							break;
+						}
+					}
+				}
+				if (!menuOpen) {
 					if (mounted !== null) mounted = null;
 					return;
 				}
 				var panel = null;
+				/*
+				 * ⚠️ `document.body` 在极端时机下可能是 `null`（1.2.62）
+				 *
+				 * 脚本在 `<head>` 内执行、或文档尚未解析到 body 时，
+				 * `document.body` 为 null ⇒ `.children` 抛 TypeError。
+				 *
+				 * 这里外面虽然有 try（定时器那层兑底），但
+				 * 抛在这里意味着整个 decorate() 跳过 —— 包括后面
+				 * 真正需要做的那些装饰。能提前退就提前退。
+				 */
+				if (!document.body) return;
 				var tops = document.body.children;
 				for (var index = 0; index < tops.length; index += 1) {
 					var node = tops[index];
@@ -4452,7 +9703,41 @@ window.__ModuleLoader__.load({
 					/* 忽略：委托失败不能影响页面其它点击 */
 				}
 			};
+			/*
+			 * ## ⚠️⚠️ 先建清理器，再注册资源（1.2.79 修）
+			 *
+			 * 这个函数从**第一个 `addEventListener`** 到**返回清理函数**
+			 * 之间隔了 124 行。中间任何一处抛错，走到外层 `guard`：
+			 *
+			 *     guard('installSyncMenu', () => ctx.effect(() => installSyncMenu(ctx), ...))
+			 *
+			 * `guard` 把异常吞掉、返回 `fallback`(undefined) ⇒ `ctx.effect` 收不到
+			 * 清理函数 ⇒ **已经注册的监听器永远无人回收**。
+			 *
+			 * `guard` 能保证「不炸」，保证不了「回收」。
+			 * 而每多一个孤儿监听器，`onDocumentClick` 就多跑一遍 ——
+			 * 那个函数里有 `panel.appendChild`，它不幂等：
+			 * 跑两遍就是往菜单里插**两个**「同步对话」。
+			 *
+			 * 所以把资源全部登记在一个数组里，清理器引用它。
+			 * 这样即使在中间抛错，清理器也已经在外面手上、能回收已注册的部分。
+			 */
+			/* 已注册的资源回收器（监听器、定时器……） */
+			var installedResources = [];
+			var installCleanup = function () {
+				for (var ci = 0; ci < installedResources.length; ci += 1) {
+					try {
+						installedResources[ci]();
+					} catch (cleanupError) {
+						/* 单个清理失败不影响其它 */
+					}
+				}
+				installedResources.length = 0;
+			};
 			document.addEventListener('click', onDocumentClick, true);
+			installedResources.push(function () {
+				document.removeEventListener('click', onDocumentClick, true);
+			});
 
 			// 低频轮询：官方菜单是 React 按需渲染的浮层，没有可供订阅的事件。
 			// 250ms 一次、只在 DOM 里查一次轻量选择器，对手机端开销可忽略。
@@ -4568,6 +9853,9 @@ window.__ModuleLoader__.load({
 				}
 			};
 			document.addEventListener('pointerdown', onPointerDown, true);
+			installedResources.push(function () {
+				document.removeEventListener('pointerdown', onPointerDown, true);
+			});
 
 			var timer = setInterval(function () {
 				try {
@@ -4576,10 +9864,12 @@ window.__ModuleLoader__.load({
 					/* 结构变化导致的偶发失败忽略 */
 				}
 			}, 250);
-			return function () {
+			installedResources.push(function () {
 				clearInterval(timer);
-				document.removeEventListener('pointerdown', onPointerDown, true);
-				document.removeEventListener('click', onDocumentClick, true);
+			});
+			return function () {
+				/* 先回收已注册的所有资源（监听器 + 定时器） */
+				installCleanup();
 				// 卸载前把可能藏着的菜单浮层还原，别给官方留一个隐藏节点。
 				restoreHiddenMenu();
 				if (host !== null && host.parentNode !== null) host.parentNode.removeChild(host);
@@ -4694,7 +9984,15 @@ window.__ModuleLoader__.load({
 					if (bar.isConnected) bar.remove();
 				}, 6000);
 			} catch (error) {
-				if (ctx.logger && typeof ctx.logger.warn === 'function') { ctx.logger.warn('[dsh-remote-mobile] 画发送失败提示出错: ' + String(error)); }
+				/*
+				 * ⚠️⚠️ 这里**不能**用可选链 `?.`（1.2.55 修）。
+				 *
+				 * 本文件受 chrome73 语法约束（见文件头）。`?.` 是 chrome80+ 才有的，
+				 * 在这台机器的 WebView 上会让**整个文件解析失败**（SyntaxError），
+				 * 于是侧边栏图标、进度浮层、所有装饰一起消失。
+				 * 那不是「没生效」，是脚本根本没跑起来。
+				 */
+				logWarn('[dsh-remote-mobile] 画发送失败提示出错: ' + String(error), ctx);
 			}
 		}
 
@@ -4743,7 +10041,29 @@ window.__ModuleLoader__.load({
 				cs.position = 'fixed';
 				cs.left = '10px';
 				cs.right = '10px';
-				cs.bottom = 'calc(env(safe-area-inset-bottom, 0px) + 76px)';
+				/*
+				 * ## ⚠️⚠️ 垂直位置：**贴顶不贴底**（1.2.92 修）
+				 *
+				 * 原来写的是 `bottom: calc(env(safe-area-inset-bottom) + 76px)`，
+				 * 也就是贴在屏幕底部往上 76px。听着合理（避开输入框），但手机
+				 * 的输入框（composer）不是 76px 高 —— 带操作按钮、模型选择、
+				 * 状态栏那一整块实测约 300px，而且 `position: fixed` 浮在最上层。
+				 *
+				 * 结果：卡片被输入框**完全盖住**。真 Chromium 量出来的数据：
+				 *
+				 *     rect: { y: 2081, h: 219 }   卡片
+				 *     输入框 top: 2076
+				 *     实际可见高度: 0 / 219        ← 一点都看不到
+				 *
+				 * 卡片**渲染成功了**，但用户眼里什么都没有。这就是「代码明明对、
+				 * 就是不弹」的真相：不是没弹，是被挡住了。静态断言查不到这个，
+				 * 只有真实浏览器能量出来。
+				 *
+				 * 改成贴顶部：顶部只有一条细标题栏（约 56px），从 64px 往下排，
+				 * 既不被输入框盖住，也不挡标题。`maxHeight: 62vh` 保证多题时
+				 * 不会铺满整屏。
+				 */
+				cs.top = 'calc(env(safe-area-inset-top, 0px) + 64px)';
 				cs.zIndex = '2147483001';
 				cs.borderRadius = '16px';
 				cs.background = '#ffffff';
@@ -4782,29 +10102,87 @@ window.__ModuleLoader__.load({
 				);
 				card.appendChild(eyebrow);
 
+				/*
+				 * **补拉提示条**（`payload.note`）。
+				 *
+				 * 场景：用户走开时电脑上发起了审批，当时手机不在线 ⇒ 电脑把它
+				 * fallback 给了本地 GUI（见电脑端 `ghostAsks`）。用户回来打开手机，
+				 * 这条请求被补拉出来 —— 但它很可能**已经在电脑上处理过了**。
+				 *
+				 * 不提示的话，用户点了「允许」发现没反应，只会以为 App 坏了。
+				 */
+				if (typeof payload.note === 'string' && payload.note !== '') {
+					card.appendChild(
+						el(
+							'div',
+							{
+								fontSize: '12px',
+								lineHeight: '1.45',
+								marginTop: '2px',
+								marginBottom: '8px',
+								padding: '7px 9px',
+								borderRadius: '8px',
+								background: 'rgba(224,163,58,0.14)',
+								color: '#8a5b00',
+							},
+							payload.note,
+						),
+					);
+				}
+
 				/** 收起卡片（不回答 = 让电脑那边超时或走官方兜底）。 */
 				var dismiss = function () {
 					if (card.isConnected) card.remove();
 				};
 
-				/** 把答案送回电脑。 */
+				/**
+				 * 把答案送回电脑。
+				 *
+				 * ## ⚠️⚠️ 必须走 `bridge()`，不能裸 `fetch`（1.2.96 修，这是「点了没反应」的根因）
+				 *
+				 * 原来这里直接 `fetch(ROUTE_RPC, ...)`，自己拼 body、自己 `JSON.stringify`。
+				 * 看着和 `bridge()` 长得一样，但**少了三件 `bridge()` 做的事**：
+				 *
+				 *   ① `bridge()` 统一读 `payload.result`，而这里直接 `.catch` 掉 ——
+				 *      服务端 `{ ok: false, reason: 'unreachable' }` 这种**业务失败**
+				 *      会被当成成功，用户点了永远没反馈；
+				 *   ② 裸 fetch 不经过 `bridge` 里那条 `fetch` 存在性检查；
+				 *   ③ 拼错/漏参时没有任何地方会告诉你。
+				 *
+				 * 但真正让「点了没反应」的是**下面这条数据形状问题**（见 `commit`）：
+				 * 选项原来没有 `id`，回传的 `answers` 里只有 `selected` 标签、没有
+				 * `questionId` 之外的东西，电脑端拿去和 `questions[].options[]`
+				 * 对不上 ⇒ 判成「形状不对」⇒ 丢弃手机答案退回电脑那条 ⇒
+				 * 手机这边表现就是**什么都没发生**。
+				 */
 				var submit = function (answer) {
 					dismiss();
 					try {
-						// 走官方 RPC 通道（与手机端其他调用同一条）。
-						fetch('/api/dsh-remote/rpc', {
-							method: 'POST',
-							headers: { 'content-type': 'application/json' },
-							body: JSON.stringify({
-								method: 'answerAsk',
-								params: { requestId: payload.requestId, answer: answer },
-							}),
-						}).catch(function () {
-							// 送不回去就算了：电脑端会超时并走官方兜底，
-							// 用户也可以在电脑上直接点。这里弹错误只会添乱。
+						var sent = bridge('answerAsk', {
+							requestId: payload.requestId,
+							answer: answer,
 						});
+						if (sent && typeof sent.then === 'function') {
+							sent.then(
+								function (result) {
+									/*
+									 * 电脑端明确说「没送到」时要让用户知道，否则他又会
+									 * 以为卡片自己消失了、问题已解决。
+									 * 这里用一条轻提示，不阻塞界面。
+									 */
+									if (result && result.ok === false) {
+										logWarn('[dsh-remote-mobile] 答案未送达: ' + String(result.reason || ''), ctx);
+									}
+								},
+								function (error) {
+									// 送不回去就算了：电脑端会超时并走官方兜底，
+									// 用户也可以在电脑上直接点。
+									logWarn('[dsh-remote-mobile] 回传答案失败: ' + String(error && error.message ? error.message : error), ctx);
+								},
+							);
+						}
 					} catch (error) {
-						if (ctx.logger && typeof ctx.logger.warn === 'function') { ctx.logger.warn('[dsh-remote-mobile] 回传答案失败: ' + String(error)); }
+						logWarn('[dsh-remote-mobile] 回传答案失败: ' + String(error), ctx);
 					}
 				};
 
@@ -4896,9 +10274,40 @@ window.__ModuleLoader__.load({
 					var options = Array.isArray(q.options) ? q.options : [];
 					var multi = q.multiSelect === true;
 
-					/** 收尾一题：记下答案，进入下一题或提交。 */
-					var commit = function (selected) {
-						cursor.answers.push({ questionId: q.id, selected: selected });
+					/**
+					 * 收尾一题：记下答案，进入下一题或提交。
+					 *
+					 * `text` 用于「没有选项、只有主观回答」的那种问题（见下面
+					 * `options.length === 0` 分支）—— 官方 schema 里它是必填的自由文本。
+					 */
+					/*
+					 * ## ⚠️⚠️ 字段名必须与官方一致：`id` / `selected` / `custom`（1.2.97）
+					 *
+					 * 原来发的是 `{ questionId, selected }` + 自由文本放 `text`。
+					 * 而官方 `dsh-tool-ask-user/lib/index.js:53` 的 `answerResult()` 是：
+					 *
+					 *     return { answers: result.answers.map((answer) => ({
+					 *         id: answer.id,
+					 *         selected: [...answer.selected],
+					 *         ...answer.custom !== void 0 ? { custom: answer.custom } : {}
+					 *     })) };
+					 *
+					 * 我们发 `questionId` ⇒ 官方读 `answer.id` 得到 `undefined`；
+					 * 再把 `undefined` 塞进工具输出，宿主校验「必须是无损 JSON」时
+					 * 直接抛：
+					 *
+					 *     Error: tool "ask_user_question" returned invalid output:
+					 *            value is not lossless JSON
+					 *
+					 * 这正是用户截图里那个红字报错。而且因为 `selected` 是 `[...answer.selected]`
+					 * 展开——`undefined` 不可迭代——所以更早就会炸。
+					 *
+					 * 现在统一官方的三个字段名。
+					 */
+					var commit = function (selected, custom) {
+						var entry = { id: q.id, selected: selected };
+						if (typeof custom === 'string' && custom !== '') entry.custom = custom;
+						cursor.answers.push(entry);
 						cursor.index += 1;
 						if (cursor.index >= questions.length) submit({ answers: cursor.answers });
 						else renderQuestion();
@@ -4941,6 +10350,72 @@ window.__ModuleLoader__.load({
 						card.appendChild(row);
 					});
 
+					/*
+					 * ## 没有选项 ⇒ 必须给输入框（1.2.96 修，用户报障）
+					 *
+					 * 用户原话：
+					 *   「更致命的是如果 AI 它此时发起的询问没有选项，只有主观回答的话，
+					 *     就是要输入文字的话没有输入框，也没有提交按钮，导致我无法关闭
+					 *     那个弹窗，就一直显示在整个 APP 的页面都会一直上浮。」
+					 *
+					 * 原代码只在 `options.forEach` 里造按钮，`options.length === 0` 时
+					 * 卡片上**一个可点元素都没有**（多选才有的「确认」也不会出现），
+					 * 于是既答不了、也关不掉 —— 那张卡片会一直浮在界面上。
+					 *
+					 * 官方把这种问题叫「自由回答」：`options` 为空，答案放在 `text` 里。
+					 */
+					if (options.length === 0) {
+						var input = el('textarea', {
+							display: 'block',
+							width: '100%',
+							minHeight: '88px',
+							marginBottom: '8px',
+							padding: '10px 12px',
+							border: '1px solid #e5e7eb',
+							borderRadius: '11px',
+							background: '#ffffff',
+							color: '#0f1115',
+							fontSize: '14px',
+							lineHeight: '1.45',
+							boxSizing: 'border-box',
+							resize: 'vertical',
+							fontFamily: 'inherit',
+						});
+						input.setAttribute('placeholder', '在这里输入你的回答…');
+						card.appendChild(input);
+
+						var submitText = el(
+							'button',
+							{
+								display: 'block',
+								width: '100%',
+								minHeight: '46px',
+								border: 'none',
+								borderRadius: '11px',
+								background: '#2563eb',
+								color: '#ffffff',
+								fontSize: '15px',
+								fontWeight: '600',
+							},
+							'提交回答',
+						);
+						submitText.addEventListener('click', function () {
+							var value = String(input.value || '').trim();
+							/*
+							 * 空内容不发：电脑端拿到空文本会当成「用户取消了」，
+							 * 那一轮就被判成失败 —— 用户只是想先把卡片关掉而已。
+							 * 真要跳过请点下面的「跳过」。
+							 */
+							if (value === '') {
+								input.style.borderColor = '#ef4444';
+								try { input.focus(); } catch (focusError) { /* 忽略 */ }
+								return;
+							}
+							commit([], value);
+						});
+						card.appendChild(submitText);
+					}
+
 					if (multi) {
 						var confirm = el(
 							'button',
@@ -4963,8 +10438,18 @@ window.__ModuleLoader__.load({
 						card.appendChild(confirm);
 					}
 
-					// 「跳过」：只对多题有意义，单题跳过等于不回答。
-					if (questions.length > 1) {
+					/*
+					 * 「跳过 / 关闭」。
+					 *
+					 * ⚠️ 原来只在**多题**时才出现（`questions.length > 1`）。
+					 * 但用户报障的场景是：单题、且**没有选项** —— 那时卡片上没有任何
+					 * 可点元素，连关都关不掉（原话「导致我无法关闭那个弹窗，就一直
+					 * 显示在整个 APP 的页面都会一直上浮」）。
+					 *
+					 * 现在凡是「没有选项」的单题也给它一个，保证任何形态的卡片
+					 * **至少有一条退出路径**。
+					 */
+					if (questions.length > 1 || options.length === 0) {
 						var skip = el(
 							'button',
 							{
@@ -4989,7 +10474,7 @@ window.__ModuleLoader__.load({
 				renderQuestion();
 				document.body.appendChild(card);
 			} catch (error) {
-				if (ctx.logger && typeof ctx.logger.warn === 'function') { ctx.logger.warn('[dsh-remote-mobile] 画 ask 卡片出错: ' + String(error)); }
+				logWarn('[dsh-remote-mobile] 画 ask 卡片出错: ' + String(error), ctx);
 			}
 		}
 
@@ -5076,7 +10561,48 @@ window.__ModuleLoader__.load({
 		 * @param ctx - client 根上下文。
 		 */
 		function subscribe(ctx) {
-			var source = new EventSource(ROUTE_STREAM);
+			/*
+			 * ## ⚠️ `EventSource` 也要先判存在（1.2.59）
+			 *
+			 * `subscribe` 外面有 guard，所以它缺失时**不会带走整批插件**，
+			 * 但会静默地少掉【电脑实时消息流】—— 手机上看不到逐字动画，
+			 * 只能等整段结束后一次性刷出来，而且没有任何提示。
+			 *
+			 * 这不是「不能工作」，是「工作得不好」—— 比完全不工作难查得多。
+			 * 所以这里明确跳过，并在窗口上留个记号，方便真机上一眼看出原因。
+			 */
+			if (typeof EventSource !== 'function') {
+				try { window.__dshRemoteNoEventSource = true; } catch (probeError) { /* 诊断失败不影响主流程 */ }
+				return function () { };
+			}
+			/*
+			 * ⚠️ `source` 必须是**可替换的**，不能是 `const`。
+			 *
+			 * 后台冻结回来的连接会停在 CLOSED 且不会自己活过来，需要重建一条
+			 * （见本函数末尾 `reopen` 的注释）。所以这里把「建连接 + 挂监听」
+			 * 收进 `startSource()`，重建时整体重跑一遍。
+			 */
+			var source = null;
+
+			var startSource = function () {
+			source = new EventSource(ROUTE_STREAM);
+			/*
+			 * 连上/断开留个记号，真机上 `window.__dshRemoteAskStream` 一眼可查。
+			 *
+			 * ⚠️ 这条连接**不带 session 参数**，所以电脑端（1.0.49 起）把它当
+			 * 「全局订阅者」：ask/approval 弹窗会推给它，与用户当前打开哪个会话
+			 * 无关。这正是修「用户在会话 A、电脑在会话 B 弹窗收不到」的关键。
+			 *
+			 * 老版本电脑插件仍按 400 拒绝不带 session 的连接 —— 那样 EventSource
+			 * 会反复重连，所以这里记下状态供排查，但不影响任何功能
+			 *（`onerror` 里什么都不做，EventSource 自带重连）。
+			 */
+			source.addEventListener('open', function () {
+				try { window.__dshRemoteAskStream = 'open'; } catch (openError) { /* 诊断失败不影响主流程 */ }
+			});
+			source.addEventListener('error', function () {
+				try { window.__dshRemoteAskStream = 'retrying'; } catch (errError) { /* 同上 */ }
+			});
 			source.addEventListener('frame', function (message) {
 				var payload;
 				try {
@@ -5119,6 +10645,50 @@ window.__ModuleLoader__.load({
 					return;
 				}
 				if (!payload || typeof payload.requestId !== 'string') return;
+				/*
+				 * 诊断出口：真机上 `window.__dshRemoteLastAsk` 能看到最后收到的
+				 * ask 内容，`window.__dshRemoteAskCount` 是累计收到条数。
+				 *
+				 * 这两个字段的价值在于**区分故障段**：
+				 *   · count 一直 0 ⇒ 电脑的 ask 根本没送到手机（流/推送问题）
+				 *   · count 涨了但没卡片 ⇒ 收到了但渲染失败（本函数问题）
+				 * 之前几轮排查就卡在分不清这两者上。
+				 */
+				try {
+					window.__dshRemoteLastAsk = payload;
+					window.__dshRemoteAskCount = (window.__dshRemoteAskCount || 0) + 1;
+				} catch (diagError) { /* 诊断失败不影响弹窗 */ }
+				/*
+				 * ## 只在「正看着那个对话」时才弹（1.2.97，用户要求）
+				 *
+				 * 用户原话：
+				 *   「如果用户不在那个对话的话，那个悬浮窗就不要显示了，
+				 *     不然用户不选的话，那悬浮窗就一直在。」
+				 *
+				 * 说得对。一个跟当前屏幕无关的浮层**挡在别人对话上面**，用户既不
+				 * 知道它从哪来、也不想去答，最后只能一直挂着挡住消息。
+				 *
+				 * 判据：`payload.sessionId` 与当前打开的会话一致才弹。
+				 * 不一致时不弹 —— 但**不丢**：请求仍留在电脑端 `pendingAsks`，
+				 * 用户切到那个对话时前端会重新 `pullAsks` 把它补出来。
+				 *
+				 * ⚠️ 判不出当前会话时（hero 新建页、`selection` 还没落地）
+				 * **照样弹** —— 宁可多弹一张，也不要让正在等的那一轮没人答。
+				 */
+				var onIt = true;
+				try {
+					var viewing = currentSessionId();
+					if (typeof viewing === 'string' && viewing !== ''
+						&& typeof payload.sessionId === 'string' && payload.sessionId !== ''
+						&& viewing !== payload.sessionId) {
+						onIt = false;
+					}
+				} catch (viewError) { onIt = true; }
+				if (!onIt) {
+					logWarn('[dsh-remote-mobile] ask 属于另一个会话（' + String(payload.sessionId)
+						+ '），当前不在那个对话，先不弹；切过去时会补出来', ctx);
+					return;
+				}
 				showAskCard(ctx, payload);
 			});
 			// 转发失败通知。
@@ -5140,8 +10710,107 @@ window.__ModuleLoader__.load({
 				if (!payload || typeof payload.message !== 'string') return;
 				showPromptFailure(ctx, payload.sessionId, payload.message);
 			});
+			};
+
+			startSource();
+
+			var visibilityHandler = null;
+			/*
+			 * ## ⚠️⚠️ 回到前台时**强制重建**这条连接（1.2.93 修）
+			 *
+			 * 用户报障（2026-10-29）：
+			 *
+			 *   「我在手机上主动发消息的时候是可以收到的，但必须一直在线才行。
+			 *     比如我在电脑上面让他发起询问，然后我 APP 是退出后台的，
+			 *     重新打开 APP 无法收到新消息、也收不到弹窗。我必须去主页
+			 *     点『添加工作区』触发一次刷新，再回到刚才的对话才能看到
+			 *     文字刷新过来了 —— 但弹窗还是没有。」
+			 *
+			 * ## 根因：注释里那句「EventSource 自带断线重连」在真机上不成立
+			 *
+			 * 浏览器规范的自动重连只在**页面存活**的前提下有效。而 Android 在
+			 * App 退到后台后会冻结 WebView：定时器停摆、socket 被系统回收。
+			 * 回到前台时那条 EventSource 对象还是 `readyState === CLOSED`，
+			 * **不会自己活过来** —— 浏览器不会为一个已经死掉的连接重新拨号。
+			 *
+			 * 于是：
+			 *   · Node 侧那条 watcher 连接早就断了，`broadcast` 推给 0 个订阅者；
+			 *   · 电脑端的 ask 推到手机 Node 侧就进了真空 —— 前端根本不知道；
+			 *   · 用户点「添加工作区」能刷新，因为那是**一次新的 RPC 请求**，
+			 *     走的是 HTTP，不需要这条长连接；但它也救不回弹窗（见下）。
+			 *
+			 * ## 所以这里必须自己重建
+			 *
+			 * `visibilitychange` → 页面可见时，**先 close 再新建**一条：
+			 *   · close 保证不残留半死连接（否则旧对象会一直是 CLOSED，白占一个槽位）；
+			 *   · 新建后立刻能收到电脑的实时推送。
+			 *
+			 * 同时在重建后**补拉一次 ask**（`pullAsks`）：从后台回来这段时间里
+			 * 电脑可能已经发起过 ask，那些是实时推送错过的，只能补拉。
+			 * 这一步是「弹窗还是没有」的直接解药 —— 用户点『添加工作区』能刷新
+			 * 文字，恰恰证明**后端是通的**，只是没人去拉那些 ask。
+			 */
+			var reopen = function () {
+				try {
+					if (source !== null) source.close();
+				} catch (closeError) { /* 已经关了就算 */ }
+				try {
+					window.__dshRemoteAskStream = 'reopening';
+				} catch (diagError) { /* 诊断失败不影响主流程 */ }
+				/*
+				 * 用 `setTimeout(0)` 而不是同步重建：同一个 tick 里 close 完立刻 new，
+				 * WebView 偶尔会复用一个正在关闭的槽位，导致新连接一上来就 error。
+				 * 让出一轮事件循环最稳。
+				 */
+				var timer = setTimeout(function () {
+					try {
+						startSource();
+					} catch (restartError) { /* 下一次可见再试 */ }
+					/*
+					 * 重建连接后**补拉一次 ask**。
+					 *
+					 * 从 App 退到后台到重新打开这段时间里，电脑端可能已经发起过
+					 * ask —— 那些是实时推送，而当时连接是死的，全都错过了。
+					 * 电脑端会把它们留在 `pendingAsks` 里等（见桌面端 `askPhone`），
+					 * 这里主动去取。
+					 *
+					 * ⚠️ 这正是用户那句「文字刷新过来了，但弹窗还是没有」的直接原因：
+					 * 文字靠「打开会话时拉历史」补上了（RPC，不依赖长连接），
+					 * 而 ask 从来不落盘、只存在于 `pendingAsks`，**没人去拉就永远没有**。
+					 */
+					bridge('pullAsks', {}).then(
+						function () { /* 补到的会自己弹卡片 */ },
+						function () { /* 未配对 / 电脑离线 ⇒ 静默 */ },
+					);
+				}, 0);
+				try {
+					if (timer && typeof timer.unref === 'function') timer.unref();
+				} catch (unrefError) { /* 忽略 */ }
+			};
+
+			if (typeof document !== 'undefined' && document.addEventListener) {
+				visibilityHandler = function () {
+					if (document.hidden === true) return;
+					/*
+					 * 只在连接**确实不可用**时重建。
+					 *
+					 * `readyState === 1`（OPEN）说明它活得好好的 —— 这时重建是白白
+					 * 丢掉一条好连接，还会漏掉重建瞬间推送的事件。而 0（CONNECTING）
+					 * / 2（CLOSED）都说明它已经不可信了：后台冻结回来的连接基本
+					 * 都停在 CLOSED。
+					 */
+					if (source !== null && source.readyState === 1) return;
+					reopen();
+				};
+				document.addEventListener('visibilitychange', visibilityHandler);
+			}
 			return function () {
-				source.close();
+				if (visibilityHandler !== null && typeof document !== 'undefined' && document.removeEventListener) {
+					document.removeEventListener('visibilitychange', visibilityHandler);
+				}
+				try {
+					if (source !== null) source.close();
+				} catch (closeError) { /* 已经关了就算 */ }
 			};
 		}
 		//#endregion
@@ -5247,9 +10916,49 @@ window.__ModuleLoader__.load({
 			};
 
 			const injected = () => ({
-				listDirectory: (path, signal) => ctx.uiWorkspace.listDirectory(path, signal),
-				createDirectory: (path, name) => ctx.uiWorkspace.createDirectory(path, name),
-				openSession: (sessionId) => ctx.uiWorkspace.openSession(sessionId),
+				/*
+				 * ## ⚠️⚠️ `ctx.uiWorkspace` 必须判空（1.2.80 修）
+				 *
+				 * 原来写的是直接调：
+				 *
+				 *     listDirectory: (path, signal) => ctx.uiWorkspace.listDirectory(path, signal)
+				 *
+				 * `ctx.uiWorkspace` 一旦是 `undefined`（服务没装、或加载顺序差），
+				 * 这句就是 `TypeError: Cannot read property 'listDirectory' of undefined`。
+				 * 而它被调用的地方是（见下面的加载 effect）：
+				 *
+				 *     Promise.resolve(listDirectory(path))
+				 *
+				 * **`listDirectory(path)` 是同步求值的** —— 抛错发生在
+				 * `Promise.resolve` 被调用**之前**，所以 `.then(成功, 失败)` 根本
+				 * 没挂上，`patch({loading:false})` 永远不执行 ⇒ 界面**永远「加载中…」**。
+				 *
+				 * 不报错、不提示，就是转圈。用户截图里的「手机页签一直加载中」
+				 * 就是这个。
+				 */
+				listDirectory: (path, signal) => {
+					if (ctx.uiWorkspace === undefined || ctx.uiWorkspace === null
+						|| typeof ctx.uiWorkspace.listDirectory !== 'function') {
+						return Promise.reject(new Error('官方目录服务不可用（uiWorkspace 未就绪）'));
+					}
+					return ctx.uiWorkspace.listDirectory(path, signal);
+				},
+				/* 同上：也必须判空（1.2.80） */
+				createDirectory: (path, name) => {
+					if (ctx.uiWorkspace === undefined || ctx.uiWorkspace === null
+						|| typeof ctx.uiWorkspace.createDirectory !== 'function') {
+						return Promise.reject(new Error('官方目录服务不可用（uiWorkspace 未就绪）'));
+					}
+					return ctx.uiWorkspace.createDirectory(path, name);
+				},
+				/* 同上（1.2.80） */
+				openSession: (sessionId) => {
+					if (ctx.uiWorkspace === undefined || ctx.uiWorkspace === null
+						|| typeof ctx.uiWorkspace.openSession !== 'function') {
+						return Promise.reject(new Error('官方目录服务不可用（uiWorkspace 未就绪）'));
+					}
+					return ctx.uiWorkspace.openSession(sessionId);
+				},
 				/**
 				 * 把宿主刚建好的会话登记进本地列表。
 				 *
@@ -5306,6 +11015,13 @@ window.__ModuleLoader__.load({
 				 * 在侧边栏里点进去仍会被判成「本地」—— 正是用户报的那个 bug。
 				 */
 				refreshMirrorSlugs: () => loadMirrorSlugs(),
+				/**
+				 * 重拉电脑侧展示元数据（时间 + 置顶）。
+				 *
+				 * 同步完成、配对成功后调 —— 那正是元数据刚变的时刻。
+				 * 返回 Promise，永不 reject。
+				 */
+				refreshDesktopMeta: () => loadDesktopMeta(),
 				/** 解绑后把所有会话退回「本地」（电脑已经不在了）。 */
 				clearRemote: () => {
 					remoteSessionIds = {};
@@ -5317,6 +11033,141 @@ window.__ModuleLoader__.load({
 			guard('loadRemoteSessionIds', () => loadRemoteSessionIds());
 			// 拉一次镜像工作区 slug 集合（隔离的**真正判据**，见 `mirrorSlugs`）。
 			guard('loadMirrorSlugs', () => loadMirrorSlugs());
+			/*
+			 * 拉一次「镜像工作区标题 → 电脑路径」清单。
+			 *
+			 * 这是 `probeHeroWorkspaceDesktopPath()` 的比对依据 —— 新建对话页
+			 * 选中电脑工作区时，靠它把选择器上的文字翻译成电脑路径
+			 *（修用户报的「直接选已存在工作区时模型/预设不刷新」）。
+			 */
+			guard('loadMirrorDesktopTitles', () => loadMirrorDesktopTitles());
+
+			/*
+			 * ## 拉电脑侧的展示元数据（用户 2026-10-29 两个报障）
+			 *
+			 *   ① 「同步过来的对话，你没有按时间顺序进行一个排序」
+			 *   ② 「电脑的某些对话人家是置顶的状态，你也没有把置顶的状态同步过来」
+			 *
+			 * 这两件事手机本地都**没有真实数据**（理由见 `applyDesktopClock` 与
+			 * `applyPinFromDesktop` 的注释），必须由宿主告诉前端。
+			 *
+			 * 顺序有讲究：**先包装 `sessions.list`，再拉数据**。
+			 * 反过来的话，第一次拉到数据后要等下一次快照变化才生效 ——
+			 * 而那可能是一分钟后，用户看到的就是「没修」。
+			 */
+			guard('wrapSessionListClock', () => {
+				if (ctx.sessions === undefined || ctx.sessions === null) return;
+				/*
+				 * ## ⚠️⚠️ 原地改写，**不换对象、不碰 slots 私有字段**（1.2.88 起）
+				 *
+				 * 前两版都栽在同一件事上：`dsh-client-ui-session` 在**加载那一刻**调
+				 *
+				 *     ctx.slots.provideRoot({ hooks: { sessions: ctx.sessions.list } })
+				 *
+				 * 把对象**按引用**写进 root binding；`bindSnapshotSelector()`
+				 *（`dsh-client-ui-renderer/lib/client.js:155`）又把它存进闭包：
+				 *
+				 *     const getSnapshot = () => w.getSnapshot();
+				 *
+				 * 所以「返回一个新对象再赋给 ctx.sessions.list」对界面**毫无作用**
+				 * —— hook 闭包里那个 `w` 还是旧的。
+				 *
+				 * 上一版试图去翻 `ctx.slots._rootContributions` 手动换引用。那能跑，
+				 * 但依赖官方私有字段，一改结构就静默失效。
+				 *
+				 * 而 `getSnapshot` 是**每次调用都动态读属性**的（`() => w.getSnapshot()`，
+				 * 不是取值时固化）。所以正解是**在同一个对象上替换这个方法**：
+				 * hook 的引用不变，调用自动走到新实现。这是公开契约，不怕官方重构。
+				 */
+				wrapSessionListClock(ctx.sessions.list);
+				clockDiag.hook = ctx.sessions.list && ctx.sessions.list.__dshClockWrapped === true
+					? '\u2713'
+					: '\u2717';
+			});
+
+			/*
+			 * 置顶：在**投影层**把电脑的置顶合并进 `workspaces.list` 快照。
+			 *
+			 * 必须先于 `applyPinFromDesktop` 装好：那个 effect 里会读快照判
+			 * 「本地认不认识这条会话」，走的是同一个 after 链。
+			 */
+			guard('wrapWorkspaceListPins', () =>
+				ctx.effect(() => {
+					const ws = ctx.get === undefined ? undefined : ctx.get('workspaces');
+					const sessions = ctx.sessions === undefined ? undefined : ctx.sessions.list;
+					return wrapWorkspaceListPins(ws, sessions);
+				}, 'dsh-remote-mobile: 电脑置顶合并进侧栏快照'),
+			);
+
+			guard('loadDesktopMeta', () => loadDesktopMeta());
+			/*
+			 * 拉「每个会话实际会用哪个模型」的真值表。
+			 *
+			 * 与 `loadDesktopMeta` 并列、同样的理由：数据在宿主侧，前端读不到。
+			 * 必须在 `patchModelDirectories` **之前**发起（下面几行）：目录包装
+			 * 建好时 `forSession()` 就已经能查到值，第一帧就是对的，不用等重渲染。
+			 */
+			guard('loadRemoteModels', () => loadRemoteModels());
+
+			/*
+			 * ## 让电脑上置顶的对话在手机上也置顶（用户 2026-10-29 报障③）
+			 *
+			 * 订阅 `sessions.list`：**新会话进来时再试一次 pin**。
+			 *
+			 * 为什么必须等快照变化：宿主 `workspaceRegistry.pinSession()`
+			 * 校验 `sessionKnown(id)`，而同步刚建好的会话要先经过
+			 * 「宿主建成 → 客户端列表认识它」这两步。`apply()` 那一刻
+			 * 快照里可能还没有它，直接 pin 会拿到 `session/unknown`。
+			 *
+			 * 所以策略是「快照一变就试，成功过的记下不再试」——
+			 * 幂等、零轮询、失败自动重试（10 秒退避）。
+			 */
+			guard('applyPinFromDesktop', () =>
+				ctx.effect(() => {
+					const list = ctx.sessions === undefined ? undefined : ctx.sessions.list;
+					if (list === undefined || list === null || typeof list.subscribe !== 'function') return;
+					const workspaces = ctx.get === undefined ? undefined : ctx.get('workspaces');
+					/*
+					 * 拦「用户主动置顶/取消置顶」，避免投影层把用户取消过的又加回来。
+					 *
+					 * 与下面的 RPC 重试是两条独立的路：
+					 *   · 这条管**用户的意图**（不再自动加回）；
+					 *   · 下面管**让本地 registry 与电脑一致**（重启后不丢）。
+					 * 显示效果只由投影层决定，所以任何一条失败都不影响置顶能看见。
+					 */
+					const undoPinIntent = hookPinIntent(workspaces);
+					// 先试一次：快照里可能已经有会话了（App 重启后）。
+					try {
+						applyPinFromDesktop(list, workspaces);
+					} catch (error) {
+						/* 置顶是展示增强，失败绝不影响主流程 */
+					}
+					/*
+					 * ⚠️ 必须注册重试钩子：上面那次试的时候
+					 * `desktopPins` 大概率**还是空的**（数据还在路上），
+					 * 而订阅只在快照变化时触发 —— 数据到位时快照往往没变。
+					 * 没这个钩子就是「置顶永远不生效」。
+					 */
+					pinRetryHooks.push(function () {
+						try {
+							applyPinFromDesktop(list, workspaces);
+						} catch (error) {
+							/* 同上 */
+						}
+					});
+					const off = list.subscribe(() => {
+						try {
+							applyPinFromDesktop(list, workspaces);
+						} catch (error) {
+							/* 同上 */
+						}
+					});
+					return () => {
+						if (typeof off === 'function') off();
+						if (typeof undoPinIntent === 'function') undoPinIntent();
+					};
+				}, 'dsh-remote-mobile: sync desktop pins'),
+			);
 
 			// 把「按工作区筛模型目录」接到官方服务上。
 			guard('patchModelDirectories', () =>
@@ -5429,6 +11280,99 @@ window.__ModuleLoader__.load({
 
 			guard('installSyncMenu', () =>
 				ctx.effect(() => installSyncMenu(ctx), 'dsh-remote-mobile: 同步对话菜单'),
+			);
+
+			/*
+			 * 同步进度浮层（见 `mountSyncProgress`）。
+			 *
+			 * ⚠️ 用 `ctx.effect` 注册，卸载时 `dispose` 会自动被调 ——
+			 * 这个浮层是原生 DOM，不受 React 回收，不主动清就会残留在
+			 * 侧边栏里（面板重建后还挂着一条假进度）。
+			 */
+			/*
+			 * **App 回到前台时补拉待审批的 ask 弹窗。**
+			 *
+			 * 粉丝反馈（2026-10-28，作者转述）：「他电脑上面已经有一个会话了，
+			 * 但此时他是没有在手机 APP 内的，它已经发起了一个 ask 弹窗，
+			 * 然后此时用户去打开我们的 APP，它虽然消息同步过来了，但是弹窗
+			 * 没有同步过来，用户就无法审批。」
+			 *
+			 * 为什么后端已经有了重连补拉，这里还要再来一次：用户可能**一直没有
+			 * 断开事件流**（App 切后台、连接还在），那种情况下"重连"这个时机
+			 * 根本不会发生 —— 只有前端知道自己回来了。
+			 *
+			 * 后端 `pulledAskIds` 去重保证不会重复弹窗。
+			 */
+			guard('pullAsksOnForeground', () =>
+				ctx.effect(
+					() => {
+						var onVisible = function () {
+							if (typeof document !== 'undefined' && document.hidden === true) return;
+							// 未配对就没必要打这一趟（桥会直接回 `{ok:false}`）。
+							if (pairedRef.current !== true) return;
+
+							bridge('pullAsks', {}).then(
+								function () { /* 成功的补拉会自己弹窗 */ },
+								function () { /* 未配对/电脑离线 ⇒ 静默 */ },
+							);
+						};
+						if (typeof document !== 'undefined' && document.addEventListener) {
+							document.addEventListener('visibilitychange', onVisible);
+						}
+						// 挂载时先试一次：侧边栏打开往往就是用户"刚回来"。
+						onVisible();
+						return function () {
+							if (typeof document !== 'undefined' && document.removeEventListener) {
+								document.removeEventListener('visibilitychange', onVisible);
+							}
+						};
+					},
+					'dsh-remote-mobile: 前台补拉 ask',
+				),
+			);
+
+			/* 在电脑工作区行前渲染在线状态圆点（见 `startOnlineDotWatch`）。 */
+			guard('startOnlineDotWatch', () =>
+				ctx.effect(
+					() => startOnlineDotWatch(),
+					'dsh-remote-mobile: 在线状态圆点',
+				),
+			);
+
+			/* 电脑在线状态探测循环（见 `startDesktopOnlineWatch`）。 */
+			guard('startDesktopOnlineWatch', () =>
+				ctx.effect(
+					() => startDesktopOnlineWatch(),
+					'dsh-remote-mobile: 电脑在线状态',
+				),
+			);
+
+			/*
+			 * 插件卸载时把「页面还活着」标记复位。
+			 *
+			 * 不做的后果：用户在设置里关掉插件后，仍在飞的同步回调
+			 *（`autoSyncDesktop` 的 Promise）继续往 `autoSyncStateRef` 写值、
+			 * 继续驱动已被销毁的 DOM —— 虽然大多会被 `isConnected` 挡住，
+			 * 但状态是脏的。这里显式收尾更干净。
+			 */
+			guard('autoSyncAliveReset', () =>
+				ctx.effect(
+					() => () => { autoSyncAlive.current = false; },
+					'dsh-remote-mobile: 同步存活标记',
+				),
+			);
+
+			guard('mountSyncProgress', () =>
+				ctx.effect(
+					() => {
+						const handle = mountSyncProgress(
+							() => autoSyncStateRef.value,
+							() => true,
+						);
+						return () => handle.dispose();
+					},
+					'dsh-remote-mobile: 同步进度浮层',
+				),
 			);
 		}
 
