@@ -2731,6 +2731,38 @@ function mergePresets(local, desktop) {
 export function apply(ctx) {
 
 	/*
+	 * ## 装错端提醒（1.2.98，用户反馈 20261029-150302-2ab475）
+	 *
+	 * 用户把**手机端**插件 `dsh-jiuling-remote-mobile` 装进了**电脑**的
+	 * DSH profile，DSH 启动后立刻退出、反复重启 5 次以上，而且每次崩溃
+	 * 都把 profile 的 `dsh.profile.bundles` 从 18 项回滚成 2 项 ——
+	 * 用户所有插件都被从启动列表里抹掉。
+	 *
+	 * 两边 `inject` 的服务名完全一样（`sessions` / `sessionController` /
+	 * `webServer` / `workspaceRegistry`），所以电脑上**装得上、也会被加载**，
+	 * 没有任何一道检查能拦住。
+	 *
+	 * ## 这里为什么只警告、不 `return`
+	 *
+	 * 我拿不到确凿证据证明崩溃就是本插件引起的那一行（用户报告里
+	 * stderr 与 JS 堆栈都是空的）。此时**贸然直接 `return` 风险更大**：
+	 * 万一判断错了，会把手机端的正常用户挡在门外 —— 那是更严重的事故。
+	 *
+	 * 所以只在上屏日志里写明「你装错端了、电脑端应该装 desktop」，
+	 * 让用户和排查者一眼看到原因，同时不改变任何行为。
+	 */
+	try {
+		const platform = String(process.platform ?? '');
+		if (platform === 'win32' || platform === 'darwin') {
+			ctx.logger?.warn?.(
+				'[dsh-remote-mobile] ⚠️ 这是**手机端**插件，却运行在 ' + platform + ' 上。' +
+					'电脑端应该装 `dsh-jiuling-remote-desktop`。' +
+					'两端混装可能导致 DSH 启动异常，建议先卸掉本包再试。',
+			);
+		}
+	} catch { /* 平台判断失败不影响任何行为 */ }
+
+	/*
 	 * ## ⚠️⚠️ 刷新必须定义在 `apply` 顶层（1.2.81 修）
 	 *
 	 * 它原来定义在 `ctx.effect(() => {…})` 的回调里（行 5283 开始），
@@ -3472,10 +3504,55 @@ export function apply(ctx) {
 					// 不重试的话要等下一条 SSE 事件才有人再调本函数，而那时
 					// `mirrorWarnedAt` 已经把会话标成放弃状态了。
 					if (removed) {
+						/*
+						 * ## ⚠️⚠️ 这里**必须重新构造 `request`**（1.2.98 修）
+						 *
+						 * 原来这里是 `create(request)` —— 而 `request` 声明在外层
+						 * `try` 的**块内**，`catch` 块看不见它。于是每次重建必抛：
+						 *
+						 *     ensureLocalMirror(…) 重建失败: request is not defined
+						 *
+						 * 后果非常严重：损坏自愈分支**先把本地壳删了**，然后重建
+						 * 一定失败 ⇒ 壳没了、也建不回来 ⇒ 会话从侧边栏**永久消失**，
+						 * 只能靠用户再手动同步一次。
+						 *
+						 * 用户反馈（20261030-111618-3d1620，附 310 行真机报告）：
+						 *   「同步 → 打开后约 40 分钟消失，自愈重建失败，永久消失」
+						 * 报告里的日志行就是上面这句，与代码逐字对上。
+						 *
+						 * 修法：在这里**就地重新构造**，不依赖外层块变量。
+						 */
 						try {
-							await ctx.sessionController.create(request);
+							const rebuildRequest = { sessionId };
+							/*
+							 * 尽量把工作区带上 —— 不带的话会话会落到「未分组」。
+							 * 拿不到就退回不带（官方 `create` 允许）。
+							 */
+							try {
+								const desktopPath = remotePaths[sessionId];
+								if (typeof desktopPath === 'string' && desktopPath !== '') {
+									const workspace = await ensureDesktopWorkspace(ctx, desktopPath, workspaceMap).catch(
+										() => undefined,
+									);
+									if (workspace !== undefined && workspace !== null
+										&& typeof workspace.id === 'string' && workspace.id !== '') {
+										rebuildRequest.workspaceId = workspace.id;
+									}
+								}
+							} catch { /* 拿不到工作区不影响重建 */ }
+							await ctx.sessionController.create(rebuildRequest);
 							const rebuilt = ctx.sessions?.get?.(sessionId);
 							if (rebuilt !== undefined && rebuilt !== null && typeof rebuilt.append === 'function') {
+								/*
+								 * ⚠️ 重建出来的壳**必须补一次非空标记**，否则它没有
+								 * `turn/start`，按引擎的 blank 规则仍会被侧边栏隐藏 ——
+								 * 那等于「重建成功了但用户还是看不见」，白修。
+								 */
+								if (typeof markSessionNonBlank === 'function') {
+									try {
+										await markSessionNonBlank(ctx, sessionId, {});
+									} catch { /* 标记失败不影响会话本身 */ }
+								}
 								void debugLog(`ensureLocalMirror(${sessionId}) 重建成功 seq=${rebuilt.seq}`);
 								return rebuilt;
 							}
@@ -5026,7 +5103,14 @@ export function apply(ctx) {
 				if (remoteSeq <= localAsRemote) continue;
 				const gap = remoteSeq - localAsRemote;
 				if (gap > POLL_MAX_GAP) {
-					void debugLog(`轮询补洞跳过 session=${sessionId} 缺口=${gap} 过大（该走同步对话）`);
+					/*
+					 * ⚠️ 同步会话**本来就不该走同步对话**，这句话对它纯属误导，
+					 * 而且每 3 秒对每个同步会话刷一条（用户报告里一天攒数 MB）。
+					 * 对它们不打印（1.2.98）。
+					 */
+					if (!syncedSessions.has(sessionId)) {
+						void debugLog(`轮询补洞跳过 session=${sessionId} 缺口=${gap} 过大（该走同步对话）`);
+					}
 					continue;
 				}
 				// 从「本地最后一条的电脑 seq」+1 拉到远端末尾。
@@ -5069,7 +5153,35 @@ export function apply(ctx) {
 					try {
 						const session = ctx.sessions?.get?.(sessionId);
 						if (session === undefined || session === null) break;
-						const wrote = mirrorEvent(session, event, mirrorStateOf(sessionId));
+						/*
+						 * ## ⚠️⚠️ 同步会话的占位壳**不接受**镜像写入（1.2.98 修）
+						 *
+						 * 同步会话的本地壳只有一个职责：让侧边栏能显示它（靠
+						 * `session/title` + 一对占位 turn，约 7-8 条）。历史按需从
+						 * 电脑拉，实时展示走 `followSynced` 转发。
+						 *
+						 * 但轮询这里原来对**所有**本地会话补洞，同步会话也在内 ——
+						 * 而补洞的起点通常在对话**中段**，写进去的是「半个 turn」：
+						 * 直接 `assistant/message` / `tool/call`，没有前置的
+						 * `turn/start`、`step/start`，还夹着 delivery 标记类事件。
+						 *
+						 * 引擎的 session-format v4 校验器随后判日志损坏：
+						 *
+						 *   SessionFormatError: delivery throughSeq must precede its marker
+						 *   SessionFormatError: assistant/message does not match an open turn and step
+						 *
+						 * ⇒ 会话读不出来 ⇒ 侧边栏不渲染 ⇒ 用户看到「会话消失」。
+						 *
+						 * 用户报告（20261030-111618-3d1620）与（20261029-030943-8a4b33）
+						 * 都是这个：PC 端会话完好（10838 条、seq 严格递增），手机端
+						 * 那份 session.v4.jsonl.zstd 却报损坏。
+						 *
+						 * 所以：同步会话**只广播、不落盘**。`broadcast` 与
+						 * `deriveRunning` 保留在下面，实时状态照常正确。
+						 */
+						const wrote = syncedSessions.has(sessionId)
+							? false
+							: mirrorEvent(session, event, mirrorStateOf(sessionId));
 						/*
 						 * 无论写没写进去，都要把事件推给前端 —— 与 `followSynced` 的
 						 * 处理一致：落盘失败只影响投影，不该让用户看不到消息。
@@ -5372,9 +5484,24 @@ export function apply(ctx) {
 						// `mirrorEvent` 会抛错拒收，那只是「这条没写进本地」，
 						// 前端照样要拿到它。
 						try {
-							const local = await ensureLocalMirror(sessionId);
-							if (local !== undefined) {
-								mirrorEvent(local, payload, mirrorStateOf(sessionId));
+							/*
+							 * ## ⚠️ 同步会话**不落盘**（1.2.98 修，理由同 `pollCatchUp`）
+							 *
+							 * 用户报告（20261030-111618-3d1620）方法 B 就是这个路径：
+							 * 手机**打开**同步会话后，`followSynced` 把实时流里
+							 * mid-turn 的事件逐条写进占位壳，几分钟会话就坏掉、
+							 * 从侧边栏消失。
+							 *
+							 * 代价：`tokenUsage` / `contextPressure` 两个投影少了数据源。
+							 * 但这两颗胶囊的真值来自 `controller.follow` 首帧的
+							 * `remoteProjections`（`readProjections`）—— 首屏照样正确，
+							 * 只是不再逐条刷新。**宁可不刷新，也不能把会话写坏。**
+							 */
+							if (!syncedSessions.has(sessionId)) {
+								const local = await ensureLocalMirror(sessionId);
+								if (local !== undefined) {
+									mirrorEvent(local, payload, mirrorStateOf(sessionId));
+								}
 							}
 						} catch (error) {
 							// 只在真出问题时记一次，别刷屏（对齐失败是常态：
@@ -7716,8 +7843,8 @@ function desktopSlug(desktopPath) {
  * 取电脑路径的末段当工作区标题。
  *
  * ⚠️ **不能直接用 `node:path` 的 `basename`**：手机是 posix 语义，
- * `basename('C:\\Users\\<user>')` 会把整串原样返回（反斜杠不是分隔符），
- * 侧边栏就会显示一长条 `C:\Users\<user>`。这里两种分隔符都切。
+ * `basename('C:\\Users\\XIAOPAN')` 会把整串原样返回（反斜杠不是分隔符），
+ * 侧边栏就会显示一长条 `C:\Users\XIAOPAN`。这里两种分隔符都切。
  *
  * @param desktopPath - 电脑上的绝对路径。
  * @returns 末段；没有末段（如 `C:\`）时退回去掉尾部斜杠的原串。
@@ -7789,11 +7916,11 @@ function desktopCategoryTitle(desktopPath) {
  * 前端把会话归到哪个工作区，是**按 cwd 路径精确匹配**的
  * （`dsh-workspace/lib/index.js:102` 的 `sessionIds` getter）。
  * 早先的实现把远程会话的 cwd 设成手机默认工作区的路径，于是**所有**远程会话
- * 都堆在「默认工作区」底下 —— 用户在电脑页签里选了 `C:\Users\<user>`，
+ * 都堆在「默认工作区」底下 —— 用户在电脑页签里选了 `C:\Users\XIAOPAN`，
  * 侧边栏却显示「默认工作区」，看起来就像「建完又回到默认工作去了」。
  *
  * 正解是给每个电脑目录配一个**独立的手机本地镜像目录**，用它注册一个独立
- * 工作区，标题取电脑目录的末段（`<user>`）。镜像目录是空的、永远不会被写入
+ * 工作区，标题取电脑目录的末段（`XIAOPAN`）。镜像目录是空的、永远不会被写入
  * —— 真正干活的是电脑那台机器，这里只是给前端一个可以挂载的 cwd 锚点。
  *
  * ⚠️ cwd 依然**不能**是电脑路径：Android 是 posix 语义，

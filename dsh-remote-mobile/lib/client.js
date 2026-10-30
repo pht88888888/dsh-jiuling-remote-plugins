@@ -1102,7 +1102,7 @@ window.__ModuleLoader__.load({
 		 * 又不愿意为一个显示用的字符串多一次桥调用。
 		 * 写成常量，并在自测里断言它与 package.json 一致。
 		 */
-		var PLUGIN_VERSION = '1.2.97';
+		var PLUGIN_VERSION = '1.2.98';
 		
 		/**
 		 * 配对条上的版本小标签。

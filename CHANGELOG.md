@@ -6,6 +6,26 @@
 
 ## 手机端 `dsh-jiuling-remote-mobile`
 
+### 1.2.98
+
+- **修复：同步会话被写坏后从侧边栏永久消失（严重）**
+  两条用户反馈（20261030-111618-3d1620、20261029-030943-8a4b33）指向同一根因：
+  同步会话的本地「占位壳」只该放 `session/title` + 一对占位 turn，但
+  `pollCatchUp` 与 `followSynced` 会把电脑上的 **mid-turn 事件**写进去
+  （从对话中段开始，缺 `turn/start` / `step/start`，还夹着 delivery 标记事件），
+  引擎 session-format v4 校验器随即判损坏 ⇒ 会话不渲染 ⇒ 用户看到「消失」。
+  现在两条写盘路径都跳过同步会话（`broadcast` / `deriveRunning` 保留，
+  实时显示与运行态照常正确）。
+- **修复：损坏自愈的重建路径必然失败**
+  `ensureLocalMirror` 的 catch 块引用了外层 try 的块内变量 `request`，
+  每次重建必抛 `request is not defined` ⇒ 壳被删了又建不回来 ⇒ **永久消失**。
+  现在就地构造 request，并在重建成功后补 `markSessionNonBlank`
+  （否则新壳没有 `turn/start`，按 blank 规则仍会被隐藏）。
+- **装错端提醒**：`dsh-jiuling-remote-mobile` 运行在 win32 / darwin 上时打印
+  明确警告，提示电脑端应该装 `dsh-jiuling-remote-desktop`。
+  有用户把手机端包装进电脑 DSH，导致启动反复崩溃（20261029-150302-2ab475）。
+- 「缺口过大」日志对同步会话静默（原来每个同步会话每 3 秒刷一条）。
+
 ### 1.2.97
 
 - **修复：后来进入 App 时，弹窗能看见但点了电脑端收不到**
