@@ -43,7 +43,7 @@ console.log('\n══ ① 轮询补洞：同步会话不落盘 ══');
 
 T(
 	'轮询写盘前判断 `syncedSessions`',
-	/syncedSessions\.has\(sessionId\)[\s\S]{0,80}?\?\s*false[\s\S]{0,120}?:[\s\S]{0,80}?mirrorEvent\(/.test(code),
+	/isMirroredDesktopSession\(sessionId, session\?\.header\?\.cwd, sessionIndex\)[\s\S]{0,80}?\?\s*false[\s\S]{0,120}?:[\s\S]{0,80}?mirrorEvent\(/.test(code),
 );
 
 T(
@@ -55,13 +55,13 @@ console.log('\n══ ② 实时流：同步会话不落盘 ══');
 
 T(
 	'`followSynced` 写盘包在 `!syncedSessions.has()` 里',
-	/if \(!syncedSessions\.has\(sessionId\)\) \{\s*const local = await ensureLocalMirror\(sessionId\);/.test(code),
+	/if \(!isMirroredDesktopSession\(sessionId, ctx\.sessions\?\.get\?\.\(sessionId\)\?\.header\?\.cwd, sessionIndex\)\) \{\s*const local = await ensureLocalMirror\(sessionId\);/.test(code),
 );
 
 T(
 	'两处都已修（轮询 + 实时流）',
-	(code.match(/syncedSessions\.has\(sessionId\)/g) ?? []).length >= 3,
-	'出现次数=' + (code.match(/syncedSessions\.has\(sessionId\)/g) ?? []).length,
+	(code.match(/isMirroredDesktopSession\(sessionId,/g) ?? []).length >= 3,
+	'出现次数=' + (code.match(/isMirroredDesktopSession\(sessionId,/g) ?? []).length,
 );
 
 console.log('\n══ ③ 自愈重建：不得引用外层块变量 ══');
@@ -85,7 +85,7 @@ console.log('\n══ ④ 「缺口过大」日志不再为同步会话刷屏 �
 
 T(
 	'该日志对同步会话静默',
-	/if \(!syncedSessions\.has\(sessionId\)\) \{\s*void debugLog\(`轮询补洞跳过/.test(code),
+	/if \(!sessionIndex\.isSynced\(sessionId\)\) \{\s*void debugLog\(`轮询补洞跳过/.test(code),
 );
 
 console.log('\n════════ ' + pass + ' 通过, ' + fail + ' 失败 ════════');

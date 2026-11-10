@@ -338,7 +338,9 @@ if (freeCard !== null) {
 		})(),
 		freePosted === null ? '未回传' : JSON.stringify(freePosted.params?.answer?.answers?.[0]),
 	);
-	T('提交后卡片被移除（不会一直浮在界面上）', doc.getElementById('dsh-remote-ask') === null);
+	T('105 回执前保留卡片，避免发送失败时丢失回答入口', doc.getElementById('dsh-remote-ask') !== null);
+	await new Promise((resolve) => setImmediate(resolve));
+	T('提交确认后卡片被移除（不会一直浮在界面上）', doc.getElementById('dsh-remote-ask') === null);
 }
 
 /* ══════════════════════════════════════════════════════════════════

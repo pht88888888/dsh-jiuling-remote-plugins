@@ -1102,7 +1102,7 @@ window.__ModuleLoader__.load({
 		 * 又不愿意为一个显示用的字符串多一次桥调用。
 		 * 写成常量，并在自测里断言它与 package.json 一致。
 		 */
-		var PLUGIN_VERSION = '1.2.98';
+		var PLUGIN_VERSION = '1.2.105';
 		
 		/**
 		 * 配对条上的版本小标签。
@@ -5529,6 +5529,19 @@ window.__ModuleLoader__.load({
 				 * 取不到就不显示 —— 不能因为展示版本号影响主流程。
 				 */
 				versionTag(),
+				/*
+				 * **连不上电脑时把原因写在这里**（反馈 `20261106-091953-9b6820`「总是连不上电脑」）。
+				 * 原来这个原因只写进侧边栏那一行的 `title` —— 手机上根本没有悬浮，
+				 * 等于用户永远看不到为什么连不上，只能一次次重连。
+				 * 不用 React 状态：在线探测每 3 秒跑一次，走的是命令式更新（见
+				 * `refreshDesktopBadges`），这里同样按命令式写，避免每 3 秒重渲染一遍。
+				 */
+				h('span', {
+					'data-dsh-online': '1',
+					style: { fontSize: '12px', lineHeight: '1.5', color: '#b91c1c', marginLeft: '6px' },
+					},
+					'',
+				),
 				sidebarDiagTag(),
 				pairState.paired === true
 					? unpairControls()
@@ -7656,6 +7669,91 @@ var insertDesktopBadge = function (row, desktopState) {
 				/* ② 拿不到结构标识（官方版本变了）—— 退回标题前缀 */
 				return isDesktopTitle(row.textContent);
 			};
+			/*
+			 * ---- 长按会话行：从手机移除（反馈 `20261104-230325-932eaa`）----
+			 *
+			 * 「加个删除会话的功能」。做法上我特意选了**只从手机移除**：
+			 * 电脑端插件没有删除接口（`ctx.sessions` 只有 `get`），而真删不可逆，
+			 * 手机上长按误触一次就永久没了。现在移除只是解绑同步，电脑上原样保留，
+			 * 想找回重新同步即可。
+			 *
+			 * ⚠️ 必须幂等：这段和 `sync()` 一起每 1.5 秒跑一次，重复绑监听会让
+			 *   一次长按弹出好几个确认框。用 WeakSet 记已经绑过的节点。
+			 */
+			var boundSessionRows = typeof WeakSet === 'function' ? new WeakSet() : null;
+			var forgetSession = function (row) {
+				var key = '';
+				try {
+					key = row.getAttribute('data-row-key') || '';
+				} catch (attrError) {
+					return;
+				}
+				var sessionId = key.slice(key.indexOf(':') + 1);
+				if (sessionId === '') return;
+				var title = '';
+				try {
+					title = String(row.textContent || '').trim().slice(0, 40);
+				} catch (textError) {
+					/* 取不到标题不影响移除 */
+				}
+				var yes = window.confirm(
+					'从手机上移除「' + title + '」？\n\n' +
+					'电脑上那个对话不会被删除，之后重新同步还能找回来。',
+				);
+				if (yes !== true) return;
+				bridge('forgetSession', { sessionId: sessionId }).then(
+					function (result) {
+						var r = result || {};
+						if (r.ok === true) {
+							window.alert('已从手机移除。电脑上不受影响。');
+						} else {
+							window.alert('这个会话不在手机的同步记录里，本来就没有需要移除的东西。');
+						}
+					},
+					function (error) {
+						window.alert('移除失败：' + String(error && error.message ? error.message : error));
+					},
+				);
+			};
+			var bindSessionRows = function () {
+				var nodes;
+				try {
+					nodes = document.querySelectorAll('[data-row-key^="session:"]');
+				} catch (queryError) {
+					return;
+				}
+				for (var i = 0; i < nodes.length; i += 1) {
+					var node = nodes[i];
+					if (boundSessionRows !== null) {
+						if (boundSessionRows.has(node)) continue;
+						boundSessionRows.add(node);
+					}
+					(function (row) {
+						var timer = null;
+						var cancel = function () {
+							if (timer !== null) {
+								clearTimeout(timer);
+								timer = null;
+							}
+						};
+						row.addEventListener('touchstart', function () {
+							cancel();
+							timer = setTimeout(function () {
+								timer = null;
+								forgetSession(row);
+							}, 700);
+						}, { passive: true });
+						row.addEventListener('touchend', cancel);
+						row.addEventListener('touchmove', cancel, { passive: true });
+						row.addEventListener('touchcancel', cancel);
+						row.addEventListener('contextmenu', function (event) {
+							event.preventDefault();
+							forgetSession(row);
+						});
+					})(node);
+				}
+			};
+
 			var findDesktopRows = function () {
 				var out = [];
 				var rows = document.querySelectorAll('[role="treeitem"]');
@@ -7793,6 +7891,15 @@ var insertDesktopBadge = function (row, desktopState) {
 					}
 				} catch (cleanupError) { /* 清理失败绝不能影响正常装饰 */ }
 
+				/*
+				 * 长按绑在 `decorateDesktopRows()` **之前**：那个函数在没有电脑工作区行时
+				 * 会返回 null 并让 sync 提前 return，绑在后面就永远轮不到。
+				 */
+				try {
+					bindSessionRows();
+				} catch (bindError) {
+					/* 绑不上不影响装饰 */
+				}
 				var firstRow = decorateDesktopRows();
 				if (firstRow === null) return;
 				/*
@@ -7814,6 +7921,20 @@ var insertDesktopBadge = function (row, desktopState) {
 						tip = st.reason ? ('电脑离线：' + st.reason) : '电脑离线';
 					}
 				}
+				/*
+				 * 同一个结论写进配对条（用户能直接看见），只在**离线**时显示：
+				 * 在线时不占地方，也不刷屏。
+				 */
+				try {
+					var onlineSlot = document.querySelector('[data-dsh-online]');
+					if (onlineSlot !== null) {
+						var slotText = '';
+						if (st.known === true && st.ok !== true) {
+							slotText = '连不上电脑：' + (st.reason || '原因未知');
+						}
+						if (onlineSlot.textContent !== slotText) onlineSlot.textContent = slotText;
+					}
+				} catch (slotError) { /* 配对条不在页面上（非目录对话框）时忽略 */ }
 				var rows = findDesktopRows();
 				for (var ri = 0; ri < rows.length; ri += 1) {
 					try {
@@ -9952,6 +10073,46 @@ var insertDesktopBadge = function (row, desktopState) {
 		 * @param sessionId - 出问题的会话（仅用于文案定位，不展示）。
 		 * @param message - 失败原因原文。
 		 */
+		/**
+		 * 「已插队」提示条（蓝色，不是错误）。
+		 *
+		 * 6 秒自动消失，点一下也能关；同一时刻只留一条。
+		 */
+		function showQueuedNotice(text) {
+			try {
+				var host = document.body;
+				if (host === null) return;
+				var previous = document.getElementById('dsh-remote-queued');
+				if (previous !== null) previous.remove();
+				var bar = document.createElement('div');
+				bar.id = 'dsh-remote-queued';
+				bar.textContent = text;
+				var style = bar.style;
+				style.position = 'fixed';
+				style.left = '12px';
+				style.right = '12px';
+				style.top = 'calc(env(safe-area-inset-top, 0px) + 56px)';
+				style.zIndex = '2147483000';
+				style.padding = '10px 14px';
+				style.borderRadius = '12px';
+				style.background = 'rgba(29, 78, 216, 0.96)';
+				style.color = '#fff';
+				style.fontSize = '13px';
+				style.lineHeight = '1.45';
+				style.boxShadow = '0 6px 20px rgba(0, 0, 0, 0.22)';
+				style.wordBreak = 'break-word';
+				bar.addEventListener('click', function () {
+					bar.remove();
+				});
+				host.appendChild(bar);
+				setTimeout(function () {
+					if (bar.parentNode !== null) bar.remove();
+				}, 6000);
+			} catch (error) {
+				/* 提示失败不能影响发送 */
+			}
+		}
+
 		function showPromptFailure(ctx, sessionId, message) {
 			try {
 				var host = document.body;
@@ -10155,8 +10316,46 @@ var insertDesktopBadge = function (row, desktopState) {
 				 * 对不上 ⇒ 判成「形状不对」⇒ 丢弃手机答案退回电脑那条 ⇒
 				 * 手机这边表现就是**什么都没发生**。
 				 */
+				/**
+				 * 在卡片上显示一条错误（不关卡片）。
+				 *
+				 * ## ⚠️ 为什么不再「先 dismiss 再回传」（反馈 `20261104-012630-ec8480`）
+				 *
+				 * 用户原话：「移动端的选项选择后，问题仍在等我的回复」。
+				 *
+				 * 原写法点下去就先 `dismiss()` 把卡片抹掉，然后异步回传，失败只
+				 * `logWarn` 一行 —— 用户看到「我点了、卡片没了」，而电脑那头还在等，
+				 * 永远对不上；失败原因只有 console 里有，手机上根本看不到。
+				 *
+				 * 现在：卡片留着，回传成功才关；失败把原因写在卡片上。
+				 */
+				var showCardError = function (text) {
+					var stale = card.querySelector('[data-ask-error]');
+					if (stale !== null) card.removeChild(stale);
+					var node = el(
+						'div',
+						{
+							fontSize: '12.5px',
+							lineHeight: '1.5',
+							marginTop: '8px',
+							padding: '8px 10px',
+							borderRadius: '8px',
+							background: 'rgba(220,38,38,0.10)',
+							color: '#b91c1c',
+						},
+						text,
+					);
+					node.setAttribute('data-ask-error', '1');
+					card.appendChild(node);
+				};
+
 				var submit = function (answer) {
-					dismiss();
+					var settled = false;
+					var done = function () {
+						if (settled) return;
+						settled = true;
+						dismiss();
+					};
 					try {
 						var sent = bridge('answerAsk', {
 							requestId: payload.requestId,
@@ -10165,25 +10364,31 @@ var insertDesktopBadge = function (row, desktopState) {
 						if (sent && typeof sent.then === 'function') {
 							sent.then(
 								function (result) {
-									/*
-									 * 电脑端明确说「没送到」时要让用户知道，否则他又会
-									 * 以为卡片自己消失了、问题已解决。
-									 * 这里用一条轻提示，不阻塞界面。
-									 */
 									if (result && result.ok === false) {
-										logWarn('[dsh-remote-mobile] 答案未送达: ' + String(result.reason || ''), ctx);
+										var reason = String(result.reason || '');
+										showCardError(
+											reason === 'expired'
+												? '这条请求已经在电脑上处理过了（或已超时），电脑不会再等它。'
+												: '答案没送到电脑（' + (reason || '未知原因') + '）。可以直接在电脑上回答。',
+										);
+										return;
 									}
+									done();
 								},
 								function (error) {
-									// 送不回去就算了：电脑端会超时并走官方兜底，
-									// 用户也可以在电脑上直接点。
-									logWarn('[dsh-remote-mobile] 回传答案失败: ' + String(error && error.message ? error.message : error), ctx);
+									showCardError(
+										'回传失败：' + String(error && error.message ? error.message : error)
+										+ '。可以直接在电脑上回答。',
+									);
 								},
 							);
+							return;
 						}
 					} catch (error) {
-						logWarn('[dsh-remote-mobile] 回传答案失败: ' + String(error), ctx);
+						showCardError('回传失败：' + String(error) + '。可以直接在电脑上回答。');
+						return;
 					}
+					done();
 				};
 
 				/** 渲染一题。 */
@@ -10364,7 +10569,8 @@ var insertDesktopBadge = function (row, desktopState) {
 					 *
 					 * 官方把这种问题叫「自由回答」：`options` 为空，答案放在 `text` 里。
 					 */
-					if (options.length === 0) {
+					// ⚠️ 有选项时**也给**自由输入（反馈 `20261105-190930-cc8f5b`：「必须回复电脑，没有自己回复的选项，不回答就一直显示浮窗」）。只给按钮等于逼用户在错选项里挑一个。
+					{
 						var input = el('textarea', {
 							display: 'block',
 							width: '100%',
@@ -10381,7 +10587,9 @@ var insertDesktopBadge = function (row, desktopState) {
 							resize: 'vertical',
 							fontFamily: 'inherit',
 						});
-						input.setAttribute('placeholder', '在这里输入你的回答…');
+						input.setAttribute('placeholder', options.length === 0
+							? '在这里输入你的回答…'
+							: '以上都不是？在这里自己回答…');
 						card.appendChild(input);
 
 						var submitText = el(
@@ -10709,6 +10917,22 @@ var insertDesktopBadge = function (row, desktopState) {
 				}
 				if (!payload || typeof payload.message !== 'string') return;
 				showPromptFailure(ctx, payload.sessionId, payload.message);
+			});
+			/*
+			 * 「这条插队了」（反馈 `20261105-185103-3ecb05`）。
+			 *
+			 * 与 `prompt-failed` 同一个浮层位置、同一套样式，只是颜色不同 ——
+			 * 它不是错误，是「你这句话排在这一轮之后」的告知。
+			 */
+			source.addEventListener('queued', function (message) {
+				var payload;
+				try {
+					payload = JSON.parse(message.data);
+				} catch (error) {
+					return;
+				}
+				if (!payload || typeof payload.message !== 'string') return;
+				showQueuedNotice(payload.message);
 			});
 			};
 
