@@ -1,6 +1,6 @@
 {
   "name": "dsh-jiuling-remote-desktop",
-  "version": "1.0.52",
+  "version": "1.0.56",
   "description": "DSH 远程目录（电脑端）：把本机 DSH 会话的事件流经 Cloudflare 隧道搬到手机，手机进入电脑目录并发起对话，公网只传文本。含激活码配对流程。",
   "type": "module",
   "main": "./lib/index.js",
@@ -33,5 +33,8 @@
   ],
   "engines": {
     "node": ">=20"
+  },
+  "scripts": {
+    "test": "node test/ask-registry.mjs"
   }
 }

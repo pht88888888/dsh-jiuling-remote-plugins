@@ -46,6 +46,7 @@
 import { chmodSync, closeSync, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { hostname as osHostname } from 'node:os';
+import { Resolver } from 'node:dns';
 import { lookup as dnsLookup } from 'node:dns/promises';
 import { request as httpsRequest } from 'node:https';
 import { join } from 'node:path';
@@ -167,6 +168,113 @@ const MANUAL_INSTALL_PROMPT = [
 	'',
 	'装好后回到 DSH 的「设置 → 手机远程」，重新点「准备环境」即可。',
 ].join('\n');
+
+/**
+ * 隧道 DNS 有问题时，交给用户**复制给电脑上的 DSH** 的提示词。
+ *
+ * ## 为什么是「交给 AI」而不是插件自己去修（用户 2026-11-01 的明确要求）
+ *
+ * 用户原话：
+ *   「安装依赖的时候 那个提示词只是提醒用户可以交给AI来代劳」
+ *   「刚才那个用户的反馈 他不也是用AI来解决这个问题吗」
+ *
+ * 也就是说：这里**不需要**插件自己去改网卡 DNS（改 DNS 要管理员权限，
+ * DSH 里的 bash 是普通权限，改了也会失败），只需要把「能干的活」写下来交给
+ * 用户，他贴给电脑上的 AI —— AI 负责诊断、给命令，需要提权那一步由用户自己点。
+ *
+ * 与 `MANUAL_INSTALL_PROMPT` 同一个模式（那条也是给用户复制的）。
+ */
+const TUNNEL_DNS_PROMPT = [
+	'我这台电脑的 DNS 查不到 Cloudflare 隧道要用的 SRV 记录',
+	'（_v2-origintunneld._tcp.argotunnel.com），导致 cloudflared 一启动就退出，',
+	'手机连不上这台电脑。请按顺序帮我处理：',
+	'',
+	'1. 运行 `nslookup -type=SRV _v2-origintunneld._tcp.argotunnel.com`，把输出贴给我；',
+	'2. 正常应该返回 region1.v2.argotunnel.com / region2.v2.argotunnel.com 的 7844 端口记录；',
+	'   返回「无记录」或超时，就确认是这个原因；',
+	'3. 看一下系统实际在用哪个 DNS（Windows 跑 `ipconfig /all`，找 DNS Servers）；',
+	'4. 如果你有管理员权限，用 netsh 把当前活动网卡的 DNS 改成 223.5.5.5 和 119.29.29.29，',
+	'   然后执行 `ipconfig /flushdns`；没有管理员权限，就把需要我手动执行的命令列出来；',
+	'5. 改完再跑一次第 1 步，确认能查到 SRV，并告诉我要不要重启 DSH。',
+	'',
+	'注意：只改 DNS，不要动代理、防火墙、hosts、路由等其他网络设置。',
+].join('\n');
+
+/** Cloudflare 隧道边缘发现依赖的 SRV 记录名（cloudflared 自己的报错里就是这个）。 */
+const TUNNEL_SRV_NAME = '_v2-origintunneld._tcp.argotunnel.com';
+
+/**
+ * 某个解析器能不能查到 [TUNNEL_SRV_NAME]。
+ *
+ * @param servers - 指定 DNS 服务器（如 `['223.5.5.5']`）；不传用系统 DNS。
+ * @returns `true` = 查到了记录。
+ *
+ * ⚠️ **NODATA 在 Node 里不一定报错**：有的解析器返回空数组而不是 `ENODATA`，
+ * 所以判据是「没有错误 **且** 记录非空」，不能只看 `err`。
+ */
+function resolveSrvOk(servers) {
+	return new Promise((resolve) => {
+		let settled = false;
+		const timer = setTimeout(() => done(false), 1600);
+		function done(value) {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			resolve(value);
+		}
+		let resolver;
+		try {
+			resolver = new Resolver({ timeout: 1500, tries: 1 });
+			if (Array.isArray(servers)) resolver.setServers(servers);
+		} catch {
+			done(false);
+			return;
+		}
+		try {
+			resolver.resolveSrv(TUNNEL_SRV_NAME, (error, records) => {
+				done(error === null || error === undefined ? Array.isArray(records) && records.length > 0 : false);
+			});
+		} catch {
+			done(false);
+		}
+	});
+}
+
+/**
+ * 探测本机 DNS 能不能解析隧道要用的 SRV 记录。
+ *
+ * ## 为什么要分「系统 DNS 失败」与「公共 DNS 也失败」
+ *
+ * 只有**系统 DNS 失败、公共 DNS 成功**才能断言「是这台机器的 DNS 配置问题」
+ * （路由器转发器不返回 SRV，家庭路由器上很常见）。两者都失败则更可能是整体
+ * 断网/代理拦了 DNS —— 那时给「改 DNS」的提示是误导。
+ *
+ * @returns `{ ok, blocked, message?, prompt? }`；`blocked: true` 表示已确诊。
+ */
+async function probeTunnelDns(options) {
+	// `check` 只给测试注入桩用（默认就是真实 DNS 查询），生产路径不传。
+	const check = typeof options?.check === 'function' ? options.check : resolveSrvOk;
+	if (await check()) return { ok: true };
+	const publicOk = await check(['223.5.5.5', '119.29.29.29']);
+	if (!publicOk) {
+		return {
+			ok: false,
+			blocked: false,
+			message:
+				'本机与公共 DNS 都查不到 Cloudflare 隧道的 SRV 记录 —— 更像是这台电脑当前上不了网'
+				+ '（或代理拦了 DNS），先确认能正常打开网页再试。',
+		};
+	}
+	return {
+		ok: false,
+		blocked: true,
+		message:
+			'本机 DNS 查不到 Cloudflare 隧道的 SRV 记录（公共 DNS 能查到），'
+			+ '隧道会一启动就退出，手机端会看到 HTTP 530。根因在电脑的 DNS 设置，不在 DSH。',
+		prompt: TUNNEL_DNS_PROMPT,
+	};
+}
+
 
 const CLOUDFLARED_SHA256 = {
 	'cloudflared-windows-amd64.exe': '4d2490e74082c5d48dbfedaf92576fa5bd1702379ab88eb7faa0cfbe8dc891b6',
@@ -810,13 +918,29 @@ export function createPairing({ stateDir, logger }) {
 
 	/** 找本机已有的 cloudflared（下载过的排在最前）。 */
 	function findCloudflared() {
+		const exe = process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared';
+		/*
+		 * ⚠️ **必须扫 PATH**（反馈 `20261103-141959-793319`）。
+		 *
+		 * 我们给用户的手动安装提示词（`MANUAL_INSTALL_PROMPT`）明确写的是
+		 * 「放进系统 PATH 能找到的位置」—— 而原来的候选表只有下载目录、
+		 * `%LOCALAPPDATA%\cloudflared` 和几个固定的 POSIX 路径，**独独没有 PATH**。
+		 * 于是用户按提示装好了、`cloudflared --version` 也能正常输出，
+		 * 插件仍然报「隧道组件无法安装」，怎么重试都没用。
+		 */
+		const fromPath = String(process.env.PATH ?? '')
+			.split(process.platform === 'win32' ? ';' : ':')
+			.map((dir) => dir.trim())
+			.filter((dir) => dir !== '')
+			.map((dir) => join(dir, exe));
 		const candidates = [
 			process.env.DSH_REMOTE_CLOUDFLARED,
-			join(BIN_DIR, process.platform === 'win32' ? 'cloudflared.exe' : 'cloudflared'),
+			join(BIN_DIR, exe),
 			process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, 'cloudflared', 'cloudflared.exe') : undefined,
 			'/usr/local/bin/cloudflared',
 			'/usr/bin/cloudflared',
 			'/opt/homebrew/bin/cloudflared',
+			...fromPath,
 		].filter(Boolean);
 		for (const candidate of candidates) if (existsSync(candidate)) return candidate;
 		return undefined;
@@ -846,5 +970,5 @@ export function createPairing({ stateDir, logger }) {
 		};
 	}
 
-	return { read, save, clear, release, register, handshake, ensureCloudflared, findCloudflared, status, STATE_PATH };
+	return { read, save, clear, release, register, handshake, ensureCloudflared, findCloudflared, probeTunnelDns, status, STATE_PATH };
 }

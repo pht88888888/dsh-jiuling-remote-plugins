@@ -937,6 +937,36 @@ async function handleRpc(ctx, method, params, io) {
 				pinnedList = [];
 			}
 			const pinnedSet = new Set(pinnedList);
+			/*
+			 * ## 电脑上**已归档**的会话默认不返回
+			 *
+			 * 归档在桌面端是「收起来」的意思：官方侧边栏默认就不显示。
+			 * 而我们这条 RPC 只看了「工作区里有哪些会话」，没看「是不是已归档」，
+			 * 于是手机端的同步列表把归档的一起捞出来排一屏。
+			 *
+			 * 用户反馈原话（20261101-154425-c49f6c）：
+			 *   「选择同步会话时，会将电脑已经归档的会话也会纳入选择范围内。
+			 *     建议单独加一个归档会话区，或者说直接不显示归档的会话，
+			 *     不然会非常的乱。」
+			 *
+			 * 默认按归档语义过滤（`includeArchived: true` 可显式要回来，留给
+			 * 以后手机端做「归档区」用）。
+			 *
+			 * ⚠️ 为什么不直接删字段而是过滤：**手机端旧版本不用改也立刻受益**。
+			 *   这条 RPC 的返回值就是同步列表的数据源，电脑端升级即干净。
+			 * ⚠️ 取不到集合时按空集合处理：最坏是归档的仍被列出（与改动前一致），
+			 *   绝不会误伤正常会话。
+			 */
+			const includeArchived = params?.includeArchived === true;
+			let archivedSet = new Set();
+			if (!includeArchived) {
+				try {
+					const value = registry.archivedSessionIds;
+					if (Array.isArray(value)) archivedSet = new Set(value.map(String));
+				} catch {
+					archivedSet = new Set();
+				}
+			}
 			const out = [];
 			for (const entity of registry.list()) {
 				if (typeof entity?.path !== 'string' || entity.path === '') continue;
@@ -947,6 +977,7 @@ async function handleRpc(ctx, method, params, io) {
 				for (const sessionId of ids) {
 					const item = byId.get(sessionId);
 					if (item === undefined) continue;
+					if (archivedSet.has(String(sessionId))) continue;
 					if (item.blank === true) continue;
 					if (item.origin === 'subagent') continue;
 					if (typeof item.parentSessionId === 'string' && item.parentSessionId !== '') continue;
@@ -1659,6 +1690,20 @@ async function handleRpc(ctx, method, params, io) {
 				pinnedSet = new Set();
 			}
 			const pinnedOf = (sessionId) => pinnedSet.has(String(sessionId));
+			/*
+			 * 已归档的会话默认不返回（理由与 `listWorkspaces` 里那段注释同一份：
+			 * 用户 20261101-154425-c49f6c 报「归档的也进了同步范围，非常乱」）。
+			 * 这里也支持 `includeArchived: true` 显式要回来。
+			 */
+			let archivedSet = new Set();
+			if (params?.includeArchived !== true) {
+				try {
+					const value = ctx.workspaceRegistry?.archivedSessionIds;
+					if (Array.isArray(value)) archivedSet = new Set(value.map(String));
+				} catch {
+					archivedSet = new Set();
+				}
+			}
 			const result = await controller.list({});
 			const items = result?.items ?? [];
 			const sessions = [];
@@ -1685,6 +1730,7 @@ async function handleRpc(ctx, method, params, io) {
 				// 判据用官方自己的字段，不靠猜（`listFields()` 与
 				// `summarizeCold()` 都会给出 `blank` / `origin` / `parentSessionId`）。
 				if (item?.blank === true) continue;
+				if (archivedSet.has(String(item?.sessionId))) continue;
 				if (item?.origin === 'subagent') continue;
 				if (typeof item?.parentSessionId === 'string' && item.parentSessionId !== '') continue;
 
@@ -3377,6 +3423,27 @@ function startTunnel(ctx, token) {
 	let protocol = requestedProtocol;
 	/** QUIC 连续失败次数（见 relay 里的自动降级）。 */
 	let quicStrikes = 0;
+	/*
+	 * 本轮是否看到「DNS 查不到隧道的 SRV 记录」的特征行。
+	 *
+	 * ## 为什么单拎出来（用户 20261101-185934-b706cd，附完整诊断）
+	 *
+	 * 那位用户把根因查得很清楚：**路由器下发的 DNS 不返回 SRV 记录**
+	 * （`_v2-origintunneld._tcp.argotunnel.com`），而 cloudflared 的边缘发现
+	 * 必须先查 SRV ⇒ 进程**在建连之前就退出**：
+	 *
+	 *     ERR edge discovery: error looking up Cloudflare edge IPs: the DNS query failed
+	 *         error="lookup argotunnel.com: no such host"
+	 *     ERR Initiating shutdown error="Could not lookup srv records on _v2-origintunneld._tcp.argotunnel.com"
+	 *
+	 * 而本插件的自动重连会**永远**重试下去（这是对的：用户中途改 DNS 就能自己恢复），
+	 * 但日志里只有「隧道退出（code=1），30 秒后自动重连」，看不出是 DNS —— 用户
+	 * 只能看到手机端的 530，方向全错。
+	 *
+	 * 所以这里认一下特征串，在退出时打一条**能照着做**的诊断（只打一次，别刷屏）。
+	 */
+	let dnsBlocked = false;
+	let dnsHinted = false;
 
 	const launch = () => {
 		child = spawn(bin, ['tunnel', '--no-autoupdate', '--protocol', protocol, 'run'], {
@@ -3396,6 +3463,20 @@ function startTunnel(ctx, token) {
 			// cloudflared 建连成功时一定会打含 `Registered tunnel connection`
 			// 的那一行（真机日志核对过）。见到它就说明这次起来了。
 			if (line.indexOf('Registered tunnel connection') >= 0) attempt = 0;
+
+			/*
+			 * DNS 阻塞 SRV 的特征串（用户 20261101-185934-b706cd 逐字提供的日志）：
+			 *   `edge discovery: error looking up Cloudflare edge IPs`
+			 *   `Could not lookup srv records on _v2-origintunneld._tcp.argotunnel.com`
+			 * 命中任一即认定「本机 DNS 不支持 SRV」，退出时给可操作提示。
+			 */
+			if (!dnsBlocked) {
+				const dnsLine =
+					line.indexOf('error looking up Cloudflare edge IPs') >= 0 ||
+					line.indexOf('_v2-origintunneld._tcp.argotunnel.com') >= 0 ||
+					line.indexOf('DNS prerequisite failed') >= 0;
+				if (dnsLine) dnsBlocked = true;
+			}
 
 			// ## QUIC 连不上时自动降级到 http2
 			//
@@ -3443,6 +3524,23 @@ function startTunnel(ctx, token) {
 			if (stopped) {
 				ctx.logger?.info?.(`[dsh-remote] 隧道已按请求停止，code=${code}`);
 				return;
+			}
+			/*
+			 * DNS 阻塞时给一条**能照着做**的诊断（只打一次）。
+			 *
+			 * 这类失败会一直重连下去，如果只说「30 秒后自动重连」，用户会以为
+			 * 是网络抖动/电脑休眠，怎么重启 DSH 都没用 —— 而真正要改的是网卡 DNS。
+			 */
+			if (dnsBlocked && !dnsHinted) {
+				dnsHinted = true;
+				ctx.logger?.warn?.(
+					'[dsh-remote][tunnel] 判定：本机 DNS 查不到 Cloudflare 隧道的 SRV 记录' +
+						'（_v2-origintunneld._tcp.argotunnel.com），cloudflared 在建连之前就会退出。' +
+						'这不是 DSH 的问题，也不是网络封锁 —— 很多路由器的 DNS 转发器不返回 SRV。' +
+						'处理办法：把电脑网卡 DNS 改成 223.5.5.5 / 119.29.29.29，' +
+						'Windows 再执行 ipconfig /flushdns（系统 DNS 能查 SRV 后隧道会自动恢复，' +
+						'本进程会一直重试，不必重启 DSH）。此时手机端看到的是 HTTP 530。',
+				);
 			}
 			// 指数退避，封顶 30 秒。手机那边此刻会看到 530，越快恢复越好，
 			// 但也不能在电脑断网时每秒重试一次把日志刷爆。
@@ -3767,6 +3865,50 @@ let pairGateDegradedWarned = false;
  * @param req - 请求。
  * @param res - 响应。
  */
+/**
+ * 把「隧道 DNS 预检」的结果拼进配对接口的响应。
+ *
+ * ## 为什么在**装依赖/配对**这一步就检查（用户 2026-11-01 要求）
+ *
+ * 用户原话：「安装依赖的时候 那个提示词只是提醒用户可以交给AI来代劳」。
+ *
+ * 隧道连不上的根因常常不在 DSH，而在**电脑的 DNS**：很多路由器的 DNS 转发器
+ * 不返回 SRV 记录，而 cloudflared 的边缘发现必须先查它 —— 进程一启动就退出，
+ * 手机端只会看到 HTTP 530（用户 20261101-185934-b706cd 把这条链路完整查清过：
+ * 系统 DNS 查 SRV 无记录、换 223.5.5.5 立刻恢复）。
+ *
+ * 与其等用户连不上再来排查，不如在「准备环境」这一步就说清楚，并把一段
+ * **可直接复制给 AI 的提示词**放进 message —— 与下载全部失败时的
+ * `MANUAL_INSTALL_PROMPT` 完全同一个模式。
+ *
+ * ⚠️ 插件**不**自己去改网卡 DNS：那需要管理员权限，DSH 里的 bash 拿不到，
+ *   硬做的结果是「AI 说要提权」这种更绕的体验。这里只负责诊断 + 交话术。
+ * ⚠️ 预检失败不影响配对结论（探测本身抛错就按「没查出问题」处理），
+ *   不能因为一个附加检查把主流程搞坏。
+ */
+async function withTunnelDnsReport(ctx, pairing, result) {
+	let dns;
+	try {
+		dns = await pairing.probeTunnelDns();
+	} catch (error) {
+		ctx.logger?.warn?.(
+			`[dsh-remote][pair] 隧道 DNS 预检失败（不影响配对）: ${String(error?.message ?? error)}`,
+		);
+		return { tunnelDns: undefined, message: result?.message };
+	}
+	if (dns?.blocked !== true) return { tunnelDns: dns, message: result?.message };
+	ctx.logger?.warn?.(`[dsh-remote][pair] ${dns.message}`);
+	const head = typeof result?.message === 'string' && result.message !== '' ? result.message + '\n\n' : '';
+	return {
+		tunnelDns: dns,
+		message:
+			head
+			+ '⚠️ ' + dns.message + '\n\n'
+			+ '把下面这段提示词复制给电脑上的 DSH（或你用的其他 AI），它能帮你确认并处理：\n\n'
+			+ dns.prompt,
+	};
+}
+
 function handlePairRoute(ctx, pairing, state, req, res) {
 	const reply = (code, payload) => {
 		res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
@@ -3872,7 +4014,12 @@ function handlePairRoute(ctx, pairing, state, req, res) {
 					 * 不传就让 `ensureCloudflared` 按默认顺序自动试。
 					 */
 					const result = await pairing.ensureCloudflared({ channel: body?.channel });
-					reply(200, { ok: result.ok === true, ...result, ...pairing.status() });
+					reply(200, {
+						ok: result.ok === true,
+						...result,
+						...pairing.status(),
+						...(await withTunnelDnsReport(ctx, pairing, result)),
+					});
 					return;
 				}
 
@@ -3886,7 +4033,7 @@ function handlePairRoute(ctx, pairing, state, req, res) {
 				/** 确保 cloudflared 在位（需要时自动下载）。 */
 				case '/cloudflared': {
 					const result = await pairing.ensureCloudflared({ channel: body?.channel });
-					reply(200, result);
+					reply(200, { ...result, ...(await withTunnelDnsReport(ctx, pairing, result)) });
 					return;
 				}
 

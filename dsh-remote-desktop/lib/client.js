@@ -108,8 +108,8 @@ window.__ModuleLoader__.load({
 			hint: 'color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px;margin:0;',
 			row: 'display:flex;flex-wrap:wrap;align-items:center;gap:8px;',
 			gap: 'flex:1 1 0;',
-			error: 'color:var(--dsw-alias-state-error-primary);font-size:13px;line-height:20px;margin:0;',
-			ok: 'color:var(--dsw-alias-state-success-primary,#3fb950);font-size:13px;line-height:20px;margin:0;',
+			error: 'color:var(--dsw-alias-state-error-primary);font-size:13px;line-height:20px;margin:0;white-space:pre-wrap;',
+			ok: 'color:var(--dsw-alias-state-success-primary,#3fb950);font-size:13px;line-height:20px;margin:0;white-space:pre-wrap;',
 			// ⚠️ 现在是 `<img>`（原来是承载 SVG 源码的 div，见 M6 那段注释），
 			// 所以要自己带尺寸：`scale:1` 下 SVG 只有 41×41 像素，不放大看不清；
 			// `image-rendering:pixelated` 让放大后的模块保持锐利（不然会被平滑糊掉）。
